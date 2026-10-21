@@ -1,0 +1,32 @@
+# ---> Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+.eslintcache
+
+# ---> Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# ---> IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# ---> 本地运行产物
+/data/
+*.log
+# 真实启动配置（可能含明文 token）；示例文件 mcptester.config.example.json 保留
+/mcptester.config.json
+
+# ---> 打包产物
+dist-portable/
+MCPTester-portable.zip
+
+# 构建产物归档；zip/exe/msi 一律不入库
+/artifacts/
+*.zip
+*.exe
+*.msi

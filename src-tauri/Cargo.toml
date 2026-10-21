@@ -1,0 +1,113 @@
+[package]
+name = "mcptester"
+version = "0.1.3"
+description = "MCP Tester - MCP 服务接口测试桌面工具"
+authors = ["Wxl"]
+license = "MIT"
+edition = "2024"
+# 存在多个 bin target（main + mock-mcp-server + probe），显式声明主二进制供 Tauri CLI 识别
+default-run = "mcptester"
+
+[features]
+# 内置 mock MCP 服务器（测试与离线验收用）。
+# rmcp 的 server 相关特性仅在此特性下启用，
+# 原因：dev-dependency 的特性对 src/bin 不生效，须用 required-features 门控。
+mock-server = [
+    "rmcp/server",
+    "rmcp/macros",
+    "rmcp/schemars",
+    "rmcp/transport-async-rw",
+    "rmcp/transport-io",
+    "rmcp/transport-streamable-http-server",
+    "rmcp/server-side-http",
+    "dep:axum",
+]
+
+[[bin]]
+name = "mcptester"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-mcp-server"
+path = "src/bin/mock_mcp_server.rs"
+required-features = ["mock-server"]
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "mcptester_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
+keyring-core = "1.0.1"
+regex = "1.13.1"
+rmcp = { version = "3.5.1", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    "which-command",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+process-wrap = "10"
+futures = "0.3"
+url = "2"
+axum = { version = "0.8", optional = true }
+sse-stream = "0.2"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# 开发 / 测试构建体积优化：
+# - 自己的工作区 crate 只保留行号（panic 回溯可用；日常排障不依赖变量级调试）；
+# - 所有依赖与过程宏 / 构建脚本关闭调试符号（target/debug 体积通常可显著减小）；
+# - test profile 继承 dev，cargo test / clippy 同样受益；release 不受影响。
+# 如需深入依赖内部调试：临时注释本段并 cargo clean -p <crate> 后重建。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.build-override]
+debug = false
+
+[dev-dependencies]
+serial_test = "3.5.0"
+tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+windows-native-keyring-store = "1.1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+zbus-secret-service-keyring-store = "1"

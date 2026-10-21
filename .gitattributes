@@ -1,0 +1,8 @@
+# 统一文本换行（LF），避免 Windows 检出时的行尾抖动
+* text=auto eol=lf
+
+# 二进制资源
+*.png binary
+*.ico binary
+*.icns binary
+*.db binary

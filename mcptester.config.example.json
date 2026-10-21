@@ -1,0 +1,29 @@
+{
+  "_comment": "MCP Tester 启动配置示例。复制为 mcptester.config.json 放在 mcptester.exe 同目录；首次启动会 seed，之后不会覆盖已有服务器。",
+  "mcptester": {
+    "version": 1,
+    "autoConnect": true,
+    "defaultServer": "local-dev",
+    "secretHeaders": ["X-Custom-Token"],
+    "secretEnv": []
+  },
+  "servers": {
+    "local-dev": {
+      "name": "本地开发",
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer replace-with-test-token"
+      },
+      "timeout_secs": 30
+    },
+    "filesystem": {
+      "name": "本地文件系统",
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\data"],
+      "env": {},
+      "shell_wrap": "resolve"
+    }
+  }
+}
