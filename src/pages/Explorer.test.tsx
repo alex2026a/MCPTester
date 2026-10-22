@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Explorer } from "./Explorer";
 import { useReplayStore } from "../stores/replay";
@@ -65,6 +66,7 @@ const snapshot: CapabilitySnapshot = {
   ],
   fetched_at: "2026-10-20T00:00:00Z",
   stale: false,
+  warnings: [],
 };
 
 function renderExplorer() {
@@ -73,7 +75,9 @@ function renderExplorer() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <Explorer />
+      <MemoryRouter initialEntries={["/explorer"]}>
+        <Explorer />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -219,6 +223,83 @@ describe("Explorer 历史重放", () => {
       screen.getByText(
         "已载入历史重放：resources/read · file:///docs/readme.md",
       ),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("Explorer 能力降级与事件面板", () => {
+  it("能力枚举降级提示展示在接口页顶部", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([server]);
+        case "get_app_info":
+          return Promise.resolve({
+            version: "0.1.3",
+            data_dir: "C:\\data",
+            log_dir: "C:\\logs",
+            supported_protocol_versions: ["2026-07-28"],
+            portable: false,
+            data_dir_source: "appdata",
+            config_path: null,
+            config_status: "not_found",
+            config_error: null,
+            config_changed: false,
+            default_server_id: null,
+            auto_connect: false,
+          });
+        case "get_capabilities":
+          return Promise.resolve({
+            ...snapshot,
+            warnings: [
+              "resources/templates/list 返回 -32601（Method not found），已按空列表处理",
+            ],
+          });
+        default:
+          return Promise.reject(new Error(`未 mock 的命令：${cmd}`));
+      }
+    }) as typeof invoke);
+
+    renderExplorer();
+
+    expect(
+      await screen.findByText("部分能力未启用或枚举失败："),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/resources\/templates\/list 返回 -32601/),
+    ).toBeInTheDocument();
+  });
+
+  it("服务器未连接时仍保留事件面板入口", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([{ ...server, state: { state: "disconnected" } }]);
+        case "get_app_info":
+          return Promise.resolve({
+            version: "0.1.3",
+            data_dir: "C:\\data",
+            log_dir: "C:\\logs",
+            supported_protocol_versions: ["2026-07-28"],
+            portable: false,
+            data_dir_source: "appdata",
+            config_path: null,
+            config_status: "not_found",
+            config_error: null,
+            config_changed: false,
+            default_server_id: null,
+            auto_connect: false,
+          });
+        default:
+          return Promise.reject(new Error(`未 mock 的命令：${cmd}`));
+      }
+    }) as typeof invoke);
+
+    renderExplorer();
+
+    expect(await screen.findByText("服务器未连接")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /事件面板/ }),
     ).toBeInTheDocument();
   });
 });

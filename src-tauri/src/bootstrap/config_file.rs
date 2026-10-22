@@ -530,6 +530,7 @@ mod tests {
             log_dir: dir.path().join("logs"),
             portable: true,
             data_dir_source: "portable".to_string(),
+            test_run: Arc::new(tokio::sync::Mutex::new(None)),
         };
         (dir, state)
     }

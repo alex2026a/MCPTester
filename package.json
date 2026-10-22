@@ -1,8 +1,7 @@
 {
   "name": "mcptester",
   "private": true,
-  "version": "0.1.3",
-  "license": "MIT",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -73,7 +73,7 @@ const KIND_META: Record<string, { title: string; hint: string }> = {
   },
   internal: {
     title: "内部错误",
-    hint: "可复制原始细节用于排障，或查看事件面板「报文」页签了解协议交互过程。",
+    hint: "可复制原始细节用于排障；已保存的服务器可在「接口」页底部「事件面板 → 报文」查看交互，测试连接产生的报文可直接在测试报告内展开。",
   },
 };
 

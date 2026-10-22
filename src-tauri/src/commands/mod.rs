@@ -9,6 +9,7 @@ pub mod import_export;
 pub mod server;
 pub mod settings;
 pub mod system;
+pub mod testing;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,4 +29,7 @@ pub struct AppState {
     pub portable: bool,
     /// 数据目录来源：env / portable / appdata / fallback
     pub data_dir_source: String,
+    /// 当前活动测试运行（全局单运行锁；M3 使用）
+    #[allow(dead_code)]
+    pub test_run: Arc<tokio::sync::Mutex<Option<crate::testing::RunControl>>>,
 }

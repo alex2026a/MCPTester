@@ -26,7 +26,7 @@ use rmcp::model::{
     PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerConfig,
-    SubscriptionFilter, Tool,
+    SubscriptionFilter, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 struct MockServer {
     era: Era,
+    caps: CapsMode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,19 @@ enum Era {
     Both,
     Modern,
     Legacy,
+}
+
+/// 能力声明模式（用于验证客户端按 capabilities 过滤枚举）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapsMode {
+    /// 声明 tools/resources/prompts，且全部列表方法可用
+    All,
+    /// 只声明 tools；resources/prompts 列表方法返回 -32601
+    ToolsOnly,
+    /// 声明 tools/resources/prompts，但 templates/list 返回 -32601
+    NoTemplates,
+    /// 不声明任何能力；工具列表仍可用，其余列表返回 -32601
+    None,
 }
 
 impl Era {
@@ -66,6 +80,10 @@ fn schema(value: Value) -> Arc<JsonObject> {
     }
 }
 
+fn read_only() -> ToolAnnotations {
+    ToolAnnotations::from_raw(None, Some(true), Some(false), Some(true), Some(false))
+}
+
 fn tool_echo() -> Tool {
     let mut tool = Tool::new(
         "echo",
@@ -77,6 +95,7 @@ fn tool_echo() -> Tool {
         })),
     );
     tool.title = Some("回显".to_string());
+    tool.annotations = Some(read_only());
     tool
 }
 
@@ -94,6 +113,7 @@ fn tool_add() -> Tool {
         })),
     );
     tool.title = Some("求和".to_string());
+    tool.annotations = Some(read_only());
     tool
 }
 
@@ -104,6 +124,15 @@ fn tool_structured() -> Tool {
         schema(json!({ "type": "object", "properties": {}, "required": [] })),
     );
     tool.title = Some("结构化输出".to_string());
+    tool.annotations = Some(read_only());
+    tool.output_schema = Some(schema(json!({
+        "type": "object",
+        "required": ["ok", "items"],
+        "properties": {
+            "ok": { "type": "boolean" },
+            "items": { "type": "array", "items": { "type": "integer" } }
+        }
+    })));
     tool
 }
 
@@ -121,6 +150,7 @@ fn tool_slow_echo() -> Tool {
         })),
     );
     tool.title = Some("慢回显".to_string());
+    tool.annotations = Some(read_only());
     tool
 }
 
@@ -131,24 +161,138 @@ fn tool_input_required() -> Tool {
         schema(json!({ "type": "object", "properties": {}, "required": [] })),
     );
     tool.title = Some("需要交互输入（MRTR）".to_string());
+    tool.annotations = Some(read_only());
+    tool
+}
+
+fn tool_bounded() -> Tool {
+    let mut tool = Tool::new(
+        "bounded",
+        "边界工具：字符串/数字/数组/枚举/嵌套；非法参数返回 isError=true",
+        schema(json!({
+            "type": "object",
+            "required": ["name", "count", "tags"],
+            "additionalProperties": false,
+            "properties": {
+                "name": { "type": "string", "minLength": 2, "maxLength": 20 },
+                "count": { "type": "integer", "minimum": 1, "maximum": 5 },
+                "tags": {
+                    "type": "array", "minItems": 1, "maxItems": 3,
+                    "items": { "type": "string", "minLength": 1 }
+                },
+                "mode": { "type": "string", "enum": ["a", "b"] },
+                "nested": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": { "id": { "type": "integer", "minimum": 1 } }
+                }
+            }
+        })),
+    );
+    tool.title = Some("边界工具".to_string());
+    tool.annotations = Some(read_only());
+    tool
+}
+
+fn tool_strict() -> Tool {
+    let mut tool = Tool::new(
+        "strict",
+        "严格工具：缺失必填参数返回 JSON-RPC error",
+        schema(json!({
+            "type": "object",
+            "required": ["value"],
+            "properties": { "value": { "type": "string", "minLength": 1 } }
+        })),
+    );
+    tool.title = Some("严格校验".to_string());
+    tool.annotations = Some(read_only());
+    tool
+}
+
+fn tool_destroy() -> Tool {
+    let mut tool = Tool::new(
+        "destroy",
+        "破坏性工具（默认不运行）",
+        schema(json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"]
+        })),
+    );
+    tool.title = Some("破坏性操作".to_string());
+    tool.annotations = Some(ToolAnnotations::from_raw(
+        None,
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+    ));
+    tool
+}
+
+fn tool_write() -> Tool {
+    let mut tool = Tool::new(
+        "write_value",
+        "写操作但不具破坏性",
+        schema(json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"]
+        })),
+    );
+    tool.title = Some("写入值".to_string());
+    tool.annotations = Some(ToolAnnotations::from_raw(
+        None,
+        Some(false),
+        Some(false),
+        Some(false),
+        Some(false),
+    ));
+    tool
+}
+
+fn tool_unknown() -> Tool {
+    let mut tool = Tool::new(
+        "unknown_risk",
+        "未声明注解的未知风险工具",
+        schema(json!({ "type": "object", "properties": {} })),
+    );
+    tool.title = Some("未知风险".to_string());
+    tool
+}
+
+fn tool_no_schema() -> Tool {
+    let mut tool = Tool::new(
+        "no_schema",
+        "无可用 inputSchema",
+        schema(json!({})),
+    );
+    tool.title = Some("无 Schema".to_string());
+    tool.annotations = Some(read_only());
     tool
 }
 
 impl ServerHandler for MockServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
-            ServerCapabilities::builder()
+        let capabilities = match self.caps {
+            CapsMode::All | CapsMode::NoTemplates => ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .enable_resources()
                 .enable_prompts()
                 .build(),
-        )
-        .with_server_info(Implementation::new(
-            "mock-mcp-server",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions("MCP Tester 内置 mock 服务器（确定性输出，供测试与离线验收）")
+            CapsMode::ToolsOnly => ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+            CapsMode::None => ServerCapabilities::default(),
+        };
+        ServerConfig::new(capabilities)
+            .with_server_info(Implementation::new(
+                "mock-mcp-server",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions("MCP Tester 内置 mock 服务器（确定性输出，供测试与离线验收）")
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -166,6 +310,12 @@ impl ServerHandler for MockServer {
             tool_structured(),
             tool_slow_echo(),
             tool_input_required(),
+            tool_bounded(),
+            tool_strict(),
+            tool_destroy(),
+            tool_write(),
+            tool_unknown(),
+            tool_no_schema(),
         ])))
     }
 
@@ -211,6 +361,61 @@ impl ServerHandler for MockServer {
                     InputRequiredResult::from_request_state("mock-state"),
                 ))
             }
+            "bounded" => {
+                let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+                let count = args.get("count").and_then(Value::as_i64).unwrap_or(0);
+                let tags = args.get("tags").and_then(Value::as_array);
+                let valid = name.chars().count() >= 2
+                    && name.chars().count() <= 20
+                    && (1..=5).contains(&count)
+                    && tags.map(|items| (1..=3).contains(&items.len())).unwrap_or(false);
+                if valid {
+                    let mut result = CallToolResult::structured(json!({
+                        "ok": true,
+                        "name": name,
+                        "count": count
+                    }));
+                    result.content = vec![ContentBlock::text(format!("bounded: {name}/{count}"))];
+                    Ok(result.into())
+                } else {
+                    let mut result = CallToolResult::success(vec![ContentBlock::text(
+                        "参数不合法：name/count/tags 超出约束",
+                    )]);
+                    result.is_error = Some(true);
+                    Ok(result.into())
+                }
+            }
+            "strict" => {
+                let value = args.get("value").and_then(Value::as_str).unwrap_or_default();
+                if value.is_empty() {
+                    Err(McpError::new(
+                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                        "value 不能为空",
+                        None,
+                    ))
+                } else {
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "strict: {value}"
+                    ))])
+                    .into())
+                }
+            }
+            "destroy" => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "destroyed（mock，不产生真实副作用）",
+            )])
+            .into()),
+            "write_value" => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "written（mock，不产生真实副作用）",
+            )])
+            .into()),
+            "unknown_risk" => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "unknown risk executed",
+            )])
+            .into()),
+            "no_schema" => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "no schema executed",
+            )])
+            .into()),
             other => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 format!("未知工具：{other}"),
@@ -224,6 +429,13 @@ impl ServerHandler for MockServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        if matches!(self.caps, CapsMode::ToolsOnly | CapsMode::None) {
+            return std::future::ready(Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                "Method not found",
+                None,
+            )));
+        }
         std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
             Resource::new("mock://hello", "hello").with_description("固定问候资源"),
         ])))
@@ -234,6 +446,16 @@ impl ServerHandler for MockServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        if matches!(
+            self.caps,
+            CapsMode::ToolsOnly | CapsMode::NoTemplates | CapsMode::None
+        ) {
+            return std::future::ready(Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                "Method not found",
+                None,
+            )));
+        }
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
             ResourceTemplate::new("mock://item/{id}", "item")
                 .with_description("按 id 读取条目（模板）"),
@@ -268,6 +490,13 @@ impl ServerHandler for MockServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
+        if matches!(self.caps, CapsMode::ToolsOnly | CapsMode::None) {
+            return std::future::ready(Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                "Method not found",
+                None,
+            )));
+        }
         std::future::ready(Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
             "greet",
             Some("问候提示词"),
@@ -332,6 +561,7 @@ fn main() {
 async fn async_main() {
     let mut transport = "stdio".to_string();
     let mut era = Era::Both;
+    let mut caps = CapsMode::All;
     let mut port: u16 = 18080;
     let mut exit_after_ms: u64 = 0;
     let mut fastmcp_compat: Option<String> = None;
@@ -350,6 +580,15 @@ async fn async_main() {
                     Some("modern") => Era::Modern,
                     Some("legacy") => Era::Legacy,
                     _ => Era::Both,
+                };
+            }
+            "--caps" => {
+                i += 1;
+                caps = match args.get(i).map(String::as_str) {
+                    Some("tools-only") => CapsMode::ToolsOnly,
+                    Some("no-templates") => CapsMode::NoTemplates,
+                    Some("none") => CapsMode::None,
+                    _ => CapsMode::All,
                 };
             }
             "--port" => {
@@ -373,7 +612,7 @@ async fn async_main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "用法：mock-mcp-server --transport stdio|http|sse [--era both|modern|legacy] [--port N] [--exit-after-ms N] [--fastmcp-compat] [--token T]"
+                    "用法：mock-mcp-server --transport stdio|http|sse [--era both|modern|legacy] [--caps all|tools-only|no-templates|none] [--port N] [--exit-after-ms N] [--fastmcp-compat] [--token T]"
                 );
                 return;
             }
@@ -390,8 +629,8 @@ async fn async_main() {
     }
 
     match transport.as_str() {
-        "stdio" => run_stdio(era).await,
-        "http" => run_http(era, port, fastmcp_compat).await,
+        "stdio" => run_stdio(era, caps).await,
+        "http" => run_http(era, port, fastmcp_compat, caps).await,
         "sse" => run_sse(port).await,
         other => {
             eprintln!("不支持的传输：{other}");
@@ -400,9 +639,9 @@ async fn async_main() {
     }
 }
 
-async fn run_stdio(era: Era) {
+async fn run_stdio(era: Era, caps: CapsMode) {
     use rmcp::ServiceExt;
-    let service = MockServer { era }
+    let service = MockServer { era, caps }
         .serve(rmcp::transport::io::stdio())
         .await
         .expect("mock server 启动失败");
@@ -575,13 +814,13 @@ fn sse_dispatch(method: &str, request: &Value, id: Value) -> Value {
     }
 }
 
-async fn run_http(era: Era, port: u16, fastmcp_compat: Option<String>) {
+async fn run_http(era: Era, port: u16, fastmcp_compat: Option<String>, caps: CapsMode) {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
     let service = StreamableHttpService::new(
-        move || Ok(MockServer { era }),
+        move || Ok(MockServer { era, caps }),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );

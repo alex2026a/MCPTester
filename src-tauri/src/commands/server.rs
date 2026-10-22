@@ -18,6 +18,7 @@ use crate::mcp::models::{
     ConnectionState, Handshake, HttpConfig, KeyValue, ServerConfig, ServerSummary, StdioConfig,
     TransportKind,
 };
+use crate::mcp::wire::WireEntry;
 use crate::storage::server_repo::{self, CredentialRef};
 
 /// 敏感值输入（新增/更新时首次明文传入；keep/replace/clear 三态语义）
@@ -381,6 +382,8 @@ pub struct ConnectionTestReport {
     pub template_count: usize,
     pub prompt_count: usize,
     pub error: Option<McpErrorInfo>,
+    /// 本次测试连接产生的线上报文（临时句柄，不进入连接管理器）
+    pub wire: Vec<WireEntry>,
 }
 
 /// 测试连接：传输建连 → 握手/协商 → 能力枚举 → 断开（全部在内存中完成）
@@ -418,6 +421,7 @@ pub async fn test_server_connection(
                 template_count: 0,
                 prompt_count: 0,
                 error: Some(error),
+                wire: handle.wire().buffer(),
             }
         };
 
@@ -495,16 +499,20 @@ pub async fn test_server_connection(
     let started = std::time::Instant::now();
     match handle.capabilities(true).await {
         Ok(snapshot) => {
+            let mut detail = format!(
+                "工具 {} · 资源 {} · 模板 {} · 提示词 {}",
+                snapshot.tools.len(),
+                snapshot.resources.len(),
+                snapshot.resource_templates.len(),
+                snapshot.prompts.len()
+            );
+            if !snapshot.warnings.is_empty() {
+                detail.push_str(&format!("；{}", snapshot.warnings.join("；")));
+            }
             steps.push(TestStep {
                 name: "能力枚举".to_string(),
                 ok: true,
-                detail: format!(
-                    "工具 {} · 资源 {} · 模板 {} · 提示词 {}",
-                    snapshot.tools.len(),
-                    snapshot.resources.len(),
-                    snapshot.resource_templates.len(),
-                    snapshot.prompts.len()
-                ),
+                detail,
                 elapsed_ms: started.elapsed().as_millis() as u64,
             });
             handle.disconnect().await;
@@ -517,6 +525,7 @@ pub async fn test_server_connection(
                 template_count: snapshot.resource_templates.len(),
                 prompt_count: snapshot.prompts.len(),
                 error: None,
+                wire: handle.wire().buffer(),
             })
         }
         Err(e) => {
@@ -1157,6 +1166,7 @@ mod tests {
             log_dir: dir.path().join("logs"),
             portable: true,
             data_dir_source: "portable".to_string(),
+            test_run: Arc::new(tokio::sync::Mutex::new(None)),
         };
         (dir, state)
     }

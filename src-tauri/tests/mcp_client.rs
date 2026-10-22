@@ -51,7 +51,7 @@ async fn stdio_modern_connect_list_call() {
     assert_eq!(handshake.server_name, "mock-mcp-server");
 
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 5);
+    assert_eq!(snapshot.tools.len(), 11);
     assert_eq!(snapshot.resources.len(), 1);
     assert_eq!(snapshot.resource_templates.len(), 1);
     assert_eq!(snapshot.prompts.len(), 1);
@@ -100,7 +100,115 @@ async fn stdio_legacy_era_negotiates_and_probes() {
 
     // 旧世代仍可枚举与调用
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 5);
+    assert_eq!(snapshot.tools.len(), 11);
+
+    h.disconnect().await;
+}
+
+/// 旧协议/轻量服务器只声明 tools：不得请求 resources/prompts，枚举必须成功。
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_tools_only_server_skips_undeclared_capabilities() {
+    let h = handle("mock-tools-only", RuntimeSettings::default());
+    h.connect_stdio(&stdio_cfg(&[
+        "--transport",
+        "stdio",
+        "--era",
+        "legacy",
+        "--caps",
+        "tools-only",
+    ]))
+    .await
+    .expect("连接失败");
+
+    assert_eq!(handshake_of(&h).await.lifecycle, LifecycleEra::Legacy);
+
+    let snapshot = h.capabilities(true).await.expect("tools-only 服务器不应枚举失败");
+    assert_eq!(snapshot.tools.len(), 11);
+    assert!(snapshot.resources.is_empty());
+    assert!(snapshot.resource_templates.is_empty());
+    assert!(snapshot.prompts.is_empty());
+    assert!(
+        snapshot.warnings.is_empty(),
+        "未声明的能力应直接跳过，不应产生错误提示：{:?}",
+        snapshot.warnings
+    );
+
+    let wire = h.wire().buffer();
+    assert!(
+        !wire
+            .iter()
+            .any(|entry| entry.method.as_deref() == Some("resources/list")),
+        "不应向未声明 resources 的服务器发送 resources/list"
+    );
+    assert!(
+        !wire
+            .iter()
+            .any(|entry| entry.method.as_deref() == Some("prompts/list")),
+        "不应向未声明 prompts 的服务器发送 prompts/list"
+    );
+
+    h.disconnect().await;
+}
+
+/// 服务器声明 resources 但未实现可选的 templates/list：降级为空模板 + 警告。
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_server_without_templates_degrades_to_warning() {
+    let h = handle("mock-no-templates", RuntimeSettings::default());
+    h.connect_stdio(&stdio_cfg(&[
+        "--transport",
+        "stdio",
+        "--era",
+        "legacy",
+        "--caps",
+        "no-templates",
+    ]))
+    .await
+    .expect("连接失败");
+
+    let snapshot = h
+        .capabilities(true)
+        .await
+        .expect("templates/list 返回 -32601 不应导致整体失败");
+    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.resources.len(), 1);
+    assert!(snapshot.resource_templates.is_empty());
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("resources/templates/list")),
+        "应提示 templates/list 不可用：{:?}",
+        snapshot.warnings
+    );
+
+    h.disconnect().await;
+}
+
+/// 服务器完全不声明 capabilities：兜底探测全部列表，缺失的方法降级而非失败。
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_server_without_capabilities_falls_back_to_probing() {
+    let h = handle("mock-no-caps", RuntimeSettings::default());
+    h.connect_stdio(&stdio_cfg(&[
+        "--transport",
+        "stdio",
+        "--era",
+        "legacy",
+        "--caps",
+        "none",
+    ]))
+    .await
+    .expect("连接失败");
+
+    let snapshot = h
+        .capabilities(true)
+        .await
+        .expect("未声明 capabilities 时应兜底探测且不失败");
+    assert_eq!(snapshot.tools.len(), 11);
+    assert!(
+        snapshot.warnings.iter().any(|w| w.contains("resources/list")),
+        "缺失的 resources/list 应降级为警告：{:?}",
+        snapshot.warnings
+    );
 
     h.disconnect().await;
 }
@@ -192,9 +300,11 @@ async fn cancel_call_aborts_wait_and_notifies_server() {
         .expect("调用任务失败");
     assert_eq!(
         record.status,
-        mcptester_lib::mcp::models::CallStatus::Error,
-        "取消后应记录为错误（请求已取消）"
+        mcptester_lib::mcp::models::CallStatus::Canceled,
+        "取消后应记录为 canceled"
     );
+    assert!(record.result.is_none());
+    assert!(record.error.is_none());
 
     // 服务器侧应收到 notifications/cancelled（stdio 语义）
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -305,7 +415,7 @@ async fn http_connect_list_call() {
     assert_eq!(handshake.server_name, "mock-mcp-server");
 
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 5);
+    assert_eq!(snapshot.tools.len(), 11);
 
     let record = h.call_tool("add", serde_json::json!({ "a": 2, "b": 3 })).await;
     assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
@@ -335,7 +445,7 @@ async fn cmd_shell_mode_wraps_command() {
     };
     h.connect_stdio(&cfg).await.expect("cmd_shell 连接失败");
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 5);
+    assert_eq!(snapshot.tools.len(), 11);
     h.disconnect().await;
 }
 

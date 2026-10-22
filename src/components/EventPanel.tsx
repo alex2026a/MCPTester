@@ -21,6 +21,7 @@ import {
 } from "../api/wire";
 import { MessageViewer } from "./json/MessageViewer";
 import { formatBytes, formatClock, formatDuration } from "./json/format";
+import { pairWireEntries, type WireInteraction } from "../lib/wire";
 import { toast } from "../stores/toast";
 
 interface EventLine {
@@ -33,13 +34,6 @@ type PanelTab = "wire" | "notifications" | "stderr";
 
 const MAX_EVENT_LINES = 500;
 const MAX_WIRE_ENTRIES = 300;
-
-interface Interaction {
-  key: string;
-  request?: WireEntry;
-  response?: WireEntry;
-  entry?: WireEntry;
-}
 
 /** 报文载荷转检索文本（限制长度，避免大结果拖慢筛选） */
 function searchable(value: unknown): string {
@@ -177,33 +171,10 @@ export function EventPanel({ serverId }: { serverId: string }) {
     if (element) element.scrollTop = element.scrollHeight;
   }, [wire, follow, open, tab]);
 
-  const interactions = useMemo<Interaction[]>(() => {
-    const responses = new Map<string, WireEntry>();
-    for (const entry of wire) {
-      if (entry.kind === "response" && entry.rpc_id) {
-        responses.set(`${entry.direction}:${entry.rpc_id}`, entry);
-      }
-    }
-    const used = new Set<number>();
-    const items: Interaction[] = [];
-    for (const entry of wire) {
-      if (entry.kind === "request") {
-        const opposite =
-          entry.direction === "client_to_server" ? "server_to_client" : "client_to_server";
-        const response = entry.rpc_id
-          ? responses.get(`${opposite}:${entry.rpc_id}`)
-          : undefined;
-        if (response) used.add(response.seq);
-        items.push({ key: `req-${entry.seq}`, request: entry, response });
-      } else if (entry.kind === "response") {
-        if (used.has(entry.seq)) continue;
-        items.push({ key: `res-${entry.seq}`, response: entry });
-      } else {
-        items.push({ key: `evt-${entry.seq}`, entry });
-      }
-    }
-    return items;
-  }, [wire]);
+  const interactions = useMemo<WireInteraction[]>(
+    () => pairWireEntries(wire),
+    [wire],
+  );
 
   const methods = useMemo(() => {
     const set = new Set<string>();
@@ -496,7 +467,7 @@ export function EventPanel({ serverId }: { serverId: string }) {
   );
 }
 
-function statusOf(item: Interaction): { text: string; className: string } {
+function statusOf(item: WireInteraction): { text: string; className: string } {
   if (item.entry) {
     return item.entry.kind === "system"
       ? { text: "系统", className: "text-slate-400" }
@@ -515,7 +486,7 @@ function WireRow({
   selected,
   onSelect,
 }: {
-  item: Interaction;
+  item: WireInteraction;
   selected: boolean;
   onSelect: () => void;
 }) {

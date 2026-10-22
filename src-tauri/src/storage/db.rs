@@ -15,6 +15,7 @@ use rusqlite::Connection;
 use super::migrations;
 
 /// SQLite 数据库句柄
+#[derive(Clone)]
 pub struct Database {
     write: Arc<Mutex<Connection>>,
     read: Arc<Mutex<Connection>>,
@@ -125,7 +126,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         for table in [
             "servers",
@@ -134,6 +135,10 @@ mod tests {
             "call_records",
             "settings",
             "app_meta",
+            "test_suites",
+            "test_cases",
+            "test_runs",
+            "test_run_cases",
         ] {
             let count: i64 = conn
                 .query_row(

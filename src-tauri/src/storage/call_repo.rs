@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::mcp::models::{CallMethod, CallRecord, CallRecordSummary, CallStatus, TransportKind};
+use crate::mcp::models::{
+    CallMethod, CallOrigin, CallRecord, CallRecordSummary, CallStatus, TransportKind,
+};
 
 /// 大结果阈值（1MB）
 const TRUNCATE_THRESHOLD: u64 = 1024 * 1024;
@@ -21,6 +23,8 @@ pub struct CallFilter {
     pub server_id: Option<String>,
     pub method: Option<String>,
     pub status: Option<String>,
+    /// manual / test；None = 全部
+    pub origin: Option<String>,
     pub keyword: Option<String>,
     /// true=同时搜索 params/result 全文（慢查询）
     pub keyword_full: bool,
@@ -28,8 +32,21 @@ pub struct CallFilter {
     pub to: Option<DateTime<Utc>>,
 }
 
-/// 插入记录；大结果截断并落盘
-pub fn insert(conn: &Connection, results_dir: &Path, record: &CallRecord) -> anyhow::Result<()> {
+/// 插入结果（供调用方回写 `truncated/size_bytes`）。
+#[derive(Debug, Clone, Copy)]
+pub struct InsertOutcome {
+    pub truncated: bool,
+    pub size_bytes: u64,
+}
+
+/// 插入记录；大结果截断并落盘。
+///
+/// 使用普通 `INSERT`：call_id 重复时返回错误，避免静默覆盖旧记录。
+pub fn insert(
+    conn: &Connection,
+    results_dir: &Path,
+    record: &CallRecord,
+) -> anyhow::Result<InsertOutcome> {
     let result_text = record
         .result
         .as_ref()
@@ -50,12 +67,24 @@ pub fn insert(conn: &Connection, results_dir: &Path, record: &CallRecord) -> any
         }
         other => (other, false),
     };
+    let error_text = record
+        .error
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let error_text = error_text.map(|text| {
+        if text.len() as u64 > TRUNCATE_THRESHOLD {
+            text.chars().take(TRUNCATE_THRESHOLD as usize).collect()
+        } else {
+            text
+        }
+    });
 
     conn.execute(
-        "INSERT OR REPLACE INTO call_records
+        "INSERT INTO call_records
             (id, server_id, server_name, method, target, params_json, result_json, error_json,
-             status, duration_ms, protocol_version, transport, truncated, size_bytes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             status, duration_ms, protocol_version, transport, truncated, size_bytes, origin, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             record.id,
             record.server_id,
@@ -64,21 +93,21 @@ pub fn insert(conn: &Connection, results_dir: &Path, record: &CallRecord) -> any
             record.target,
             serde_json::to_string(&record.params)?,
             stored_result,
-            record
-                .error
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
+            error_text,
             record.status.as_str(),
             record.duration_ms as i64,
             record.protocol_version,
             record.transport.as_str(),
             if truncated { 1 } else { 0 },
             size_bytes as i64,
+            record.origin.as_str(),
             record.created_at.to_rfc3339(),
         ],
     )?;
-    Ok(())
+    Ok(InsertOutcome {
+        truncated,
+        size_bytes,
+    })
 }
 
 /// 查询记录列表（分页 + 筛选）
@@ -102,6 +131,10 @@ pub fn list(
     if let Some(status) = &filter.status {
         conditions.push("status = ?".to_string());
         params.push(Box::new(status.clone()));
+    }
+    if let Some(origin) = &filter.origin {
+        conditions.push("origin = ?".to_string());
+        params.push(Box::new(origin.clone()));
     }
     if let Some(from) = &filter.from {
         conditions.push("created_at >= ?".to_string());
@@ -147,7 +180,7 @@ pub fn list(
 
     let sql = format!(
         "SELECT id, server_id, server_name, method, target, status, duration_ms, size_bytes,
-                truncated, created_at
+                truncated, origin, created_at
          FROM call_records {where_clause}
          ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
         params.len() + 1,
@@ -171,7 +204,8 @@ pub fn list(
                 duration_ms: row.get::<_, i64>(6)? as u64,
                 size_bytes: row.get::<_, i64>(7)? as u64,
                 truncated: row.get::<_, i64>(8)? != 0,
-                created_at: row.get(9)?,
+                origin: row.get(9)?,
+                created_at: row.get(10)?,
             })
         },
     )?;
@@ -189,7 +223,7 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<CallRecord>> {
         .query_row(
             "SELECT id, server_id, server_name, method, target, params_json, result_json,
                     error_json, status, duration_ms, protocol_version, transport, truncated,
-                    size_bytes, created_at
+                    size_bytes, origin, created_at
              FROM call_records WHERE id = ?1",
             [id],
             |row| {
@@ -208,7 +242,8 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<CallRecord>> {
                     transport: row.get(11)?,
                     truncated: row.get::<_, i64>(12)? != 0,
                     size_bytes: row.get::<_, i64>(13)? as u64,
-                    created_at: row.get(14)?,
+                    origin: row.get(14)?,
+                    created_at: row.get(15)?,
                 })
             },
         )
@@ -237,31 +272,71 @@ pub fn clear(conn: &Connection, results_dir: &Path, filter: &CallFilter) -> anyh
     delete(conn, results_dir, &ids)
 }
 
-/// 保留清理：按天数/条数删除旧记录并清理落盘文件
+/// 保留清理：按天数/条数删除旧记录并清理落盘文件（全部来源）。
+#[allow(dead_code)]
 pub fn cleanup(
     conn: &Connection,
     results_dir: &Path,
     retention_days: u32,
     max_rows: u32,
 ) -> anyhow::Result<(u64, u64)> {
+    cleanup_origin(conn, results_dir, None, retention_days, max_rows)
+}
+
+/// 按来源清理（manual / test 分开配额）。
+pub fn cleanup_origin(
+    conn: &Connection,
+    results_dir: &Path,
+    origin: Option<&str>,
+    retention_days: u32,
+    max_rows: u32,
+) -> anyhow::Result<(u64, u64)> {
     let cutoff = (Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    let (origin_clause, origin_value) = match origin {
+        Some(value) => (" AND origin = ?2", Some(value.to_string())),
+        None => ("", None),
+    };
     let expired: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT id FROM call_records WHERE created_at < ?1")?;
-        let rows = stmt.query_map([&cutoff], |row| row.get::<_, String>(0))?;
-        rows.filter_map(Result::ok).collect()
+        let sql = format!("SELECT id FROM call_records WHERE created_at < ?1{origin_clause}");
+        let mut stmt = conn.prepare(&sql)?;
+        if let Some(origin) = &origin_value {
+            stmt.query_map(rusqlite::params![&cutoff, origin], |row| row.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect()
+        } else {
+            stmt.query_map([&cutoff], |row| row.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect()
+        }
     };
     let mut deleted = delete(conn, results_dir, &expired)?;
 
     // 条数上限：删除最旧的超出部分
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM call_records", [], |row| row.get(0))?;
+    let total: i64 = match &origin_value {
+        Some(origin) => conn.query_row(
+            "SELECT COUNT(*) FROM call_records WHERE origin = ?1",
+            [origin],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row("SELECT COUNT(*) FROM call_records", [], |row| row.get(0))?,
+    };
     let overflow = total - max_rows as i64;
     if overflow > 0 {
         let overflow_ids: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM call_records ORDER BY created_at ASC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([overflow], |row| row.get::<_, String>(0))?;
-            rows.filter_map(Result::ok).collect()
+            let sql = match &origin_value {
+                Some(_) => "SELECT id FROM call_records WHERE origin = ?1 ORDER BY created_at ASC LIMIT ?2",
+                None => "SELECT id FROM call_records ORDER BY created_at ASC LIMIT ?1",
+            };
+            let mut stmt = conn.prepare(sql)?;
+            if let Some(origin) = &origin_value {
+                stmt.query_map(rusqlite::params![origin, overflow], |row| row.get::<_, String>(0))?
+                    .filter_map(Result::ok)
+                    .collect()
+            } else {
+                stmt.query_map([overflow], |row| row.get::<_, String>(0))?
+                    .filter_map(Result::ok)
+                    .collect()
+            }
         };
         deleted += delete(conn, results_dir, &overflow_ids)?;
     }
@@ -332,6 +407,7 @@ struct SummaryRow {
     duration_ms: u64,
     size_bytes: u64,
     truncated: bool,
+    origin: String,
     created_at: String,
 }
 
@@ -347,6 +423,7 @@ impl SummaryRow {
             duration_ms: self.duration_ms,
             size_bytes: self.size_bytes,
             truncated: self.truncated,
+            origin: parse_origin(&self.origin)?,
             created_at: parse_time(&self.created_at)?,
         })
     }
@@ -367,6 +444,7 @@ struct FullRow {
     transport: String,
     truncated: bool,
     size_bytes: u64,
+    origin: String,
     created_at: String,
 }
 
@@ -391,8 +469,17 @@ impl FullRow {
             transport: parse_transport(&self.transport)?,
             truncated: self.truncated,
             size_bytes: self.size_bytes,
+            origin: parse_origin(&self.origin)?,
             created_at: parse_time(&self.created_at)?,
         })
+    }
+}
+
+fn parse_origin(value: &str) -> anyhow::Result<CallOrigin> {
+    match value {
+        "manual" => Ok(CallOrigin::Manual),
+        "test" => Ok(CallOrigin::Test),
+        other => anyhow::bail!("未知调用来源：{other}"),
     }
 }
 
@@ -464,6 +551,7 @@ mod tests {
             transport: TransportKind::Stdio,
             truncated: false,
             size_bytes: 0,
+            origin: CallOrigin::Manual,
             created_at: Utc::now(),
         }
     }
@@ -498,8 +586,17 @@ mod tests {
         let (items, _) = list(&conn, &filter, 0, 10).expect("查询失败");
         assert_eq!(items.len(), 2);
 
+        // 筛选：来源
+        let filter = CallFilter {
+            origin: Some("manual".to_string()),
+            ..Default::default()
+        };
+        let (_, total) = list(&conn, &filter, 0, 10).expect("查询失败");
+        assert_eq!(total, 2);
+
         let record = get(&conn, "c1").expect("查询失败").expect("应存在");
         assert_eq!(record.method, CallMethod::ToolsCall);
+        assert_eq!(record.origin, CallOrigin::Manual);
         assert!(record.result.is_some());
 
         let deleted = delete(&conn, &results, &["c1".to_string()]).expect("删除失败");

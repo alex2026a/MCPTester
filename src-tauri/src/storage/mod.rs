@@ -6,5 +6,6 @@ pub mod db;
 pub mod migrations;
 pub mod server_repo;
 pub mod settings_repo;
+pub mod test_repo;
 
 pub use db::Database;

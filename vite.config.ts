@@ -34,6 +34,8 @@ export default defineConfig(() => ({
     globals: true,
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    // 本机 forks 池启动超时会导致测试文件漏跑，threads 池稳定且更快
+    pool: "threads",
     // 本机 jsdom 环境初始化/渲染较慢（并发跑测时单测 5s 易假超时）
     testTimeout: 20000,
     hookTimeout: 20000,

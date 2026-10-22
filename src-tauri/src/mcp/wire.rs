@@ -21,11 +21,11 @@ use chrono::{DateTime, Utc};
 use rmcp::RoleClient;
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 报文方向
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WireDirection {
     /// 客户端 → 服务器
@@ -37,7 +37,7 @@ pub enum WireDirection {
 }
 
 /// 报文类型（按 JSON-RPC 帧形态分类）
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WireKind {
     /// 带 id 的方法调用
@@ -51,7 +51,7 @@ pub enum WireKind {
 }
 
 /// 报文条目
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireEntry {
     pub seq: u64,
     pub direction: WireDirection,

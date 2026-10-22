@@ -18,12 +18,12 @@ use rmcp::model::{
     SubscriptionsAcknowledgedNotificationParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::models::RuntimeSettings;
 
 /// 通知缓冲条目（seq 连接内单调递增；连接重建后从 0 重新计数）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NotificationEntry {
     pub seq: u64,
     pub method: String,
@@ -32,7 +32,7 @@ pub struct NotificationEntry {
 }
 
 /// stderr 行条目（仅内存缓冲，不落盘）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StderrLine {
     pub seq: u64,
     pub line: String,
@@ -116,6 +116,16 @@ impl EventHub {
             }
         }
         self.emit(HubEvent::Stderr(entry));
+    }
+
+    /// 当前通知最大 seq（无通知时为 0）
+    pub fn last_notification_seq(&self) -> u64 {
+        self.notification_seq.load(Ordering::Relaxed)
+    }
+
+    /// 当前 stderr 最大 seq（无输出时为 0）
+    pub fn last_stderr_seq(&self) -> u64 {
+        self.stderr_seq.load(Ordering::Relaxed)
     }
 
     /// 自 `since_seq` 之后的通知（0 = 全量）

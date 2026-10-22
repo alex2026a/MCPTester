@@ -156,7 +156,7 @@ impl ConnectionState {
 }
 
 /// 工具信息（input_schema 原样透传，前端据此生成表单）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolInfo {
     pub name: String,
     pub title: Option<String>,
@@ -167,7 +167,7 @@ pub struct ToolInfo {
 }
 
 /// 资源信息
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ResourceInfo {
     pub uri: String,
     pub name: String,
@@ -179,7 +179,7 @@ pub struct ResourceInfo {
 }
 
 /// 资源模板信息
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ResourceTemplateInfo {
     pub uri_template: String,
     pub name: String,
@@ -189,7 +189,7 @@ pub struct ResourceTemplateInfo {
 }
 
 /// 提示词参数
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PromptArgument {
     pub name: String,
     pub description: Option<String>,
@@ -197,7 +197,7 @@ pub struct PromptArgument {
 }
 
 /// 提示词信息
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PromptInfo {
     pub name: String,
     pub title: Option<String>,
@@ -206,7 +206,7 @@ pub struct PromptInfo {
 }
 
 /// 能力快照（仅内存缓存）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CapabilitySnapshot {
     pub server_id: String,
     pub tools: Vec<ToolInfo>,
@@ -216,6 +216,9 @@ pub struct CapabilitySnapshot {
     pub fetched_at: DateTime<Utc>,
     /// 是否因刷新失败而沿用旧快照
     pub stale: bool,
+    /// 枚举降级提示（如服务器声明了某能力但方法未实现）
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// 调用方法（历史记录 method 字段）
@@ -236,6 +239,24 @@ impl CallMethod {
             CallMethod::ResourcesRead => "resources_read",
             CallMethod::PromptsGet => "prompts_get",
             CallMethod::Probe => "probe",
+        }
+    }
+}
+
+/// 调用来源：手工调用 / 测试运行
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOrigin {
+    #[default]
+    Manual,
+    Test,
+}
+
+impl CallOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CallOrigin::Manual => "manual",
+            CallOrigin::Test => "test",
         }
     }
 }
@@ -276,6 +297,8 @@ pub struct CallRecord {
     pub transport: TransportKind,
     pub truncated: bool,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub origin: CallOrigin,
     pub created_at: DateTime<Utc>,
 }
 
@@ -291,6 +314,8 @@ pub struct CallRecordSummary {
     pub duration_ms: u64,
     pub size_bytes: u64,
     pub truncated: bool,
+    #[serde(default)]
+    pub origin: CallOrigin,
     pub created_at: DateTime<Utc>,
 }
 

@@ -8,6 +8,8 @@ import { Servers } from "./pages/Servers";
 import { Explorer } from "./pages/Explorer";
 import { History } from "./pages/History";
 import { SettingsPage } from "./pages/Settings";
+import { Tests } from "./pages/Tests";
+import { Reports } from "./pages/Reports";
 import { ToastContainer } from "./components/Toast";
 import { zh } from "./i18n/zh";
 
@@ -64,6 +66,8 @@ function Layout() {
         <nav className="space-y-1">
           <NavItem to="/" label={zh.nav.servers} />
           <NavItem to="/explorer" label={zh.nav.explorer} />
+          <NavItem to="/tests" label={zh.nav.tests} />
+          <NavItem to="/reports" label={zh.nav.reports} />
           <NavItem to="/history" label={zh.nav.history} />
           <NavItem to="/settings" label={zh.nav.settings} />
         </nav>
@@ -75,6 +79,8 @@ function Layout() {
         <Routes>
           <Route path="/" element={<Servers />} />
           <Route path="/explorer" element={<Explorer />} />
+          <Route path="/tests" element={<Tests />} />
+          <Route path="/reports" element={<Reports />} />
           <Route path="/history" element={<History />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>

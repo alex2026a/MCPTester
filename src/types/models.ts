@@ -162,15 +162,23 @@ export interface CapabilitySnapshot {
   prompts: PromptInfo[];
   fetched_at: string;
   stale: boolean;
+  /** 枚举降级提示（如可选方法 -32601） */
+  warnings: string[];
 }
 
 export type CallMethod =
   "tools_call" | "resources_read" | "prompts_get" | "probe";
 export type CallStatus = "ok" | "error" | "canceled";
+export type CallOrigin = "manual" | "test";
 
 export interface CallError {
   kind: string;
   message?: string;
+  code?: number;
+  data?: unknown;
+  timeout_secs?: number;
+  reason?: string;
+  capability?: string;
 }
 
 export interface CallRecord {
@@ -188,6 +196,7 @@ export interface CallRecord {
   transport: TransportKind;
   truncated: boolean;
   size_bytes: number;
+  origin: CallOrigin;
   created_at: string;
 }
 
@@ -207,5 +216,6 @@ export interface CallRecordSummary {
   duration_ms: number;
   size_bytes: number;
   truncated: boolean;
+  origin: CallOrigin;
   created_at: string;
 }

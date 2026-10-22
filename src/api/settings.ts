@@ -9,6 +9,10 @@ export interface Settings {
   notification_buffer_lines: number;
   auto_reconnect: boolean;
   auto_refresh_on_list_changed: boolean;
+  test_call_retention_days: number;
+  test_call_max_rows: number;
+  test_run_retention_days: number;
+  test_run_max_rows: number;
 }
 
 export function getSettings(): Promise<Settings> {

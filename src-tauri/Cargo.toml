@@ -1,9 +1,8 @@
 [package]
 name = "mcptester"
-version = "0.1.3"
+version = "0.2.2"
 description = "MCP Tester - MCP 服务接口测试桌面工具"
 authors = ["Wxl"]
-license = "MIT"
 edition = "2024"
 # 存在多个 bin target（main + mock-mcp-server + probe），显式声明主二进制供 Tauri CLI 识别
 default-run = "mcptester"

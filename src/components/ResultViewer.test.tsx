@@ -23,6 +23,7 @@ function record(partial: Partial<CallRecord>): CallRecord {
     transport: "stdio",
     truncated: false,
     size_bytes: 10,
+    origin: "manual",
     created_at: "2026-10-18T00:00:00Z",
     ...partial,
   };

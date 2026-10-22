@@ -8,6 +8,7 @@ import type {
   ServerDraft,
   ServerSummary,
 } from "../types/models";
+import type { WireEntry } from "./wire";
 
 /** 服务器列表（含运行期连接状态） */
 export function listServers(): Promise<ServerSummary[]> {
@@ -128,6 +129,8 @@ export interface ConnectionTestReport {
   template_count: number;
   prompt_count: number;
   error: { kind: string; message?: string; raw?: string | null } | null;
+  /** 测试连接期间产生的报文（临时句柄，不进入连接管理器） */
+  wire: WireEntry[];
 }
 
 /** 测试连接（不落库；id 用于编辑已有服务器时从 keyring 解析 keep 敏感值） */

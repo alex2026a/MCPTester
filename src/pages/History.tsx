@@ -5,7 +5,9 @@ import { EmptyState } from "../components/EmptyState";
 import { ExportPreviewDialog } from "../components/ExportPreviewDialog";
 import { JsonViewer } from "../components/JsonViewer";
 import { ResultViewer } from "../components/ResultViewer";
+import { Field, Modal } from "../components/testing/SuiteDialog";
 import { listServers } from "../api/servers";
+import { listTestSuites, saveCallAsCase } from "../api/tests";
 import {
   clearCallRecords,
   deleteCallRecords,
@@ -34,10 +36,14 @@ export function History() {
 
   const [filter, setFilter] = useState<CallFilterInput>({
     keyword_full: false,
+    origin: "manual",
   });
   const [keywordDraft, setKeywordDraft] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saveSuiteId, setSaveSuiteId] = useState("");
+  const [saveName, setSaveName] = useState("");
 
   const exportLoad = useCallback(
     () => previewExportCallRecords(filter).then((preview) => preview.json),
@@ -53,6 +59,25 @@ export function History() {
     queryKey: ["history-detail", selected],
     queryFn: () => getCallRecord(selected ?? ""),
     enabled: Boolean(selected),
+  });
+  const saveSuites = useQuery({
+    queryKey: ["test-suites", detail.data?.server_id],
+    queryFn: () => listTestSuites(detail.data?.server_id ?? null),
+    enabled: Boolean(saveOpen && detail.data),
+  });
+  const saveCase = useMutation({
+    mutationFn: () =>
+      saveCallAsCase(
+        detail.data?.id ?? "",
+        saveSuiteId,
+        saveName.trim() || undefined,
+      ),
+    onSuccess: () => {
+      toast.success("已保存为测试用例");
+      setSaveOpen(false);
+      setSaveName("");
+    },
+    onError: (error) => toast.fromError(error, "保存用例失败"),
   });
 
   const invalidate = () => {
@@ -144,6 +169,23 @@ export function History() {
           <option value="ok">成功</option>
           <option value="error">失败</option>
           <option value="canceled">取消</option>
+        </select>
+        <select
+          className="rounded border border-slate-200 px-2 py-1 text-xs"
+          value={filter.origin ?? "all"}
+          onChange={(event) =>
+            setFilter({
+              ...filter,
+              origin:
+                event.target.value === "all"
+                  ? null
+                  : (event.target.value as "manual" | "test"),
+            })
+          }
+        >
+          <option value="manual">手工调用</option>
+          <option value="test">测试调用</option>
+          <option value="all">全部来源</option>
         </select>
         <select
           className="rounded border border-slate-200 px-2 py-1 text-xs"
@@ -264,6 +306,23 @@ export function History() {
                 </button>
                 <button
                   type="button"
+                  className="rounded border border-slate-200 px-3 py-1.5 hover:bg-slate-50 disabled:opacity-50"
+                  disabled={detail.data.method === "probe"}
+                  title={
+                    detail.data.method === "probe"
+                      ? "探测记录不支持保存为用例"
+                      : "保存到测试套件"
+                  }
+                  onClick={() => {
+                    setSaveSuiteId("");
+                    setSaveName(`${detail.data?.target ?? ""} · 来自历史`);
+                    setSaveOpen(true);
+                  }}
+                >
+                  保存为用例
+                </button>
+                <button
+                  type="button"
                   className="rounded border border-red-100 px-3 py-1.5 text-red-500 hover:bg-red-50"
                   onClick={() => {
                     if (selected) remove.mutate(selected);
@@ -296,6 +355,54 @@ export function History() {
           )}
         </div>
       </div>
+
+      {saveOpen && detail.data ? (
+        <Modal title="保存为测试用例" onClose={() => setSaveOpen(false)}>
+          <div className="space-y-3 text-sm">
+            <Field label="目标套件">
+              <select
+                className="w-full rounded border border-slate-200 px-2 py-1.5"
+                value={saveSuiteId}
+                onChange={(event) => setSaveSuiteId(event.target.value)}
+              >
+                <option value="">请选择套件</option>
+                {(saveSuites.data ?? []).map((suite) => (
+                  <option key={suite.id} value={suite.id}>
+                    {suite.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="用例名称">
+              <input
+                className="w-full rounded border border-slate-200 px-2 py-1.5"
+                value={saveName}
+                onChange={(event) => setSaveName(event.target.value)}
+              />
+            </Field>
+            <p className="text-[11px] text-slate-400">
+              仅保存参数与基础期望；可在“测试”页继续补充断言。
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded border border-slate-200 px-3 py-1.5 text-xs hover:bg-slate-50"
+                onClick={() => setSaveOpen(false)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="rounded bg-slate-800 px-3 py-1.5 text-xs text-white hover:bg-slate-700 disabled:opacity-50"
+                disabled={!saveSuiteId || saveCase.isPending}
+                onClick={() => saveCase.mutate()}
+              >
+                {saveCase.isPending ? "保存中…" : "保存"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      ) : null}
 
       {exportOpen ? (
         <ExportPreviewDialog

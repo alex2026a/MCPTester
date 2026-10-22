@@ -16,6 +16,8 @@ pub struct CallFilterInput {
     pub server_id: Option<String>,
     pub method: Option<String>,
     pub status: Option<String>,
+    /// manual / test；None = 全部
+    pub origin: Option<String>,
     pub keyword: Option<String>,
     #[serde(default)]
     pub keyword_full: bool,
@@ -29,6 +31,7 @@ impl From<CallFilterInput> for CallFilter {
             server_id: value.server_id,
             method: value.method,
             status: value.status,
+            origin: value.origin,
             keyword: value.keyword,
             keyword_full: value.keyword_full,
             from: value.from,

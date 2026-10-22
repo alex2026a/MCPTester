@@ -9,6 +9,7 @@ mod credentials;
 mod logging;
 pub mod mcp;
 mod storage;
+pub mod testing;
 
 use std::sync::Arc;
 
@@ -72,6 +73,7 @@ pub fn run() {
                 log_dir: paths.log_dir.clone(),
                 portable: paths.portable,
                 data_dir_source: paths.source.as_str().to_string(),
+                test_run: Arc::new(tokio::sync::Mutex::new(None)),
             };
 
             // 启动配置 seed：只补充缺失项，不覆盖用户修改
@@ -95,6 +97,14 @@ pub fn run() {
 
             // 启动自检：重试待清理的 keyring 条目 + 清理孤儿索引
             commands::server::startup_secret_check(&state);
+
+            // 回收上次异常退出留下的测试运行
+            if let Err(e) = state
+                .db
+                .with_write_blocking(|conn| storage::test_repo::recover_interrupted_runs(conn))
+            {
+                tracing::warn!(error = %e, "测试运行回收失败");
+            }
 
             // 启动保留清理（历史天数 / 条数 / 落盘目录上限）
             run_retention_cleanup(&state);
@@ -151,6 +161,39 @@ pub fn run() {
             commands::import_export::preview_export_servers,
             commands::import_export::get_server_json,
             commands::server::test_server_connection,
+            commands::testing::list_test_suites,
+            commands::testing::get_test_suite,
+            commands::testing::create_test_suite,
+            commands::testing::update_test_suite,
+            commands::testing::rebind_test_suite,
+            commands::testing::delete_test_suite,
+            commands::testing::list_test_cases,
+            commands::testing::create_test_cases,
+            commands::testing::update_test_case,
+            commands::testing::delete_test_cases,
+            commands::testing::duplicate_test_case,
+            commands::testing::reorder_test_cases,
+            commands::testing::generate_test_cases,
+            commands::testing::save_generated_cases,
+            commands::testing::run_test_suite,
+            commands::testing::run_test_cases,
+            commands::testing::cancel_test_run,
+            commands::testing::get_active_test_run,
+            commands::testing::list_test_runs,
+            commands::testing::get_test_run,
+            commands::testing::list_test_run_cases,
+            commands::testing::get_test_run_case,
+            commands::testing::set_test_baseline,
+            commands::testing::compare_test_runs,
+            commands::testing::rerun_failed_test_cases,
+            commands::testing::export_test_report,
+            commands::testing::get_contract_snapshot,
+            commands::testing::diff_contract,
+            commands::testing::save_call_as_case,
+            commands::testing::export_test_suite,
+            commands::testing::import_test_cases,
+            commands::testing::import_llm_test_cases,
+            commands::testing::export_llm_prompt,
         ]);
 
     builder
@@ -165,18 +208,34 @@ fn run_retention_cleanup(state: &AppState) {
         .with_read_blocking(storage::settings_repo::get)
         .unwrap_or_default();
     let results_dir = state.data_dir.join("results");
+    let reports_dir = state.data_dir.join("reports");
     match state.db.with_write_blocking(|conn| {
-        storage::call_repo::cleanup(
+        let (manual, files_a) = storage::call_repo::cleanup_origin(
             conn,
             &results_dir,
+            Some("manual"),
             settings.history_retention_days,
             settings.history_max_rows,
-        )
+        )?;
+        let (test, files_b) = storage::call_repo::cleanup_origin(
+            conn,
+            &results_dir,
+            Some("test"),
+            settings.test_call_retention_days,
+            settings.test_call_max_rows,
+        )?;
+        let runs = storage::test_repo::cleanup_runs(
+            conn,
+            &reports_dir,
+            settings.test_run_retention_days,
+            settings.test_run_max_rows,
+        )?;
+        Ok((manual + test, files_a + files_b, runs))
     }) {
-        Ok((records, files)) if records > 0 || files > 0 => {
-            tracing::info!(records, files, "历史保留清理完成");
+        Ok((records, files, runs)) if records > 0 || files > 0 || runs > 0 => {
+            tracing::info!(records, files, runs, "历史/测试保留清理完成");
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "历史保留清理失败"),
+        Err(e) => tracing::warn!(error = %e, "历史/测试保留清理失败"),
     }
 }

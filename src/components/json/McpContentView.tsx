@@ -275,12 +275,36 @@ function BlockView({ block, markdown }: { block: McpBlock; markdown: boolean }) 
   }
 }
 
-export function McpContentView({ view, markdown }: { view: McpView; markdown: boolean }) {
+export type ErrorTone = "error" | "warning" | "neutral";
+
+const ERROR_TONE_CLASS: Record<ErrorTone, string> = {
+  error: "border-red-200 bg-red-50 text-red-700",
+  warning: "border-amber-200 bg-amber-50 text-amber-700",
+  neutral: "border-slate-200 bg-slate-50 text-slate-600",
+};
+
+const ERROR_TONE_LABEL: Record<ErrorTone, string> = {
+  error: "工具返回错误（isError = true）",
+  warning: "工具返回错误（isError = true，按用例配置降级为警告）",
+  neutral: "工具返回错误（isError = true，符合用例期望）",
+};
+
+export function McpContentView({
+  view,
+  markdown,
+  errorTone = "error",
+}: {
+  view: McpView;
+  markdown: boolean;
+  errorTone?: ErrorTone;
+}) {
   return (
     <div className="space-y-2">
       {view.isError ? (
-        <div className="rounded border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700">
-          工具返回错误（isError = true）
+        <div
+          className={`rounded border px-2 py-1.5 text-xs ${ERROR_TONE_CLASS[errorTone]}`}
+        >
+          {ERROR_TONE_LABEL[errorTone]}
         </div>
       ) : null}
       {view.blocks.length === 0 ? (

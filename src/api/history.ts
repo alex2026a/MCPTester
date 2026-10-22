@@ -5,6 +5,7 @@ export interface CallFilterInput {
   server_id?: string | null;
   method?: string | null;
   status?: string | null;
+  origin?: "manual" | "test" | null;
   keyword?: string | null;
   keyword_full?: boolean;
   from?: string | null;

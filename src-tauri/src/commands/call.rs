@@ -25,8 +25,7 @@ pub async fn call_tool(
         .await
         .ok_or_else(|| "服务器未连接，请先连接".to_string())?;
     let record = handle.call_tool_with_id(call_id, &name, arguments).await;
-    persist(&state, &app, &record);
-    Ok(record)
+    Ok(persist_call(&state, &app, &record))
 }
 
 /// 读取资源
@@ -43,8 +42,7 @@ pub async fn read_resource(
         .await
         .ok_or_else(|| "服务器未连接，请先连接".to_string())?;
     let record = handle.read_resource(&uri).await;
-    persist(&state, &app, &record);
-    Ok(record)
+    Ok(persist_call(&state, &app, &record))
 }
 
 /// 获取提示词
@@ -62,8 +60,7 @@ pub async fn get_prompt(
         .await
         .ok_or_else(|| "服务器未连接，请先连接".to_string())?;
     let record = handle.get_prompt(&name, arguments).await;
-    persist(&state, &app, &record);
-    Ok(record)
+    Ok(persist_call(&state, &app, &record))
 }
 
 /// 取消在途调用（按传输语义：中止等待 + 发送取消通知）
@@ -94,34 +91,43 @@ pub async fn probe_server(
         .await
         .ok_or_else(|| "服务器未连接，请先连接".to_string())?;
     let result = handle.probe().await.map_err(|e| e.message())?;
-    let record = handle
-        .record_probe(&result)
-        .await;
-    persist(&state, &app, &record);
+    let record = handle.record_probe(&result).await;
+    persist_call(&state, &app, &record);
     Ok(result)
 }
 
-/// 落库 + 事件推送（失败仅告警，不影响调用返回）
-fn persist(state: &AppState, app: &AppHandle, record: &CallRecord) {
+/// 落库 + 事件推送（失败仅告警，不影响调用返回）。
+///
+/// 返回回写了 `truncated/size_bytes` 的记录，供前端/报告使用。
+pub(crate) fn persist_call(state: &AppState, app: &AppHandle, record: &CallRecord) -> CallRecord {
     let results_dir = state.data_dir.join("results");
-    if let Err(e) = state
+    let mut updated = record.clone();
+    match state
         .db
         .with_write_blocking(|conn| call_repo::insert(conn, &results_dir, record))
     {
-        tracing::warn!(record_id = %record.id, error = %e, "调用记录落库失败");
-        return;
+        Ok(outcome) => {
+            updated.truncated = outcome.truncated;
+            updated.size_bytes = outcome.size_bytes;
+        }
+        Err(e) => {
+            tracing::warn!(record_id = %record.id, error = %e, "调用记录落库失败");
+            return updated;
+        }
     }
     let summary = CallRecordSummary {
-        id: record.id.clone(),
-        server_id: record.server_id.clone(),
-        server_name: record.server_name.clone(),
-        method: record.method.clone(),
-        target: record.target.clone(),
-        status: record.status.clone(),
-        duration_ms: record.duration_ms,
-        size_bytes: record.size_bytes,
-        truncated: record.truncated,
-        created_at: record.created_at,
+        id: updated.id.clone(),
+        server_id: updated.server_id.clone(),
+        server_name: updated.server_name.clone(),
+        method: updated.method.clone(),
+        target: updated.target.clone(),
+        status: updated.status.clone(),
+        duration_ms: updated.duration_ms,
+        size_bytes: updated.size_bytes,
+        truncated: updated.truncated,
+        origin: updated.origin.clone(),
+        created_at: updated.created_at,
     };
     let _ = app.emit("history://recorded", summary);
+    updated
 }

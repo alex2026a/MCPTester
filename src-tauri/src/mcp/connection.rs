@@ -20,10 +20,10 @@ use tokio::sync::{Mutex, RwLock};
 use super::error::{CallError, McpError};
 use super::handler::{AppClientHandler, EventHub};
 use super::models::{
-    CallMethod, CallRecord, CallStatus, CapabilitySnapshot, ConnectionState, Handshake, HttpConfig,
-    LEGACY_FALLBACK_VERSION, LifecycleEra, PREFERRED_PROTOCOL_VERSIONS, PromptArgument, PromptInfo,
-    ProbeResult, ResourceInfo, ResourceTemplateInfo, RuntimeSettings, StdioConfig, ToolInfo,
-    TransportKind,
+    CallMethod, CallOrigin, CallRecord, CallStatus, CapabilitySnapshot, ConnectionState, Handshake,
+    HttpConfig, LEGACY_FALLBACK_VERSION, LifecycleEra, PREFERRED_PROTOCOL_VERSIONS, PromptArgument,
+    PromptInfo, ProbeResult, ResourceInfo, ResourceTemplateInfo, RuntimeSettings, StdioConfig,
+    ToolInfo, TransportKind,
 };
 use super::transport;
 use super::wire::{WireLog, WireTransport};
@@ -31,6 +31,15 @@ use super::wire::{WireLog, WireTransport};
 /// 在途调用条目（取消 = 中止本地等待 + 发送取消通知）
 struct InFlight {
     abort: tokio::task::AbortHandle,
+    canceled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 单次调用选项（测试运行器使用独立 call_id / timeout / 来源）。
+#[derive(Clone, Debug, Default)]
+pub struct CallOptions {
+    pub call_id: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub origin: CallOrigin,
 }
 
 /// 连接句柄（每个服务器一个；内部状态并发安全）
@@ -300,11 +309,21 @@ impl ConnectionHandle {
     /// 现代世代：订阅列表变更（tools / prompts / resources）
     pub async fn subscribe_list_changed(&self) -> Result<(), McpError> {
         let peer = self.peer().await?;
-        let filter = SubscriptionFilter::builder()
-            .tools_list_changed()
-            .prompts_list_changed()
-            .resources_list_changed()
-            .build();
+        let server_caps = peer.peer_info().map(|info| info.capabilities.clone());
+        let unknown_caps = server_caps.as_ref().is_none_or(|caps| {
+            caps.tools.is_none() && caps.resources.is_none() && caps.prompts.is_none()
+        });
+        let mut builder = SubscriptionFilter::builder();
+        if unknown_caps || server_caps.as_ref().is_some_and(|caps| caps.tools.is_some()) {
+            builder = builder.tools_list_changed();
+        }
+        if unknown_caps || server_caps.as_ref().is_some_and(|caps| caps.resources.is_some()) {
+            builder = builder.resources_list_changed();
+        }
+        if unknown_caps || server_caps.as_ref().is_some_and(|caps| caps.prompts.is_some()) {
+            builder = builder.prompts_list_changed();
+        }
+        let filter = builder.build();
         // listen 会等待服务器确认；Subscription::next 拉取后续通知
         let mut subscription = peer
             .listen(filter)
@@ -353,6 +372,8 @@ impl ConnectionHandle {
                 Ok(snapshot)
             }
             Err(e) => {
+                self.wire
+                    .push_system(format!("能力枚举失败：{}", e.message()));
                 // 失败回退上次快照并标注过期
                 let mut guard = self.capabilities.write().await;
                 if let Some(previous) = guard.as_mut() {
@@ -364,36 +385,111 @@ impl ConnectionHandle {
         }
     }
 
+    /// 按服务器声明的 capabilities 枚举，避免向旧/轻量服务器发送未实现的可选方法。
+    ///
+    /// 旧协议服务器常见只实现 `tools/list`，或声明了 `resources` 却未实现
+    /// `resources/templates/list`。这些方法返回 `-32601` 时应降级为空列表并给出
+    /// 警告，而不是让整个能力枚举失败。
     async fn fetch_capabilities(&self) -> Result<CapabilitySnapshot, McpError> {
         let peer = self.peer().await?;
-        let timeout = Duration::from_secs(self.settings.request_timeout_secs.max(1));
+        let server_caps = peer.peer_info().map(|info| info.capabilities.clone());
+        // 未声明任何已知能力（旧服务器或能力集缺失）时保守地探测全部列表，
+        // 保持对非标准服务器的兼容性。
+        let unknown_caps = server_caps.as_ref().is_none_or(|caps| {
+            caps.tools.is_none() && caps.resources.is_none() && caps.prompts.is_none()
+        });
+        let tools_enabled =
+            unknown_caps || server_caps.as_ref().is_some_and(|caps| caps.tools.is_some());
+        let resources_enabled =
+            unknown_caps || server_caps.as_ref().is_some_and(|caps| caps.resources.is_some());
+        let prompts_enabled =
+            unknown_caps || server_caps.as_ref().is_some_and(|caps| caps.prompts.is_some());
 
-        let result = tokio::time::timeout(timeout, async {
-            let tools = peer.list_all_tools().await?;
-            let resources = peer.list_all_resources().await?;
-            let templates = peer.list_all_resource_templates().await?;
-            let prompts = peer.list_all_prompts().await?;
-            Ok::<_, ServiceError>((tools, resources, templates, prompts))
-        })
-        .await;
+        // 整个枚举共享一个超时预算，避免多个可选能力依次超时导致等待时间翻倍。
+        let deadline = Instant::now() + Duration::from_secs(self.settings.request_timeout_secs.max(1));
+        let mut warnings = Vec::new();
+        let mut skipped = Vec::new();
 
-        match result {
-            Err(_) => Err(McpError::Internal {
-                message: "枚举接口超时".to_string(),
-            }),
-            Ok(Err(e)) => Err(McpError::Internal {
-                message: format!("枚举接口失败：{e}"),
-            }),
-            Ok(Ok((tools, resources, templates, prompts))) => Ok(CapabilitySnapshot {
-                server_id: self.server_id.clone(),
-                tools: tools.iter().map(convert_tool).collect(),
-                resources: resources.iter().map(convert_resource).collect(),
-                resource_templates: templates.iter().map(convert_template).collect(),
-                prompts: prompts.iter().map(convert_prompt).collect(),
-                fetched_at: Utc::now(),
-                stale: false,
-            }),
+        // tools/list 是核心能力：声明后若失败（-32601 除外）仍视为错误。
+        let tools = if tools_enabled {
+            let (items, warning) = handle_list_result(
+                "tools/list",
+                true,
+                tokio::time::timeout(remaining_timeout(deadline), peer.list_all_tools()).await,
+            )?;
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            items
+        } else {
+            skipped.push("tools/list（未声明 tools）");
+            Vec::new()
+        };
+
+        // resources/prompts 及可选的模板列表属于增强能力：失败降级为警告，
+        // 避免一个未实现的可选方法拖垮工具列表。
+        let (resources, templates) = if resources_enabled {
+            let (resources, warning) = handle_list_result(
+                "resources/list",
+                false,
+                tokio::time::timeout(remaining_timeout(deadline), peer.list_all_resources()).await,
+            )?;
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            let (templates, warning) = handle_list_result(
+                "resources/templates/list",
+                false,
+                tokio::time::timeout(
+                    remaining_timeout(deadline),
+                    peer.list_all_resource_templates(),
+                )
+                .await,
+            )?;
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            (resources, templates)
+        } else {
+            skipped.push("resources/list、resources/templates/list（未声明 resources）");
+            (Vec::new(), Vec::new())
+        };
+
+        let prompts = if prompts_enabled {
+            let (items, warning) = handle_list_result(
+                "prompts/list",
+                false,
+                tokio::time::timeout(remaining_timeout(deadline), peer.list_all_prompts()).await,
+            )?;
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            items
+        } else {
+            skipped.push("prompts/list（未声明 prompts）");
+            Vec::new()
+        };
+
+        if !skipped.is_empty() {
+            self.wire.push_system(format!(
+                "按服务器能力跳过枚举：{}",
+                skipped.join("、")
+            ));
         }
+        for warning in &warnings {
+            self.wire.push_system(format!("能力枚举降级：{warning}"));
+        }
+
+        Ok(CapabilitySnapshot {
+            server_id: self.server_id.clone(),
+            tools: tools.iter().map(convert_tool).collect(),
+            resources: resources.iter().map(convert_resource).collect(),
+            resource_templates: templates.iter().map(convert_template).collect(),
+            prompts: prompts.iter().map(convert_prompt).collect(),
+            fetched_at: Utc::now(),
+            stale: false,
+            warnings,
+        })
     }
 
     /// 健康探测：现代世代用幂等枚举探测，旧世代发送 ping 请求
@@ -408,10 +504,34 @@ impl ConnectionHandle {
 
         let result = match era {
             LifecycleEra::Modern => {
-                // 现代世代无 ping：用一次全量枚举作为幂等探测
-                tokio::time::timeout(timeout, peer.list_all_tools())
-                    .await
-                    .map(|r| r.map(|tools| format!("可用（{} 个工具）", tools.len())))
+                // 现代世代无 ping：按服务器声明的能力选择一次幂等枚举作为探测。
+                let server_caps = peer.peer_info().map(|info| info.capabilities.clone());
+                tokio::time::timeout(timeout, async {
+                    match server_caps.as_ref() {
+                        Some(caps)
+                            if caps.tools.is_some()
+                                || (caps.resources.is_none() && caps.prompts.is_none()) =>
+                        {
+                            peer.list_all_tools()
+                                .await
+                                .map(|tools| format!("可用（{} 个工具）", tools.len()))
+                        }
+                        Some(caps) if caps.resources.is_some() => peer
+                            .list_all_resources()
+                            .await
+                            .map(|items| format!("可用（{} 个资源）", items.len())),
+                        Some(caps) if caps.prompts.is_some() => peer
+                            .list_all_prompts()
+                            .await
+                            .map(|items| format!("可用（{} 个提示词）", items.len())),
+                        Some(_) => Ok("可用（服务器未声明可枚举能力）".to_string()),
+                        None => peer
+                            .list_all_tools()
+                            .await
+                            .map(|tools| format!("可用（{} 个工具）", tools.len())),
+                    }
+                })
+                .await
             }
             LifecycleEra::Legacy => {
                 let request = ClientRequest::PingRequest(PingRequest {
@@ -455,12 +575,30 @@ impl ConnectionHandle {
         name: &str,
         arguments: Value,
     ) -> CallRecord {
+        self.call_tool_with_options(
+            name,
+            arguments,
+            CallOptions {
+                call_id,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// 调用工具（测试运行器：独立 call_id / timeout / origin）。
+    pub async fn call_tool_with_options(
+        &self,
+        name: &str,
+        arguments: Value,
+        options: CallOptions,
+    ) -> CallRecord {
         let record_params = serde_json::json!({ "name": name, "arguments": arguments.clone() });
         let params = match arguments {
             Value::Object(map) => CallToolRequestParams::new(name.to_string()).with_arguments(map),
             Value::Null => CallToolRequestParams::new(name.to_string()),
             other => {
-                return self
+                let mut record = self
                     .failed_record(
                         CallMethod::ToolsCall,
                         name,
@@ -470,6 +608,11 @@ impl ConnectionHandle {
                         },
                     )
                     .await;
+                if let Some(call_id) = options.call_id {
+                    record.id = call_id;
+                }
+                record.origin = options.origin;
+                return record;
             }
         };
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
@@ -478,13 +621,21 @@ impl ConnectionHandle {
             name.to_string(),
             request,
             record_params,
-            call_id,
+            options,
         )
         .await
     }
 
     /// 读取资源
     pub async fn read_resource(&self, uri: &str) -> CallRecord {
+        self.read_resource_with_options(uri, CallOptions::default()).await
+    }
+
+    pub async fn read_resource_with_options(
+        &self,
+        uri: &str,
+        options: CallOptions,
+    ) -> CallRecord {
         let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
             ReadResourceRequestParams::new(uri.to_string()),
         ));
@@ -493,13 +644,23 @@ impl ConnectionHandle {
             uri.to_string(),
             request,
             serde_json::json!({ "uri": uri }),
-            None,
+            options,
         )
         .await
     }
 
     /// 获取提示词
     pub async fn get_prompt(&self, name: &str, arguments: Value) -> CallRecord {
+        self.get_prompt_with_options(name, arguments, CallOptions::default())
+            .await
+    }
+
+    pub async fn get_prompt_with_options(
+        &self,
+        name: &str,
+        arguments: Value,
+        options: CallOptions,
+    ) -> CallRecord {
         let mut params = GetPromptRequestParams::new(name.to_string());
         if let Value::Object(map) = arguments.clone() {
             params.arguments = Some(map);
@@ -510,7 +671,7 @@ impl ConnectionHandle {
             name.to_string(),
             request,
             serde_json::json!({ "name": name, "arguments": arguments }),
-            None,
+            options,
         )
         .await
     }
@@ -522,11 +683,37 @@ impl ConnectionHandle {
         target: String,
         request: ClientRequest,
         params: Value,
-        call_id: Option<String>,
+        options: CallOptions,
+    ) -> CallRecord {
+        let call_id = options.call_id.clone();
+        let origin = options.origin.clone();
+        let mut record = self
+            .invoke_inner(method, target, request, params, options)
+            .await;
+        if let Some(call_id) = call_id {
+            record.id = call_id;
+        }
+        record.origin = origin;
+        record
+    }
+
+    async fn invoke_inner(
+        &self,
+        method: CallMethod,
+        target: String,
+        request: ClientRequest,
+        params: Value,
+        options: CallOptions,
     ) -> CallRecord {
         let started = Instant::now();
-        let call_id = call_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let timeout_secs = self.settings.request_timeout_secs.max(1);
+        let call_id = options
+            .call_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let timeout_secs = options
+            .timeout_secs
+            .unwrap_or(self.settings.request_timeout_secs)
+            .max(1);
 
         let peer = match self.peer().await {
             Ok(peer) => peer,
@@ -569,10 +756,12 @@ impl ConnectionHandle {
             let result = handle.await_response().await;
             let _ = response_tx.send(result);
         });
+        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.inflight.lock().await.insert(
             call_id.clone(),
             InFlight {
                 abort: responder.abort_handle(),
+                canceled: Arc::clone(&canceled),
             },
         );
 
@@ -580,6 +769,20 @@ impl ConnectionHandle {
             Ok(result) => result,
             Err(_) => {
                 // 等待任务被中止（取消）或异常结束
+                if canceled.load(std::sync::atomic::Ordering::SeqCst) {
+                    return self
+                        .finish_record(
+                            method,
+                            target,
+                            params,
+                            started,
+                            Some(protocol_version),
+                            None,
+                            None,
+                            Some(CallStatus::Canceled),
+                        )
+                        .await;
+                }
                 return self
                     .record_with_error(
                         method,
@@ -685,6 +888,9 @@ impl ConnectionHandle {
     pub async fn cancel_call(&self, call_id: &str) -> bool {
         let entry = self.inflight.lock().await.remove(call_id);
         let Some(entry) = entry else { return false };
+        entry
+            .canceled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         entry.abort.abort();
         if let Ok(peer) = self.peer().await {
             let _ = peer
@@ -797,9 +1003,71 @@ impl ConnectionHandle {
             transport: self.transport_kind().await,
             truncated: false,
             size_bytes,
+            origin: CallOrigin::Manual,
             created_at: Utc::now(),
         }
     }
+}
+
+/// 处理单个列表枚举结果：
+/// - 传输关闭/取消：始终视为致命错误；
+/// - `-32601`：服务器未实现该方法，降级为空列表；
+/// - 非核心能力（`fatal=false`）的其他错误或超时：降级为空列表并给出警告；
+/// - 核心能力（`fatal=true`）的其他错误或超时：返回错误。
+fn handle_list_result<T>(
+    label: &str,
+    fatal: bool,
+    result: Result<Result<Vec<T>, ServiceError>, tokio::time::error::Elapsed>,
+) -> Result<(Vec<T>, Option<String>), McpError> {
+    match result {
+        Ok(Ok(items)) => Ok((items, None)),
+        Ok(Err(error)) if is_connection_fatal(&error) => Err(McpError::Internal {
+            message: format!("枚举 {label} 失败：{error}"),
+        }),
+        Ok(Err(error)) if is_method_not_found(&error) => Ok((
+            Vec::new(),
+            Some(format!(
+                "{label} 返回 -32601（Method not found），已按空列表处理"
+            )),
+        )),
+        Ok(Err(error)) if !fatal => Ok((
+            Vec::new(),
+            Some(format!("{label} 枚举失败：{error}，已按空列表处理")),
+        )),
+        Ok(Err(error)) => Err(McpError::Internal {
+            message: format!("枚举 {label} 失败：{error}"),
+        }),
+        Err(_) if !fatal => Ok((Vec::new(), Some(format!("{label} 枚举超时，已跳过")))),
+        Err(_) => Err(McpError::Internal {
+            message: format!("枚举 {label} 超时"),
+        }),
+    }
+}
+
+/// 共享超时预算的剩余时间（至少 1ms，避免已耗尽时立即误判）。
+fn remaining_timeout(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1))
+}
+
+/// 传输层错误：连接已不可用，继续枚举其他能力没有意义。
+fn is_connection_fatal(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::TransportClosed
+            | ServiceError::TransportSend(_)
+            | ServiceError::Cancelled { .. }
+    )
+}
+
+/// JSON-RPC `-32601 Method not found`（服务器未实现该方法）。
+fn is_method_not_found(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::McpError(data)
+            if data.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND
+    )
 }
 
 /// 初始化错误 → 中文可读分类（v0.1.1：以 rmcp 官方 API 判定为主，文本匹配仅兜底；

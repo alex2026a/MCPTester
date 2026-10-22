@@ -10,7 +10,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { formatBytes } from "./format";
 import { JsonText } from "./JsonText";
 import { JsonTree } from "./JsonTree";
-import { McpContentView } from "./McpContentView";
+import { McpContentView, type ErrorTone } from "./McpContentView";
 import { buildMcpView } from "./mcpView";
 import type { JsonMatch } from "./paths";
 
@@ -26,6 +26,8 @@ export interface MessageViewerProps {
   text?: string;
   /** MCP 方法（tools_call / resources_read / prompts_get），用于语义渲染 */
   method?: string;
+  /** isError 文案的着色；默认 error，保持 Explorer/History 现有行为 */
+  errorTone?: ErrorTone;
   /** 后端记录的结果字节数（优先于本地估算） */
   sizeBytes?: number;
   /** 结果是否被截断入库 */
@@ -51,6 +53,7 @@ export function MessageViewer({
   value,
   text,
   method,
+  errorTone = "error",
   sizeBytes,
   truncated = false,
   defaultTab,
@@ -354,7 +357,7 @@ export function MessageViewer({
   if (tab === "rendered" && mcpView) {
     body = (
       <div className={`${fullscreen ? "max-h-[calc(100vh-150px)]" : contentClassName} p-2`}>
-        <McpContentView view={mcpView} markdown={markdown} />
+        <McpContentView view={mcpView} markdown={markdown} errorTone={errorTone} />
       </div>
     );
   } else if (tab === "tree" && parsed.ok) {

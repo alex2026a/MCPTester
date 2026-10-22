@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { EventPanel } from "../components/EventPanel";
@@ -39,6 +40,7 @@ function isBlank(value: string | undefined): boolean {
 /** 接口页：枚举 + 调用台（Tools / Resources / 模板 / Prompts） */
 export function Explorer() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const servers = useQuery({ queryKey: ["servers"], queryFn: listServers });
   const appInfo = useQuery({ queryKey: ["appInfo"], queryFn: getAppInfo });
   const replay = useReplayStore((s) => s.replay);
@@ -343,6 +345,17 @@ export function Explorer() {
         ) : null}
       </div>
 
+      {capabilities.data?.warnings.length ? (
+        <div className="mb-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+          <div className="font-medium">部分能力未启用或枚举失败：</div>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5">
+            {capabilities.data.warnings.map((warning, index) => (
+              <li key={`${index}:${warning}`}>{warning}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       {replayBanner ? (
         <div className="mb-3 flex items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
           <span className="truncate">{replayBanner}</span>
@@ -408,10 +421,12 @@ export function Explorer() {
           description="请先在「服务器」页添加并连接一个服务器。"
         />
       ) : !ready ? (
-        <EmptyState
-          title="服务器未连接"
-          description="切换到「服务器」页连接后即可枚举与调用接口。"
-        />
+        <div className="flex min-h-0 flex-1 flex-col">
+          <EmptyState
+            title="服务器未连接"
+            description="切换到「服务器」页连接后即可枚举与调用接口。"
+          />
+        </div>
       ) : capabilities.isLoading ? (
         <div className="text-sm text-slate-400">枚举接口中…</div>
       ) : capabilities.isError ? (
@@ -459,8 +474,19 @@ export function Explorer() {
             ) : viewTab === "tools" && currentTool ? (
               <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
                 <div>
-                  <div className="text-sm font-medium text-slate-800">
-                    {currentTool.name}
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-medium text-slate-800">
+                      {currentTool.name}
+                    </div>
+                    <button
+                      type="button"
+                      className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                      onClick={() =>
+                        navigate(`/tests?target=${encodeURIComponent(currentTool.name)}`)
+                      }
+                    >
+                      生成用例
+                    </button>
                   </div>
                   {currentTool.description ? (
                     <div className="mt-1 text-xs text-slate-500">
@@ -707,12 +733,12 @@ export function Explorer() {
             )}
 
             {result ? <ResultViewer record={result} /> : null}
-            {currentServer ? (
-              <EventPanel key={currentServer.id} serverId={currentServer.id} />
-            ) : null}
           </div>
         </div>
       )}
+      {currentServer ? (
+        <EventPanel key={currentServer.id} serverId={currentServer.id} />
+      ) : null}
     </section>
   );
 }

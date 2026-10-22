@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ErrorDetailDialog } from "./ErrorDetailDialog";
+import { JsonViewer } from "./JsonViewer";
 import { toErrorInfo, type ErrorInfo } from "../lib/errors";
 import { toast } from "../stores/toast";
 import type { ConnectionTestReport } from "../api/servers";
@@ -464,6 +465,16 @@ export function ServerForm({
               </li>
             ))}
           </ul>
+          {testReport.wire.length > 0 ? (
+            <details className="rounded border border-slate-200 bg-white/70 px-2 py-1">
+              <summary className="cursor-pointer text-xs text-slate-500">
+                查看本次报文（{testReport.wire.length} 条）
+              </summary>
+              <div className="mt-2 max-h-64 overflow-auto">
+                <JsonViewer value={testReport.wire} defaultMode="tree" />
+              </div>
+            </details>
+          ) : null}
         </div>
       ) : null}
 

@@ -14,6 +14,30 @@ pub struct Settings {
     pub notification_buffer_lines: usize,
     pub auto_reconnect: bool,
     pub auto_refresh_on_list_changed: bool,
+    #[serde(default = "default_test_call_retention_days")]
+    pub test_call_retention_days: u32,
+    #[serde(default = "default_test_call_max_rows")]
+    pub test_call_max_rows: u32,
+    #[serde(default = "default_test_run_retention_days")]
+    pub test_run_retention_days: u32,
+    #[serde(default = "default_test_run_max_rows")]
+    pub test_run_max_rows: u32,
+}
+
+fn default_test_call_retention_days() -> u32 {
+    30
+}
+
+fn default_test_call_max_rows() -> u32 {
+    5000
+}
+
+fn default_test_run_retention_days() -> u32 {
+    90
+}
+
+fn default_test_run_max_rows() -> u32 {
+    100
 }
 
 impl Default for Settings {
@@ -27,6 +51,10 @@ impl Default for Settings {
             notification_buffer_lines: 1000,
             auto_reconnect: true,
             auto_refresh_on_list_changed: true,
+            test_call_retention_days: default_test_call_retention_days(),
+            test_call_max_rows: default_test_call_max_rows(),
+            test_run_retention_days: default_test_run_retention_days(),
+            test_run_max_rows: default_test_run_max_rows(),
         }
     }
 }
@@ -75,5 +103,25 @@ mod tests {
         let loaded = get(&conn).expect("读取失败");
         assert_eq!(loaded.request_timeout_secs, 5);
         assert_eq!(loaded.history_retention_days, 7);
+    }
+
+    #[test]
+    fn old_settings_json_keeps_values_and_defaults_new_fields() {
+        let dir = tempfile::tempdir().expect("临时目录创建失败");
+        let mut conn = rusqlite::Connection::open(dir.path().join("test.db")).expect("打开失败");
+        crate::storage::migrations::run(&mut conn).expect("迁移失败");
+        // v0.2.0 及更早的 settings JSON（不含测试保留字段）
+        conn.execute(
+            "INSERT INTO settings (id, json) VALUES (1, ?1)",
+            [r#"{"request_timeout_secs":9,"connect_timeout_secs":3,"history_retention_days":5,"history_max_rows":77,"stderr_buffer_lines":100,"notification_buffer_lines":50,"auto_reconnect":false,"auto_refresh_on_list_changed":false}"#],
+        )
+        .expect("写入失败");
+
+        let loaded = get(&conn).expect("读取失败");
+        assert_eq!(loaded.request_timeout_secs, 9);
+        assert_eq!(loaded.history_retention_days, 5);
+        assert!(!loaded.auto_reconnect);
+        assert_eq!(loaded.test_call_retention_days, 30);
+        assert_eq!(loaded.test_run_max_rows, 100);
     }
 }

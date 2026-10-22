@@ -110,6 +110,46 @@ export function SettingsPage() {
 
         <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4 text-sm">
           <div className="text-xs font-medium text-slate-500">
+            测试与报告保留
+          </div>
+          {effective ? (
+            <div className="grid grid-cols-2 gap-3">
+              <NumberField
+                label="测试调用保留天数"
+                value={effective.test_call_retention_days}
+                onChange={(value) =>
+                  setDraft({ ...effective, test_call_retention_days: value })
+                }
+              />
+              <NumberField
+                label="测试调用最大条数"
+                value={effective.test_call_max_rows}
+                onChange={(value) =>
+                  setDraft({ ...effective, test_call_max_rows: value })
+                }
+              />
+              <NumberField
+                label="测试报告保留天数"
+                value={effective.test_run_retention_days}
+                onChange={(value) =>
+                  setDraft({ ...effective, test_run_retention_days: value })
+                }
+              />
+              <NumberField
+                label="测试报告最大运行数"
+                value={effective.test_run_max_rows}
+                onChange={(value) =>
+                  setDraft({ ...effective, test_run_max_rows: value })
+                }
+              />
+            </div>
+          ) : (
+            <div className="text-xs text-slate-400">加载中…</div>
+          )}
+        </div>
+
+        <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4 text-sm">
+          <div className="text-xs font-medium text-slate-500">
             运行与启动配置
           </div>
           {appInfo.isLoading ? (
