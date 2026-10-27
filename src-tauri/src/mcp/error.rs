@@ -37,6 +37,21 @@ pub enum McpError {
         detail: Option<String>,
     },
 
+    /// OAuth 服务器要求登录授权（v0.3.0）
+    #[serde(rename = "oauth_required")]
+    #[error("需要 OAuth 登录授权{suffix}", suffix = unauthorized_suffix(.detail))]
+    OAuthRequired {
+        /// 服务器 `WWW-Authenticate` 挑战原文（如有）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// 从挑战解析的 Protected Resource Metadata URL
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resource_metadata_url: Option<String>,
+        /// 403 insufficient_scope 的 required_scope
+        #[serde(skip_serializing_if = "Option::is_none")]
+        required_scope: Option<String>,
+    },
+
     /// 旧世代服务器请求客户端能力（现代世代不存在该场景）
     #[error("服务器请求了客户端能力 {capability}（v0.1 不支持）")]
     UnsupportedClientCapability { capability: String },
@@ -63,7 +78,7 @@ fn unauthorized_suffix(detail: &Option<String>) -> String {
 }
 
 /// 结构化连接错误（`connect_server` / `reconnect_server` 的失败载荷）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct McpErrorInfo {
     /// 错误类别（`McpError` serde tag，前端映射人话标题与修复建议）
     pub kind: String,
@@ -71,6 +86,12 @@ pub struct McpErrorInfo {
     pub message: String,
     /// 原始技术细节（SDK 原文 / 挑战原文，详情弹窗展示）
     pub raw: Option<String>,
+    /// 403 insufficient_scope 的 required_scope
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_scope: Option<String>,
+    /// 从挑战解析的 Protected Resource Metadata URL
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_metadata_url: Option<String>,
 }
 
 impl McpError {
@@ -87,6 +108,7 @@ impl McpError {
             McpError::HandshakeFailed { .. } => "handshake_failed",
             McpError::UnsupportedProtocolVersion { .. } => "unsupported_protocol_version",
             McpError::Unauthorized { .. } => "unauthorized",
+            McpError::OAuthRequired { .. } => "oauth_required",
             McpError::UnsupportedClientCapability { .. } => "unsupported_client_capability",
             McpError::ConnectTimeout { .. } => "connect_timeout",
             McpError::Config { .. } => "config",
@@ -103,16 +125,43 @@ impl McpError {
             | McpError::Config { message }
             | McpError::Internal { message } => Some(message.clone()),
             McpError::Unauthorized { detail, .. } => detail.clone(),
+            McpError::OAuthRequired {
+                detail,
+                resource_metadata_url,
+                required_scope,
+            } => {
+                let mut parts = Vec::new();
+                if let Some(detail) = detail {
+                    parts.push(detail.clone());
+                }
+                if let Some(url) = resource_metadata_url {
+                    parts.push(format!("resource_metadata={url}"));
+                }
+                if let Some(scope) = required_scope {
+                    parts.push(format!("required_scope={scope}"));
+                }
+                (!parts.is_empty()).then(|| parts.join("；"))
+            }
             _ => None,
         }
     }
 
     /// 结构化错误载荷
     pub fn to_info(&self) -> McpErrorInfo {
+        let (required_scope, resource_metadata_url) = match self {
+            McpError::OAuthRequired {
+                required_scope,
+                resource_metadata_url,
+                ..
+            } => (required_scope.clone(), resource_metadata_url.clone()),
+            _ => (None, None),
+        };
         McpErrorInfo {
             kind: self.kind().to_string(),
             message: self.message(),
             raw: self.raw(),
+            required_scope,
+            resource_metadata_url,
         }
     }
 }
@@ -141,6 +190,30 @@ pub enum CallError {
     #[error("参数校验失败：{message}")]
     Validation { message: String },
 
+    /// OAuth 认证失效（连接后 token 被撤销/刷新失败）
+    #[serde(rename = "oauth_required")]
+    #[error("需要 OAuth 登录授权{suffix}", suffix = unauthorized_suffix(.detail))]
+    OAuthRequired {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_metadata_url: Option<String>,
+    },
+
+    /// 非 step-up 的 403（服务器拒绝访问，不是“连接已关闭”）
+    #[error("服务器拒绝访问（HTTP {status}）{suffix}", suffix = unauthorized_suffix(.detail))]
+    Forbidden {
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// OAuth 临时认证失败（刷新/凭据存储），可重试
+    #[error("OAuth 临时认证失败：{detail}")]
+    AuthTransient { detail: String },
+
     /// MRTR：结果 `resultType:"input_required"`（v0.1 不支持交互式输入）
     #[error("需要交互式输入（MRTR input_required，v0.1 不支持）")]
     InputRequired,
@@ -156,8 +229,34 @@ pub enum CallError {
 
 impl CallError {
     /// 将 rmcp 服务错误映射为调用错误（超时 / 传输关闭 / RPC 错误）
-    pub fn from_service_error(err: &rmcp::service::ServiceError, timeout_secs: u64) -> Self {
+    pub fn from_service_error(
+        err: &rmcp::service::ServiceError,
+        timeout_secs: u64,
+        oauth_enabled: bool,
+        base_url: Option<&url::Url>,
+    ) -> Self {
+        use crate::mcp::connection::AuthFailure;
         use rmcp::service::ServiceError;
+        if oauth_enabled
+            && let ServiceError::TransportSend(error) = err
+            && let Some(failure) = crate::mcp::connection::classify_oauth_service_error(
+                error, base_url,
+            )
+        {
+            return match failure {
+                AuthFailure::Unauthorized(challenge)
+                | AuthFailure::InsufficientScope(challenge) => CallError::OAuthRequired {
+                    detail: Some(challenge.raw),
+                    required_scope: challenge.required_scope,
+                    resource_metadata_url: challenge.resource_metadata_url,
+                },
+                AuthFailure::Forbidden { status, detail } => CallError::Forbidden {
+                    status,
+                    detail: Some(detail),
+                },
+                AuthFailure::Transient(detail) => CallError::AuthTransient { detail },
+            };
+        }
         match err {
             ServiceError::Timeout { .. } => CallError::Timeout { timeout_secs },
             ServiceError::TransportClosed => CallError::TransportClosed {
@@ -172,9 +271,7 @@ impl CallError {
                 data: data.data.clone(),
             },
             ServiceError::Cancelled { reason } => CallError::TransportClosed {
-                reason: reason
-                    .clone()
-                    .unwrap_or_else(|| "请求已取消".to_string()),
+                reason: reason.clone().unwrap_or_else(|| "请求已取消".to_string()),
             },
             other => CallError::Internal {
                 message: other.to_string(),

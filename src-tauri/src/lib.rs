@@ -8,7 +8,7 @@ pub mod core;
 mod credentials;
 mod logging;
 pub mod mcp;
-mod storage;
+pub mod storage;
 pub mod testing;
 
 use std::sync::Arc;
@@ -66,9 +66,15 @@ pub fn run() {
                 .map_err(setup_error)?;
             db.migrate().map_err(setup_error)?;
 
+            let oauth = mcp::oauth::OAuthService::new(db.clone(), paths.portable);
+            let manager = Arc::new(mcp::ConnectionManager::new(
+                RuntimeSettings::default(),
+                Some(oauth.clone()),
+            ));
             let state = AppState {
                 db,
-                manager: Arc::new(mcp::ConnectionManager::new(RuntimeSettings::default())),
+                manager,
+                oauth,
                 data_dir: paths.data_dir.clone(),
                 log_dir: paths.log_dir.clone(),
                 portable: paths.portable,
@@ -130,6 +136,7 @@ pub fn run() {
             commands::server::add_server,
             commands::server::update_server,
             commands::server::update_server_meta,
+            commands::server::reorder_servers,
             commands::server::delete_server,
             commands::server::connect_server,
             commands::server::disconnect_server,
@@ -146,6 +153,8 @@ pub fn run() {
             commands::call::cancel_call,
             commands::call::probe_server,
             commands::history::list_call_records,
+            commands::history::list_recent_call_params,
+            commands::history::get_call_params,
             commands::history::get_call_record,
             commands::history::get_full_result_path,
             commands::history::read_full_result,
@@ -161,6 +170,14 @@ pub fn run() {
             commands::import_export::preview_export_servers,
             commands::import_export::get_server_json,
             commands::server::test_server_connection,
+            commands::oauth::start_oauth_login,
+            commands::oauth::cancel_oauth_login,
+            commands::oauth::get_oauth_status,
+            commands::oauth::logout_oauth,
+            commands::oauth::clear_oauth_registration,
+            commands::oauth::get_oauth_diagnostics,
+            commands::oauth::refresh_oauth_token,
+            commands::oauth::get_oauth_access_token,
             commands::testing::list_test_suites,
             commands::testing::get_test_suite,
             commands::testing::create_test_suite,

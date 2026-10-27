@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Reports } from "./Reports";
 import type {
@@ -169,13 +170,15 @@ const caseDetail: TestRunCaseDetail = {
   },
 };
 
-function renderReports() {
+function renderReports(initialEntry = "/reports") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <Reports />
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <Reports />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -243,6 +246,13 @@ beforeEach(() => {
 });
 
 describe("Reports 页面", () => {
+  it("通过 run 参数打开时选中指定运行", async () => {
+    renderReports("/reports?run=run-2");
+
+    expect(await screen.findByText("用例 A")).toBeInTheDocument();
+    expect(lastCaseCall().runId).toBe("run-2");
+  });
+
   it("没有运行时展示空态", async () => {
     invokeMock.mockImplementation(((cmd: string) => {
       if (cmd === "list_test_runs") {

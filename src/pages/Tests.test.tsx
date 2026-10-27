@@ -1,14 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Tests } from "./Tests";
 import type { ServerSummary } from "../types/models";
 import type { TestCase, TestSuiteSummary } from "../types/testing";
 
 const invokeMock = vi.mocked(invoke);
+const listenMock = vi.mocked(listen);
 
 const server: ServerSummary = {
   id: "srv-1",
@@ -55,6 +57,11 @@ const testCase: TestCase = {
   updated_at: "2026-10-21T00:00:00Z",
 };
 
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
+}
+
 function renderTests() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -63,6 +70,7 @@ function renderTests() {
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={["/tests"]}>
         <Tests />
+        <LocationProbe />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -70,6 +78,8 @@ function renderTests() {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  listenMock.mockReset();
+  listenMock.mockResolvedValue(() => {});
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "list_servers":
@@ -136,5 +146,70 @@ describe("Tests 页面", () => {
         tags: [],
       },
     });
+  });
+
+  it("运行完成后「查看报告」跳转到对应报告", async () => {
+    const handlers = new Map<string, (event: { payload: unknown }) => void>();
+    listenMock.mockImplementation(((
+      event: string,
+      handler: (event: { payload: unknown }) => void,
+    ) => {
+      handlers.set(event, handler);
+      return Promise.resolve(() => {});
+    }) as never);
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([server]);
+        case "list_test_suites":
+          return Promise.resolve([suite]);
+        case "list_test_cases":
+          return Promise.resolve([testCase]);
+        case "get_active_test_run":
+          return Promise.resolve({
+            run_id: "run-9",
+            server_id: "srv-1",
+            total: 1,
+            completed: 1,
+            started_at: "2026-10-21T00:00:00Z",
+          });
+        default:
+          return Promise.resolve(null);
+      }
+    }) as never);
+
+    renderTests();
+    expect(await screen.findByText("测试运行中")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(handlers.has("test://run-finished")).toBe(true),
+    );
+
+    act(() => {
+      handlers.get("test://run-finished")?.({
+        payload: {
+          run_id: "run-9",
+          status: "completed",
+          summary: {
+            total: 1,
+            passed: 1,
+            failed: 0,
+            warning: 0,
+            skipped: 0,
+            error: 0,
+            canceled: 0,
+            pass_rate: 1,
+            effective_pass_rate: 1,
+          },
+        },
+      });
+    });
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "查看报告" }),
+    );
+
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/reports?run=run-9",
+    );
   });
 });

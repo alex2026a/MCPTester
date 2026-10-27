@@ -58,6 +58,63 @@ pub struct StdioConfig {
     pub shell_wrap: ShellWrap,
 }
 
+/// OAuth 授权请求额外参数（v0.3.1）
+///
+/// 只追加到 authorization request，不进入 token/refresh 请求；key 由后端
+/// 校验，禁止覆盖 state/PKCE/client_id 等保留参数。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OAuthParam {
+    pub key: String,
+    pub value: String,
+}
+
+/// OAuth 2.1 登录配置（v0.3.0；v0.3.1 增加互操作字段）
+///
+/// `Some/None` 即开关；`client_secret` 只用于 UI 回显掩码，真实值保存在
+/// `oauth_credentials`。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OAuthConfig {
+    /// 请求的 scope；空 = 由授权服务器元数据自动选择
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// 预注册 client_id；空 = 动态客户端注册
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// UI 掩码；真实 secret 由 `ServerDraft.secrets` 写入 oauth_credentials
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// 完整回调地址；None = http://127.0.0.1:33318/oauth/callback
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    /// 手工端点模式的 issuer（可选；用于 RFC 9207 校验）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// 容忍元数据缺少 issuer（仅兼容不规范服务器）
+    #[serde(default)]
+    pub allow_missing_issuer: bool,
+    /// 授权请求额外参数（v0.3.1）；只追加到 authorization request
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorize_params: Vec<OAuthParam>,
+    /// 显式允许把自定义 header 发往跨源授权服务器（v0.3.1）
+    #[serde(default)]
+    pub forward_headers_to_auth_server: bool,
+    /// CIMD（SEP-991）客户端元数据文档 URL；None = 不启用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_metadata_url: Option<String>,
+    /// 手工端点模式的 token 端点认证方式
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<String>,
+    /// 退出登录时使用的撤销端点（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+}
+
 /// HTTP / SSE 传输配置
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HttpConfig {
@@ -68,6 +125,9 @@ pub struct HttpConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub allow_insecure_tls: bool,
+    /// Some = 使用 OAuth；None = 手工 Authorization / 无认证
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfig>,
 }
 
 /// 服务器来源（配置文件 seed 的服务器带此标记）
@@ -280,6 +340,17 @@ impl CallStatus {
     }
 }
 
+/// 单次调用的 JSON-RPC 原始帧（脱敏/截断前采集）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CallFrames {
+    /// 线上 JSON-RPC id，保留 number / string 类型
+    pub rpc_id: Option<serde_json::Value>,
+    pub request: Option<serde_json::Value>,
+    pub response: Option<serde_json::Value>,
+    /// 任一帧因超限/异常未保存
+    pub truncated: bool,
+}
+
 /// 历史记录（persist：call_records）
 #[derive(Serialize, Clone, Debug)]
 pub struct CallRecord {
@@ -299,6 +370,9 @@ pub struct CallRecord {
     pub size_bytes: u64,
     #[serde(default)]
     pub origin: CallOrigin,
+    /// 原始 JSON-RPC 帧；旧记录/不支持的方法为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<CallFrames>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -319,6 +393,22 @@ pub struct CallRecordSummary {
     pub created_at: DateTime<Utc>,
 }
 
+/// 服务器 OAuth 摘要（列表用；不读 keyring）
+#[derive(Serialize, Clone, Debug)]
+pub struct OAuthSummary {
+    pub configured: bool,
+    pub authorized: bool,
+    pub refreshable: bool,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// 403 insufficient_scope 的 required_scope（v0.3.1）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_scope: Option<String>,
+    /// 连接仍 Ready、但需要补充授权
+    #[serde(default)]
+    pub step_up_required: bool,
+}
+
 /// 服务器摘要（列表 / 状态事件）
 #[derive(Serialize, Clone, Debug)]
 pub struct ServerSummary {
@@ -329,6 +419,8 @@ pub struct ServerSummary {
     pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<ServerOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthSummary>,
     pub last_connected_at: Option<DateTime<Utc>>,
     pub state: ConnectionState,
 }
@@ -376,3 +468,35 @@ pub const PREFERRED_PROTOCOL_VERSIONS: [rmcp::model::ProtocolVersion; 5] = [
 /// 旧世代回退版本（取最新 legacy，rmcp 官方示例口径）
 pub const LEGACY_FALLBACK_VERSION: rmcp::model::ProtocolVersion =
     rmcp::model::ProtocolVersion::V_2025_11_25;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_http_config_without_oauth_deserializes() {
+        let json = r#"{
+            "url": "https://example.com/mcp",
+            "headers": [],
+            "timeout_secs": 10,
+            "allow_insecure_tls": false
+        }"#;
+        let config: HttpConfig = serde_json::from_str(json).expect("旧配置反序列化失败");
+        assert!(config.oauth.is_none());
+    }
+
+    #[test]
+    fn oauth_config_roundtrip_skips_none() {
+        let config = OAuthConfig {
+            scopes: vec!["read".to_string()],
+            client_id: Some("client".to_string()),
+            redirect_uri: Some("http://127.0.0.1:33318/oauth/callback".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&config).expect("序列化失败");
+        assert_eq!(value["scopes"][0], "read");
+        assert!(value.get("client_secret").is_none());
+        let back: OAuthConfig = serde_json::from_value(value).expect("反序列化失败");
+        assert_eq!(back, config);
+    }
+}

@@ -10,7 +10,9 @@ use crate::mcp::models::ServerConfig;
 /// 服务器行（列表/详情；仅取行级元信息，配置以 config_json 为准）
 pub fn list(conn: &Connection) -> anyhow::Result<Vec<ServerConfig>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, config_json, protocol_version_pin, enabled FROM servers ORDER BY created_at ASC",
+        "SELECT id, name, config_json, protocol_version_pin, enabled
+         FROM servers
+         ORDER BY sort_order ASC, name COLLATE NOCASE ASC, id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(ServerRow {
@@ -53,13 +55,16 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<ServerConfig>> 
 }
 
 /// 插入或更新（config 为准），并维护 tags/enabled 列
+///
+/// 新服务器追加到当前顺序末尾；更新已有服务器时保持 sort_order 不变。
 pub fn upsert(conn: &Connection, config: &ServerConfig) -> anyhow::Result<()> {
     let config_json = serde_json::to_string(config)?;
     let tags_json = serde_json::to_string(&config.tags)?;
     conn.execute(
         "INSERT INTO servers (id, name, transport, config_json, protocol_version_pin, enabled,
-                              tags_json, created_at, updated_at, last_connected_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                              tags_json, created_at, updated_at, last_connected_at, sort_order)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM servers))
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             transport = excluded.transport,
@@ -87,6 +92,41 @@ pub fn upsert(conn: &Connection, config: &ServerConfig) -> anyhow::Result<()> {
 /// 删除服务器行（credentials 索引由调用方在同一事务中删除）
 pub fn delete(conn: &Connection, id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM servers WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// 按给定 ID 顺序重写 sort_order（0..n-1）
+///
+/// 要求 ID 不重复且覆盖当前全部服务器；列表在提交前发生变化时返回错误，
+/// 由前端刷新后重试，避免写入部分顺序。
+pub fn reorder(conn: &mut Connection, ids: &[String]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            anyhow::bail!("服务器列表包含重复项");
+        }
+    }
+
+    let existing: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM servers")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if existing.len() != ids.len() || !ids.iter().all(|id| existing.contains(id)) {
+        anyhow::bail!("服务器列表已变化，请刷新后重试");
+    }
+
+    let tx = conn.transaction()?;
+    for (index, id) in ids.iter().enumerate() {
+        let updated = tx.execute(
+            "UPDATE servers SET sort_order = ?2 WHERE id = ?1",
+            rusqlite::params![id, index as i64],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("服务器列表已变化，请刷新后重试");
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -324,5 +364,59 @@ mod tests {
         assert_eq!(refs, vec!["ref-a".to_string(), "ref-b".to_string()]);
         remove_secret_cleanup(&conn, "ref-a").expect("移除失败");
         assert_eq!(list_secret_cleanup(&conn).expect("查询失败").len(), 1);
+    }
+
+    fn list_ids(conn: &Connection) -> Vec<String> {
+        list(conn)
+            .expect("列表失败")
+            .into_iter()
+            .map(|server| server.id)
+            .collect()
+    }
+
+    #[test]
+    fn reorder_persists_and_appends_new_servers() {
+        let (_dir, mut conn) = temp_conn();
+        for id in ["s1", "s2", "s3"] {
+            upsert(&conn, &sample_config(id)).expect("插入失败");
+        }
+        assert_eq!(list_ids(&conn), vec!["s1", "s2", "s3"]);
+
+        let order = ["s3", "s1", "s2"].map(str::to_string);
+        reorder(&mut conn, &order).expect("重排失败");
+        assert_eq!(list_ids(&conn), vec!["s3", "s1", "s2"]);
+
+        // 新建服务器追加到末尾
+        upsert(&conn, &sample_config("s4")).expect("插入失败");
+        assert_eq!(list_ids(&conn), vec!["s3", "s1", "s2", "s4"]);
+
+        // 更新已有服务器不改变顺序
+        let mut renamed = sample_config("s3");
+        renamed.name = "renamed".to_string();
+        upsert(&conn, &renamed).expect("更新失败");
+        assert_eq!(list_ids(&conn), vec!["s3", "s1", "s2", "s4"]);
+    }
+
+    #[test]
+    fn reorder_rejects_incomplete_duplicate_or_unknown_ids() {
+        let (_dir, mut conn) = temp_conn();
+        for id in ["s1", "s2"] {
+            upsert(&conn, &sample_config(id)).expect("插入失败");
+        }
+        assert_eq!(list_ids(&conn), vec!["s1", "s2"]);
+
+        // 缺项：不允许部分顺序
+        let partial = ["s1".to_string()];
+        assert!(reorder(&mut conn, &partial).is_err());
+        assert_eq!(list_ids(&conn), vec!["s1", "s2"]);
+
+        // 重复项
+        let duplicate = ["s1".to_string(), "s1".to_string()];
+        assert!(reorder(&mut conn, &duplicate).is_err());
+
+        // 未知 ID
+        let unknown = ["s1".to_string(), "missing".to_string()];
+        assert!(reorder(&mut conn, &unknown).is_err());
+        assert_eq!(list_ids(&conn), vec!["s1", "s2"]);
     }
 }

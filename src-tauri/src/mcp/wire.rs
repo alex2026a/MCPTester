@@ -19,10 +19,20 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use rmcp::RoleClient;
+use rmcp::model::RequestId;
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// 原始帧单帧上限（请求/响应各自）
+pub const FRAME_MAX_BYTES: usize = 512 * 1024;
+/// 在途 capture 条数上限
+const CAPTURE_MAX_ENTRIES: usize = 32;
+/// 在途 capture 总字节上限
+const CAPTURE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// 只采集这三个调用方法，避免能力枚举/探测淹没 capture
+const CAPTURE_METHODS: &[&str] = &["tools/call", "resources/read", "prompts/get"];
 
 /// 报文方向
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +86,40 @@ pub struct WireEntry {
     pub at: DateTime<Utc>,
 }
 
+/// 单次调用的原始 JSON-RPC 帧（脱敏/截断前）
+#[derive(Clone, Debug, Default)]
+pub struct CapturedExchange {
+    pub rpc_id: Option<Value>,
+    pub request: Option<Value>,
+    pub response: Option<Value>,
+    pub truncated: bool,
+    /// 已保存帧的序列化字节数（用于总预算）
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    entries: HashMap<String, CapturedExchange>,
+    order: VecDeque<String>,
+    /// call_id → rpc_key
+    links: HashMap<String, String>,
+}
+
+impl CaptureState {
+    fn enforce_budget(&mut self) {
+        while self.order.len() > CAPTURE_MAX_ENTRIES || self.total_bytes() > CAPTURE_MAX_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.entries.values().map(|entry| entry.bytes).sum()
+    }
+}
+
 /// 单连接报文日志（环形缓冲）
 pub struct WireLog {
     seq: AtomicU64,
@@ -84,6 +128,8 @@ pub struct WireLog {
     entries: Mutex<VecDeque<WireEntry>>,
     /// 在途请求（方向, id）→ 发送时刻，用于响应配对计时
     pending: Mutex<HashMap<(u8, String), DateTime<Utc>>>,
+    /// 原始帧采集（按 rpc_id 配对，link 到 call_id）
+    captures: Mutex<CaptureState>,
 }
 
 impl WireLog {
@@ -94,6 +140,7 @@ impl WireLog {
             max_payload_bytes: max_payload_bytes.max(1024),
             entries: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashMap::new()),
+            captures: Mutex::new(CaptureState::default()),
         })
     }
 
@@ -108,6 +155,7 @@ impl WireLog {
             .unwrap_or(0);
         let at = Utc::now();
         let duration_ms = self.track(&direction, &meta, at);
+        self.capture(&direction, &meta, &payload);
 
         sanitize(&mut payload);
         let (payload, truncated) = bounded(payload, self.max_payload_bytes);
@@ -161,6 +209,72 @@ impl WireLog {
         }
     }
 
+    /// 采集原始帧：只处理调用方法；请求按 rpc_id 建条目，响应按 rpc_id 回填
+    fn capture(&self, direction: &WireDirection, meta: &FrameMeta, payload: &Value) {
+        let Some(id) = payload.get("id").filter(|value| !value.is_null()) else {
+            return;
+        };
+        let Some(key) = rpc_key(id) else {
+            return;
+        };
+        let from_client = matches!(direction, WireDirection::ClientToServer);
+
+        if from_client && meta.kind == WireKind::Request {
+            let Some(method) = meta.method.as_deref() else {
+                return;
+            };
+            if !CAPTURE_METHODS.contains(&method) {
+                return;
+            }
+            let (request, bytes, truncated) = bounded_capture(payload);
+            let mut state = self.captures.lock().expect("原始帧采集锁异常");
+            state.entries.insert(
+                key.clone(),
+                CapturedExchange {
+                    rpc_id: Some(id.clone()),
+                    request,
+                    response: None,
+                    truncated,
+                    bytes,
+                },
+            );
+            state.order.push_back(key);
+            state.enforce_budget();
+            return;
+        }
+
+        if !from_client && meta.kind == WireKind::Response {
+            let mut state = self.captures.lock().expect("原始帧采集锁异常");
+            if let Some(entry) = state.entries.get_mut(&key) {
+                let (response, bytes, truncated) = bounded_capture(payload);
+                entry.response = response;
+                entry.truncated |= truncated;
+                entry.bytes += bytes;
+            }
+        }
+    }
+
+    /// 把 rpc_id 归属到 call_id；请求帧可能已采集，也可能稍后才到
+    pub fn link_capture(&self, rpc_id: &RequestId, call_id: &str) {
+        let Ok(value) = serde_json::to_value(rpc_id) else {
+            return;
+        };
+        let Some(key) = rpc_key(&value) else {
+            return;
+        };
+        let mut state = self.captures.lock().expect("原始帧采集锁异常");
+        state.links.insert(call_id.to_string(), key);
+    }
+
+    /// 取出并删除一次调用的原始帧
+    pub fn take_capture(&self, call_id: &str) -> Option<CapturedExchange> {
+        let mut state = self.captures.lock().expect("原始帧采集锁异常");
+        let key = state.links.remove(call_id)?;
+        let entry = state.entries.remove(&key);
+        state.order.retain(|item| item != &key);
+        entry
+    }
+
     /// 全量快照（按 seq 升序）
     pub fn buffer(&self) -> Vec<WireEntry> {
         let buf = self.entries.lock().expect("报文缓冲锁异常");
@@ -186,6 +300,10 @@ impl WireLog {
     pub fn clear(&self) {
         self.entries.lock().expect("报文缓冲锁异常").clear();
         self.pending.lock().expect("报文配对表锁异常").clear();
+        let mut captures = self.captures.lock().expect("原始帧采集锁异常");
+        captures.entries.clear();
+        captures.order.clear();
+        captures.links.clear();
     }
 
     /// 当前条数
@@ -213,6 +331,24 @@ fn rpc_id_of(value: &Value) -> Option<String> {
         Some(Value::Number(number)) => Some(number.to_string()),
         Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
         _ => None,
+    }
+}
+
+/// JSON-RPC id → 采集键（保留 number/string 类型，避免 0 与 "0" 混淆）
+fn rpc_key(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(_) | Value::String(_) => serde_json::to_string(value).ok(),
+        _ => None,
+    }
+}
+
+/// 原始帧限长；超限不保存该帧，但仍保留 rpc_id
+fn bounded_capture(value: &Value) -> (Option<Value>, usize, bool) {
+    let bytes = serde_json::to_vec(value).map(|text| text.len()).unwrap_or(0);
+    if bytes <= FRAME_MAX_BYTES {
+        (Some(value.clone()), bytes, false)
+    } else {
+        (None, 0, true)
     }
 }
 
@@ -449,6 +585,116 @@ mod tests {
         assert_eq!(buf[1].kind, WireKind::Response);
         assert!(buf[1].duration_ms.is_some(), "响应应携带配对耗时");
         assert!(!buf[1].is_error);
+    }
+
+    #[test]
+    fn capture_ignores_non_call_methods() {
+        let log = WireLog::new(10, 4096);
+        log.push(
+            WireDirection::ClientToServer,
+            "request tools/list #1",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        );
+        log.push(
+            WireDirection::ServerToClient,
+            "response #1",
+            json!({ "jsonrpc": "2.0", "id": 1, "result": {} }),
+        );
+        log.link_capture(&RequestId::Number(1), "call-list");
+        assert!(log.take_capture("call-list").is_none());
+    }
+
+    #[test]
+    fn capture_pairs_by_direction_and_preserves_id_type() {
+        let log = WireLog::new(10, 4096);
+        log.push(
+            WireDirection::ClientToServer,
+            "request tools/call #0",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "tools/call",
+                "params": { "name": "echo" }
+            }),
+        );
+        log.link_capture(&RequestId::Number(0), "call-1");
+        log.push(
+            WireDirection::ServerToClient,
+            "response #0",
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "ok": true } }),
+        );
+
+        let capture = log.take_capture("call-1").expect("应采集到帧");
+        assert_eq!(capture.rpc_id, Some(json!(0)));
+        assert_eq!(capture.request.unwrap()["method"], json!("tools/call"));
+        assert_eq!(capture.response.unwrap()["result"]["ok"], json!(true));
+        assert!(!capture.truncated);
+        assert!(log.take_capture("call-1").is_none());
+    }
+
+    #[test]
+    fn capture_does_not_close_on_client_response() {
+        let log = WireLog::new(10, 4096);
+        // 服务端发起 sampling 请求，id 与工具调用相同
+        log.push(
+            WireDirection::ServerToClient,
+            "request sampling/createMessage #0",
+            json!({ "id": 0, "method": "sampling/createMessage" }),
+        );
+        // 工具调用请求
+        log.push(
+            WireDirection::ClientToServer,
+            "request tools/call #0",
+            json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/call" }),
+        );
+        log.link_capture(&RequestId::Number(0), "call-1");
+        // 客户端对 sampling 的应答（客户端 → 服务器）不应关闭工具调用 capture
+        log.push(
+            WireDirection::ClientToServer,
+            "response #0",
+            json!({ "jsonrpc": "2.0", "id": 0, "result": {} }),
+        );
+        log.push(
+            WireDirection::ServerToClient,
+            "response #0",
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "ok": true } }),
+        );
+
+        let capture = log.take_capture("call-1").expect("应采集到帧");
+        assert_eq!(capture.response.unwrap()["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn capture_keeps_rpc_id_when_frame_over_limit() {
+        let log = WireLog::new(10, 4096);
+        log.push(
+            WireDirection::ClientToServer,
+            "request tools/call #2",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "blob": "x".repeat(FRAME_MAX_BYTES) }
+            }),
+        );
+        log.link_capture(&RequestId::Number(2), "call-big");
+        let capture = log.take_capture("call-big").expect("应保留条目");
+        assert_eq!(capture.rpc_id, Some(json!(2)));
+        assert!(capture.request.is_none());
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn clear_drops_captures() {
+        let log = WireLog::new(10, 4096);
+        log.push(
+            WireDirection::ClientToServer,
+            "request tools/call #1",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }),
+        );
+        log.link_capture(&RequestId::Number(1), "call-1");
+        log.clear();
+        assert!(log.take_capture("call-1").is_none());
     }
 
     #[test]

@@ -42,6 +42,16 @@ describe("toErrorInfo", () => {
     expect(info.message).toBe("服务器名称不能为空");
   });
 
+  it("OAuth 需要登录给出可操作提示（v0.3.0）", () => {
+    const info = toErrorInfo({
+      kind: "oauth_required",
+      message: "需要 OAuth 登录授权",
+    });
+    expect(info.title).toBe("需要 OAuth 登录");
+    expect(info.hint).toContain("服务器");
+    expect(info.hint).toContain("登录");
+  });
+
   it("凭据掩码遗留给出定向标题与建议（v0.1.2）", () => {
     const info = toErrorInfo({
       kind: "credential_mask",

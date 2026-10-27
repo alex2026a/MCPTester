@@ -18,7 +18,7 @@ export function StatusBadge({ state }: { state: ConnectionState }) {
       ? `${state.handshake.protocol_version} · ${state.handshake.lifecycle === "modern" ? "现代世代" : "旧世代"}`
       : state.state === "error"
         ? errorTitle(state.error.kind)
-        : state.state === "lost"
+        : state.state === "lost" || state.state === "degraded"
           ? state.reason
           : "";
   const tooltip =

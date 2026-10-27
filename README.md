@@ -20,7 +20,7 @@
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white" alt="Rust 2024" /></a>
   <a href="https://modelcontextprotocol.io/"><img src="https://img.shields.io/badge/MCP-2026--07--28-6E56CF" alt="MCP 2026-07-28" /></a>
   <a href="#系统要求"><img src="https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows&logoColor=white" alt="Windows 10/11" /></a>
-  <a href="../../releases"><img src="https://img.shields.io/badge/version-0.1.3-2F6FEB" alt="version 0.1.3" /></a>
+  <a href="../../releases"><img src="https://img.shields.io/badge/version-0.5.0-2F6FEB" alt="version 0.5.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E" alt="MIT License" /></a>
 </p>
 
@@ -28,36 +28,39 @@
   <a href="#核心功能">核心功能</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#使用指南">使用指南</a> ·
+  <a href="#认证与-oauth">认证与 OAuth</a> ·
   <a href="#启动配置">启动配置</a> ·
   <a href="#数据与便携模式">数据与便携模式</a> ·
   <a href="#安全设计">安全设计</a> ·
   <a href="#本地开发">本地开发</a>
 </p>
 
-MCP Tester 是一个面向 **Model Context Protocol（MCP）** 的桌面调试工具。它把服务器管理、接口枚举、Schema 表单调用、JSON-RPC 报文观察和调用历史重放放在同一个界面里，适合调试本地 `stdio` 服务、远程 `Streamable HTTP` 服务以及遗留 `HTTP + SSE` 服务。
+MCP Tester 是一个面向 **Model Context Protocol（MCP）** 的桌面调试工具。它把服务器管理、接口枚举、Schema 表单调用、JSON-RPC 报文观察、调用历史重放和回归测试放在同一个界面里，适合调试本地 `stdio` 服务、远程 `Streamable HTTP` 服务以及遗留 `HTTP + SSE` 服务。
 
 > [!NOTE]
-> 当前版本为 **v0.1.3**，以 Windows 为主要发布平台；项目仍在快速迭代中。
+> 当前版本为 **v0.5.0**，以 Windows 为主要发布平台；项目仍在快速迭代中。
 
 ## 核心功能
 
 | 模块 | 能力 |
 | --- | --- |
-| **服务器管理** | 添加、编辑、删除 `stdio`、`Streamable HTTP`、`HTTP + SSE` 服务器；连接、断开、重连、健康探测；保存前可「测试连接」，逐步查看握手、协议版本与接口数量。 |
+| **服务器管理** | 添加、编辑、删除 `stdio`、`Streamable HTTP`、`HTTP + SSE` 服务器；拖动排序；连接、断开、重连、健康探测；保存前可「测试连接」，逐步查看握手、协议版本与接口数量。 |
+| **认证与 OAuth** | 支持无认证、`Authorization` 请求头与 OAuth 2.1 授权码 + PKCE；动态客户端注册（DCR）、CIMD 与预注册客户端；token 刷新、撤销、补充授权与诊断。 |
 | **接口浏览器** | 枚举 Tools、Resources、Resource Templates、Prompts；按名称、描述或 URI 搜索；服务端推送列表变更时自动刷新。 |
-| **Schema 表单** | 根据工具的 `inputSchema` 生成表单，支持必填、类型、枚举校验；可切换原始 JSON 编辑；校验不通过时可显式选择「仍要发送」。 |
-| **调用与取消** | 发起 `tools/call`、`resources/read`、`prompts/get`；在途调用可取消；资源模板自动提取并校验变量。 |
-| **结果查看** | 按 MCP 内容块渲染文本、Markdown、图片、音频、资源、链接与结构化 JSON；提供「渲染 / 结构 / 原文」三视图与一键复制。 |
+| **Schema 表单** | 根据工具的 `inputSchema` 生成表单，支持必填、类型、枚举校验；可切换原始 JSON 编辑；校验不通过时可显式选择「仍要发送」；按接口保留未发送草稿。 |
+| **调用与取消** | 发起 `tools/call`、`resources/read`、`prompts/get`；在途调用可取消；资源模板自动提取并校验变量；`Ctrl+Enter` 发送；「最近参数」一键回填。 |
+| **结果查看** | 按 MCP 内容块渲染文本、Markdown、图片、音频、资源、链接与结构化 JSON；渲染 / 结构 / 原文三视图，请求 / 响应页签与原始 JSON-RPC 帧；复制请求、响应、成对内容、Markdown、参数、文本摘要与 HTTP 请求骨架，可选脱敏。 |
 | **链路观察** | 事件面板把 JSON-RPC 请求与响应按 id 配对，展示耗时、大小与错误状态；支持按方法、关键词、仅错误筛选，支持暂停、跟随最新与导出。同时查看服务端通知和 stdio `stderr`。 |
-| **历史与重放** | 调用记录落 SQLite；按服务器、方法、状态、关键词筛选；一键载入调用台重放；支持删除、清空与导出 JSON。 |
+| **历史与重放** | 调用记录落 SQLite；按服务器、方法、状态、关键词与接口筛选；一键载入调用台重放；支持复制参数、删除、清空与导出 JSON（可选原始帧）。 |
+| **测试与报告** | 测试套件与用例管理；按 Schema、历史或 LLM 生成用例；运行、取消、断言与失败分类；基线对比、覆盖率、契约漂移；报告导出 HTML / JSON / JUnit / Markdown。 |
 | **导入导出** | 识别 Claude Desktop / Cursor 的 `mcpServers` 与 VS Code 的 `servers` 格式；导出服务器配置时敏感值统一替换为占位符。 |
 | **启动配置** | 通过 `mcptester.config.json` 预置服务器、默认服务器与自动连接；只补缺失项，不覆盖用户修改。 |
 | **便携与安全** | 安装版凭据进入系统凭据库；便携模式数据随程序目录；日志字段级脱敏；超过 1 MB 的结果自动落盘。 |
 
 几个设计目标：
 
-- **可观察**：不只看调用结果，还能看到完整的 JSON-RPC 往返、通知和进程输出。
-- **可复现**：参数与结果可回放，便于定位偶发问题和验证修复。
+- **可观察**：不只看调用结果，还能看到完整的 JSON-RPC 往返、原始帧、通知和进程输出。
+- **可复现**：参数与结果可回放，测试用例带随机种子与基线，便于定位偶发问题和验证修复。
 - **可迁移**：服务器配置可在 MCP Tester 与 Claude Desktop / Cursor / VS Code 的配置格式之间导入导出。
 
 ## 快速开始
@@ -69,10 +72,10 @@ MCP Tester 是一个面向 **Model Context Protocol（MCP）** 的桌面调试�
 | 发行形态 | 适用场景 | 数据与凭据 |
 | --- | --- | --- |
 | **MSI 安装版** | 日常使用，支持标准安装与卸载 | 数据在系统用户目录；敏感值存入系统凭据库 |
-| **便携版 ZIP** | 免安装、随身携带、隔离环境 | 数据在解压目录的 `data/`；敏感值明文保存在本地数据库 |
+| **便携版 ZIP** | 免安装、随身携带、隔离环境 | 数据在解压目录的 `data/`；敏感值与 OAuth token 明文保存在本地数据库 |
 
 > [!WARNING]
-> 便携版会把请求头、环境变量等敏感值以明文写入 `data/mcptester.db`。请勿把包含真实凭据的便携目录对外分发。当前 MSI 未做代码签名，首次运行时 Windows 可能显示 SmartScreen 提示。
+> 便携版会把请求头、环境变量、OAuth refresh token 与 client secret 以明文写入 `data/mcptester.db`。请勿把包含真实凭据的便携目录对外分发。当前 MSI 未做代码签名，首次运行时 Windows 可能显示 SmartScreen 提示。
 
 ### 系统要求
 
@@ -101,7 +104,15 @@ pnpm build        # TypeScript 类型检查 + 前端构建
 pnpm tauri build  # 生成 MSI
 ```
 
-MSI 产物位于 `src-tauri/target/release/bundle/msi/`。
+MSI 产物位于 `src-tauri/target/release/bundle/msi/`。仓库同时提供带归档与校验的构建脚本：
+
+| 命令 | 构建档位 | 产物 |
+| --- | --- | --- |
+| `pnpm release` | 速度优先（thin LTO、`codegen-units=16`、`opt-level=3`） | `artifacts/<version>/` |
+| `pnpm release:size` | 体积优先（fat LTO、`codegen-units=1`、`opt-level=s`） | `artifacts-size/<version>/` |
+| `pnpm portable` / `pnpm msi` | 仅生成对应形态 | `artifacts/<version>/` |
+
+体积优先档需要全量重编，耗时明显更长，适合对外分发；日常开发建议使用默认档位。
 
 如需手动制作便携版：
 
@@ -118,8 +129,9 @@ pnpm tauri build --no-bundle
 - 在「服务器」页点击「新建服务器」。
 - `stdio`：填写命令、参数（每行一个）、环境变量和工作目录。命令解析方式建议保持 `resolve`；`cmd_shell` 存在转义风险；`never` 主要用于排障。
 - `HTTP / SSE`：填写 MCP 端点 URL、请求头、超时覆盖；仅本地自签证书场景才建议勾选「允许不安全 TLS」。
-- `Authorization` 请求头同时支持完整写法（`Bearer xxx`）和仅 token（`xxx`），客户端会统一归一化。
+- 认证方式三选一：**无认证**、**Authorization 请求头**（支持完整 `Bearer xxx` 或裸 token）、**OAuth 2.1**（仅 `Streamable HTTP`，详见[认证与 OAuth](#认证与-oauth)）。
 - 「测试连接」只验证配置，不保存、不写历史；保存后点击「连接」，再到「接口」页枚举能力。
+- 服务器较多时可拖动左侧手柄排序；接口页、历史页与测试页的服务器选择器会按连接状态分组，组内沿用该顺序。
 
 ### 2. 浏览与调用接口
 
@@ -127,13 +139,17 @@ pnpm tauri build --no-bundle
 - 顶部页签分别对应 Tools、Resources、Resource Templates、Prompts，左侧列表支持关键字搜索。
 - 调用工具时，表单会依据 JSON Schema 生成；也可以切换到 JSON 模式直接编辑参数。
 - 必填项缺失或类型不符时默认拦截发送，可显式点击「仍要发送」跳过前端校验；JSON 解析失败时不会提供该选项。
-- 资源模板会自动提取 `{变量}`，填写完整后才能读取；在途调用可以点击「取消」。
+- 「最近参数」会列出同一服务器、同一接口的历史调用，可一键回填并撤销；切换接口时会保留尚未发送的草稿（仅本次运行有效）。
+- `Ctrl+Enter` 发送当前调用；资源模板会自动提取 `{变量}`，填写完整后才能读取；在途调用可以点击「取消」。
 
 ### 3. 查看结果
 
 - 结果头部展示状态、耗时、协议版本、传输类型、时间和大小。
 - 「渲染」按 MCP 内容块展示；「结构」提供 JSON 树；「原文」保留原始响应。
-- 结果超过 1 MB 时数据库只保留前 1 MB，完整内容落在 `data/results/<record-id>.json`，可在结果区打开。
+- 结果区可在「响应 / 请求」之间切换；请求与响应优先展示线上原始 JSON-RPC 帧，缺失或超限时按调用记录重建，并标记「原始帧 / 部分原始 / 重建」。
+- 复制菜单支持：请求、响应、请求和响应（Markdown）、请求和响应（JSON）、请求参数、响应（JSON-RPC）、HTTP 请求骨架与文本摘要；可开启「脱敏复制」，参数中的敏感字段会提前提示。
+- HTTP 请求骨架仅适用于 `Streamable HTTP`，会省略 `Mcp-Session-Id` 等会话信息，并对 URL、请求头与 body 脱敏。
+- 结果超过 1 MB 时数据库只保留前 1 MB，完整内容落在 `data/results/<record-id>.json`，可在结果区打开；读取超过 10 MB 的完整结果前会二次确认。
 
 ### 4. 观察链路
 
@@ -145,16 +161,53 @@ pnpm tauri build --no-bundle
 ### 5. 历史与重放
 
 - 「历史」页记录每次工具调用、资源读取、提示词获取和探测。
-- 可按服务器、方法、状态、关键词筛选，查看完整参数与结果。
-- 点击「载入调用台重放」会回到接口页，自动定位服务器、接口并回填参数。
-- 支持删除单条、按当前筛选清空以及导出 JSON；保留天数与最大条数可在设置页调整。
+- 可按服务器、方法、状态、关键词与接口筛选，查看完整参数与结果；筛选条件会同步到 URL，便于从其他页面直接定位。
+- 点击「载入调用台重放」会回到接口页，自动定位服务器、接口并回填参数；也可复制参数后手工使用。
+- 支持删除单条、按当前筛选清空以及导出 JSON；导出时可勾选「包含原始帧」（体积明显增大，上限 50 MB）。
+- 保留天数与最大条数可在设置页调整。
 
-### 6. 导入与导出
+### 6. 测试与报告
+
+- 「测试」页按服务器管理套件与用例；套件必须绑定一个 MCP 服务器。用例支持 `tools/call`、`resources/read`、`prompts/get`，带优先级、风险等级与启用开关。
+- 「生成用例」可按 **快速冒烟 / 标准回归 / 彻底检查** 三档生成，选择是否包含边界值、负向用例、资源、提示词与历史参数；破坏性工具默认跳过。生成结果先预览，勾选后保存，随机种子保证可复现。
+- 「LLM 辅助」只导出接口定义（不含凭据与历史参数），把提示词交给任意模型后，将返回的 JSON 导入并人工复核。
+- 运行时可选单用例超时与环境错误重试次数，支持运行套件、运行选中用例、取消与进度展示。
+- 「测试报告」页汇总通过/失败/跳过数量、耗时、失败分类与覆盖率；可设为基线、与其他运行对比、重跑失败用例。
+- 「契约漂移」会对比当前接口快照与套件基线，提示新增、删除或变更的接口。
+- 报告可导出 HTML、JSON、JUnit XML 或 Markdown，并可选择是否包含敏感数据。
+
+### 7. 导入与导出
 
 - 导入支持 **Claude Desktop / Cursor** 的 `{ "mcpServers": { ... } }` 和 **VS Code** 的 `{ "servers": { ... } }`。
 - 可以从文件导入，也可以直接粘贴 JSON。
 - 导入时按「键名优先 + 值模式兜底」识别敏感项；安装版写入系统凭据库，便携版随数据目录保存。
 - 导出支持 `claude` 与 `vscode` 两种格式，所有敏感值统一替换为 `${MCPTESTER_SECRET}`。
+
+## 认证与 OAuth
+
+服务器表单提供三种认证方式：
+
+| 方式 | 适用场景 | 说明 |
+| --- | --- | --- |
+| **无认证** | 本地或内网服务 | 不发送 `Authorization` |
+| **Authorization 请求头** | 已有 Bearer Token / API Key | 完整 `Bearer xxx` 或裸 token 均可 |
+| **OAuth 2.1** | 支持 MCP 授权规范的远程服务 | 授权码 + PKCE，仅支持 `Streamable HTTP` |
+
+OAuth 登录流程：
+
+1. 选择 OAuth 2.1，填写 scopes（留空时按授权服务器元数据自动选择），按需填写 `client_id`、`client_secret` 与回调地址。
+2. 保存后在服务器卡片点击「登录」。应用会启动本地回调监听（默认 `http://127.0.0.1:33318/oauth/callback`）并打开系统浏览器。
+3. 授权完成后 token 自动写入；连接返回 401 时提示登录，返回 403 `insufficient_scope` 时展示缺少的 scope 与「补充授权」按钮。
+4. 卡片菜单提供「诊断」「退出登录」「清除注册」。诊断面板可查看端点、注册方式、PKCE、scope 与过期时间，并可强制刷新 token 或临时查看 access token。
+
+互操作选项（高级）：
+
+- 元数据发现不可用时，可手工填写 authorization / token / registration / issuer / revocation 端点；不规范的服务器可容忍缺少 issuer。
+- 客户端注册支持 **DCR**（默认）、**CIMD**（`client_metadata_url`）与预注册 `client_id`；已用 DCR/CIMD 登录时，切换注册方式需先「清除注册」。
+- 可指定 token 端点认证方式（`client_secret_basic` / `client_secret_post` / `none`）。
+- 授权请求可附加额外参数（每行 `key=value`），但不能覆盖 `state`、PKCE、`client_id` 等保留参数。
+- 自定义请求头默认只发往 MCP 服务器同源地址；显式开启后才会转发到跨源授权服务器，请确认不会泄露网关密钥。
+- OAuth 模式会忽略 `Authorization` 请求头；未启用刷新令牌的授权仅本次会话有效，重启后需重新登录。
 
 ## 启动配置
 
@@ -206,6 +259,7 @@ pnpm tauri build --no-bundle
 - `autoConnect` 与 `defaultServer` 只在首次 seed 或手动重新应用时生效。
 - `secretHeaders` / `secretEnv` 用于把额外的键名标记为敏感项；值写成 `${MCPTESTER_SECRET}` 表示「待配置」，不会写入数据库或凭据库。
 - 由配置文件预置的服务器，其请求头和环境变量会以明文保存在本地 SQLite；导出时仍会脱敏。
+- OAuth 配置不通过启动配置文件预置，请在服务器编辑页登录后保存；已有 OAuth 服务器仍可参与 `autoConnect`。
 
 > [!IMPORTANT]
 > 不要把含真实凭据的 `mcptester.config.json` 提交到版本库。仓库中的 `.gitignore` 已忽略该文件，仅保留示例文件。
@@ -214,8 +268,8 @@ pnpm tauri build --no-bundle
 
 | 模式 | 触发方式 | 数据目录 | 凭据存储 |
 | --- | --- | --- | --- |
-| **安装模式** | 默认 | `%APPDATA%\com.mcptester.desktop` | 系统凭据库 |
-| **便携模式** | 可执行文件旁存在 `mcptester.portable` | `<程序目录>\data` | 本地数据库明文 |
+| **安装模式** | 默认 | `%APPDATA%\com.mcptester.desktop` | 系统凭据库（含 OAuth token） |
+| **便携模式** | 可执行文件旁存在 `mcptester.portable` | `<程序目录>\data` | 本地数据库明文（含 OAuth token） |
 | **自定义目录** | 设置 `MCPTESTER_DATA_DIR` | 指定目录（相对路径按程序目录解析） | 由便携标记决定 |
 
 如果便携目录不可写，应用会回退到用户数据目录，并在设置页提示本次运行未启用便携凭据策略。
@@ -224,7 +278,7 @@ pnpm tauri build --no-bundle
 
 | 路径 | 内容 |
 | --- | --- |
-| `mcptester.db` | 服务器配置、设置、调用历史元数据 |
+| `mcptester.db` | 服务器配置、OAuth 凭据、设置、调用历史与测试报告 |
 | `results/` | 超过 1 MB 的完整调用结果 |
 | `logs/` | 按天滚动的运行日志 |
 | `mcptester.config.json` | 可选的启动配置 |
@@ -233,12 +287,14 @@ pnpm tauri build --no-bundle
 
 ## 安全设计
 
-- **凭据隔离**：安装模式下敏感请求头和环境变量写入操作系统凭据库（Windows Credential Manager / macOS Keychain / Linux Secret Service），SQLite 只保存引用索引。
+- **凭据隔离**：安装模式下敏感请求头、环境变量、OAuth refresh token 与 client secret 写入操作系统凭据库（Windows Credential Manager / macOS Keychain / Linux Secret Service），SQLite 只保存引用索引。
+- **OAuth 边界**：access token 不落库；退出登录会清除本地 token，配置撤销端点时同时尝试远程撤销；`403 insufficient_scope` 只申请缺失的 scope。
 - **掩码编辑**：界面只展示 `Beare****5678` 形式的掩码；编辑时留空表示不修改，输入新值才会替换，避免把掩码误写回凭据库。
-- **导出脱敏**：导出服务器配置时，敏感值统一替换为 `${MCPTESTER_SECRET}`，不会带出明文。历史记录导出保留原始请求与响应，分享前请自行确认其中是否包含敏感数据。
+- **导出脱敏**：导出服务器配置时，敏感值统一替换为 `${MCPTESTER_SECRET}`，不会带出明文。历史记录导出保留原始请求与响应；测试报告导出默认不包含敏感数据。分享前请自行确认内容。
+- **复制脱敏**：复制菜单提供「脱敏复制」；参数、JSON-RPC 帧、HTTP 请求骨架与文本摘要会对 Bearer Token、JWT、`sk-` 密钥、URL token 参数和 userinfo 打码。
 - **日志脱敏**：按精确字段名匹配敏感字段，并对 Bearer Token、JWT、`sk-` 密钥、URL token 参数和 URL userinfo 做值模式打码；`stderr` 与通知只进入内存缓冲，不写入日志文件。
-- **本机优先**：应用不包含遥测或云端同步，服务器配置、调用历史和响应内容只保存在本机。
-- **显式风险开关**：「允许不安全 TLS」仅用于本地自签证书，默认关闭；便携模式的明文凭据风险会在界面中明确提示。
+- **本机优先**：应用不包含遥测或云端同步，服务器配置、调用历史、测试报告和响应内容只保存在本机。
+- **显式风险开关**：「允许不安全 TLS」仅用于本地自签证书，默认关闭；跨源 OAuth 请求头转发默认关闭；便携模式的明文凭据风险会在界面中明确提示。
 
 ## 协议支持
 
@@ -257,6 +313,7 @@ pnpm tauri build --no-bundle
 - `subscriptions/listen`（现代世代列表变更通知）
 - 旧世代 `ping` 健康探测；现代世代使用幂等枚举探测
 - 调用取消与在途请求中止
+- OAuth 2.1 授权码 + PKCE，含 RFC 9728 资源元数据、RFC 8414 授权服务器元数据、DCR 与 CIMD 客户端注册
 
 > [!NOTE]
 > `HTTP + SSE` 是 MCP 规范中已弃用的旧传输，仅为兼容旧服务器保留。新项目建议使用 `Streamable HTTP`。
@@ -266,7 +323,7 @@ pnpm tauri build --no-bundle
 ```mermaid
 flowchart LR
     subgraph FE["前端 · React 19 + TypeScript"]
-        UI["Servers / Explorer / History / Settings"]
+        UI["Servers / Explorer / History / Tests / Reports / Settings"]
         STATE["TanStack Query + Zustand"]
         UI <--> STATE
     end
@@ -274,6 +331,8 @@ flowchart LR
     subgraph BE["后端 · Rust / Tauri 2"]
         CMD["Tauri Commands"]
         MGR["Connection Manager"]
+        OAUTH["OAuth 2.1 Service"]
+        TEST["Test Runner"]
         WIRE["JSON-RPC Wire Log"]
         DB[("SQLite")]
         KEY[("OS Keychain")]
@@ -282,9 +341,12 @@ flowchart LR
 
     FE -->|Tauri IPC| CMD
     CMD --> MGR
+    CMD --> OAUTH
+    CMD --> TEST
     MGR --> WIRE
+    TEST --> MGR
+    OAUTH --> KEY
     CMD --> DB
-    CMD --> KEY
     CMD --> LOG
 
     MGR --> STDIO["stdio"]
@@ -301,10 +363,11 @@ flowchart LR
 | 前端 | React 19、TypeScript、Vite、Tailwind CSS |
 | 路由与状态 | React Router、TanStack Query、Zustand |
 | 后端 | Rust 2024、Tokio、rmcp 3.5 |
+| 认证 | OAuth 2.1（oauth2 5.0）、reqwest 0.13 |
+| 凭据 | keyring-core + 平台原生凭据库（含 OAuth token） |
 | 存储 | SQLite（rusqlite，bundled） |
-| 凭据 | keyring-core + 平台原生凭据库 |
 | 日志 | tracing + tracing-appender（按天滚动） |
-| 测试 | Vitest、Testing Library、cargo test、内置 mock MCP server |
+| 测试 | Vitest、Testing Library、cargo test、内置 mock MCP server、OAuth 流程集成测试 |
 
 ## 本地开发
 
@@ -321,7 +384,7 @@ cargo clippy --all-targets
 
 ### 内置 Mock Server
 
-仓库自带一个确定性的 mock MCP 服务器，覆盖工具调用、资源、资源模板、提示词、列表变更通知和双世代协商。
+仓库自带一个确定性的 mock MCP 服务器，覆盖工具调用、资源、资源模板、提示词、列表变更通知、双世代协商与 OAuth 登录。
 
 ```bash
 cd src-tauri
@@ -336,14 +399,15 @@ cargo run --features mock-server --bin mock-mcp-server -- --transport http --por
 - `--era both|modern|legacy`
 - `--port 18080`
 - `--fastmcp-compat --token mock-token`：模拟 FastMCP / Python 服务端的鉴权与会话行为
+- `--oauth`：启用 OAuth 2.1 模拟；可配合 `--oauth-no-refresh`、`--oauth-dcr-secret`、`--oauth-token-ttl <秒>`、`--oauth-cimd`、`--oauth-require-authorize-param key=value` 覆盖注册方式、token 有效期与授权参数校验
 
 ### Probe CLI
 
-不启动桌面界面时，可以用 `probe` 直接连接并调用：
+不启动桌面界面时，可以用 `probe` 直接连接并调用。该工具默认不参与 release 构建，需要显式开启 `dev-tools`：
 
 ```bash
 cd src-tauri
-cargo run --bin probe -- \
+cargo run --features dev-tools --bin probe -- \
   --http http://127.0.0.1:18080/mcp \
   --tool echo \
   --args '{"text":"hello"}'
@@ -356,18 +420,20 @@ cargo run --bin probe -- \
 ```text
 .
 ├─ src/                         # React 前端
-│  ├─ pages/                    # 服务器 / 接口 / 历史 / 设置
-│  ├─ components/               # Schema 表单、结果与报文查看器、事件面板
+│  ├─ pages/                    # 服务器 / 接口 / 历史 / 测试 / 报告 / 设置
+│  ├─ components/               # Schema 表单、结果与报文查看器、OAuth 弹窗、事件面板
 │  ├─ api/                      # Tauri IPC 封装
-│  ├─ stores/                   # 重放与 Toast 状态
+│  ├─ stores/                   # 重放、草稿与 Toast 状态
 │  └─ i18n/                     # 中文文案
 ├─ src-tauri/
 │  ├─ src/mcp/                  # 连接、传输、模型、报文日志
+│  │  └─ oauth/                 # OAuth 2.1 登录、注册身份与凭据存储
 │  ├─ src/commands/             # Tauri 命令
 │  ├─ src/storage/              # SQLite 仓储与迁移
+│  ├─ src/testing/              # 测试生成、断言、覆盖率、契约与报告
 │  ├─ src/bootstrap/            # 目录解析、启动配置
 │  ├─ src/bin/                  # mock-mcp-server / probe
-│  └─ tests/                    # MCP 客户端集成测试
+│  └─ tests/                    # MCP 客户端与 OAuth 集成测试
 ├─ LICENSE
 ├─ mcptester.config.example.json
 ├─ package.json
@@ -379,7 +445,8 @@ cargo run --bin probe -- \
 
 - 当前仅配置并发布 Windows MSI；macOS / Linux 的代码路径尚未打包验证。
 - 界面文案目前只有中文，`i18n` 目录已为多语言预留结构。
-- 掉线后的自动重连尚未内置，当前通过服务器列表中的「重连」按钮恢复。
+- 掉线后的自动重连仍在开发中；当前通过页面顶部的「重连」按钮恢复。
+- OAuth 仅支持授权码 + PKCE 与 Streamable HTTP，暂不支持设备码、客户端凭据模式，也不适用于遗留 `HTTP + SSE`。
 - 超过 1 MB 的调用结果在数据库中只保留前 1 MB，完整内容需从 `results/` 打开。
 - 旧版 `HTTP + SSE` 传输仅用于兼容，部分新服务器可能不再支持。
 
@@ -388,7 +455,7 @@ cargo run --bin probe -- \
 - [ ] macOS / Linux 打包与签名
 - [ ] 自动重连与连接保活
 - [ ] 英文界面
-- [ ] 调用用例与集合管理
+- [ ] OAuth 设备码与企业 SSO 场景
 - [ ] CI 与自动发布
 
 ## 许可证

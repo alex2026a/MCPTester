@@ -6,6 +6,8 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target msi
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target msi -SkipBuild
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target all -Verify
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target portable -SizeOptimized
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target all -Verify -SizeOptimized
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target clean
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target clean -CleanMode full
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target rebuild
@@ -24,6 +26,8 @@ param(
     [switch]$Verify,
     [switch]$RequireClean,
     [switch]$SkipBuild,
+    # 体积优先 profile：fat LTO + codegen-units=1 + opt-level=s，代价是全量重编
+    [switch]$SizeOptimized,
     [string]$OutputDir = 'artifacts'
 )
 
@@ -40,6 +44,23 @@ function Write-Step {
 function Stop-Build {
     param([string]$Message)
     throw $Message
+}
+
+function Push-ProfileEnv {
+    param([hashtable]$Values)
+    $previous = @{}
+    foreach ($key in $Values.Keys) {
+        $previous[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+        [Environment]::SetEnvironmentVariable($key, [string]$Values[$key], 'Process')
+    }
+    return $previous
+}
+
+function Pop-ProfileEnv {
+    param([hashtable]$Previous)
+    foreach ($key in $Previous.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $Previous[$key], 'Process')
+    }
 }
 
 function Remove-PathSafe {
@@ -168,6 +189,11 @@ if ($cargoVersion -ne $version) {
 }
 Write-Host "版本：$version"
 
+# 体积优先构建单独归档，避免覆盖快速构建的产物
+if ($SizeOptimized -and -not $PSBoundParameters.ContainsKey('OutputDir')) {
+    $OutputDir = 'artifacts-size'
+}
+
 if (-not [IO.Path]::IsPathRooted($OutputDir)) {
     $OutputDir = Join-Path $root $OutputDir
 }
@@ -227,12 +253,19 @@ if ($SkipBuild -and $Target -in @('clean', 'rebuild')) {
 if ($SkipBuild -and $effectiveClean -ne 'soft') {
     Stop-Build '-SkipBuild 只支持 -CleanMode soft，避免清理掉现有 release exe。'
 }
+if ($SkipBuild -and $SizeOptimized) {
+    Stop-Build '-SkipBuild 无法保证现有 exe 是体积优化产物；-SizeOptimized 必须重新编译。'
+}
 
 if ($Target -eq 'clean') {
     Write-Step "清理（$effectiveClean）"
     Clear-FrontendOutputs
     Remove-PathSafe (Join-Path $root 'src-tauri\target\release\bundle')
     Remove-PathSafe $artifactDir
+    # 两个构建档位的同版本产物都清掉，避免残留混淆
+    foreach ($name in @('artifacts', 'artifacts-size')) {
+        Remove-PathSafe (Join-Path (Join-Path $root $name) $version)
+    }
     Invoke-CargoClean $effectiveClean
     Write-Host '清理完成。' -ForegroundColor Green
     return
@@ -286,13 +319,29 @@ if ($SkipBuild) {
         Invoke-Native 'pnpm tauri bundle --bundles msi' { & pnpm tauri bundle --bundles msi }
     }
 } else {
-    Write-Step "编译（$buildKind）"
-    if ($buildKind -eq 'portable') {
-        Invoke-Native 'pnpm tauri build --no-bundle' { & pnpm tauri build --no-bundle }
-    } elseif ($buildKind -eq 'msi') {
-        Invoke-Native 'pnpm tauri build --bundles msi' { & pnpm tauri build --bundles msi }
-    } else {
-        Invoke-Native 'pnpm tauri build' { & pnpm tauri build }
+    $sizeProfileEnv = @{
+        CARGO_PROFILE_RELEASE_LTO           = 'fat'
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '1'
+        CARGO_PROFILE_RELEASE_OPT_LEVEL     = 's'
+    }
+    $previousProfileEnv = $null
+    try {
+        if ($SizeOptimized) {
+            Write-Step '体积优先：fat LTO + codegen-units=1 + opt-level=s（全量重编，耗时明显增加）'
+            $previousProfileEnv = Push-ProfileEnv $sizeProfileEnv
+        }
+        Write-Step "编译（$buildKind）"
+        if ($buildKind -eq 'portable') {
+            Invoke-Native 'pnpm tauri build --no-bundle' { & pnpm tauri build --no-bundle }
+        } elseif ($buildKind -eq 'msi') {
+            Invoke-Native 'pnpm tauri build --bundles msi' { & pnpm tauri build --bundles msi }
+        } else {
+            Invoke-Native 'pnpm tauri build' { & pnpm tauri build }
+        }
+    } finally {
+        if ($null -ne $previousProfileEnv) {
+            Pop-ProfileEnv $previousProfileEnv
+        }
     }
 }
 
@@ -337,6 +386,11 @@ if ($buildKind -in @('portable', 'all')) {
 }
 
 $builtAt = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+$profileLabel = if ($SizeOptimized) {
+    'size (fat LTO, codegen-units=1, opt-level=s)'
+} else {
+    'speed (thin LTO, codegen-units=16, opt-level=3)'
+}
 $buildInfo = @(
     'Product: MCP Tester',
     "Version: $version",
@@ -350,7 +404,9 @@ $buildInfo = @(
     "pnpm: $pnpmVersion",
     "Rust: $rustcVersion",
     "Verified: $($Verify.IsPresent)",
-    "SkippedBuild: $($SkipBuild.IsPresent)"
+    "SkippedBuild: $($SkipBuild.IsPresent)",
+    "SizeOptimized: $($SizeOptimized.IsPresent)",
+    "CargoProfile: $profileLabel"
 )
 Set-Content -LiteralPath (Join-Path $artifactDir 'build-info.txt') -Value $buildInfo -Encoding UTF8
 

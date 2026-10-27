@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { save } from "@tauri-apps/plugin-dialog";
 import { EmptyState } from "../components/EmptyState";
 import { Field, Modal } from "../components/testing/SuiteDialog";
@@ -33,7 +34,9 @@ import type {
 export function Reports() {
   const queryClient = useQueryClient();
   const [runStatus, setRunStatus] = useState<"" | TestRunStatus>("");
-  const [selectedRunId, setSelectedRunId] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  // 当前运行由 URL 的 run 参数决定，便于从测试页「查看报告」直接定位。
+  const selectedRunId = searchParams.get("run") ?? "";
   const [caseFilter, setCaseFilter] = useState<{
     runId: string;
     status: "" | TestRunCaseStatus;
@@ -155,7 +158,7 @@ export function Reports() {
           value={runStatus}
           onChange={(event) => {
             setRunStatus(event.target.value as "" | TestRunStatus);
-            setSelectedRunId("");
+            setSearchParams({}, { replace: true });
             setCaseFilter({ runId: "", status: "" });
           }}
         >
@@ -236,7 +239,7 @@ export function Reports() {
                   activeRun?.id === run.id ? "bg-slate-100" : "hover:bg-slate-50"
                 }`}
                 onClick={() => {
-                  setSelectedRunId(run.id);
+                  setSearchParams({ run: run.id }, { replace: true });
                   setSelectedCaseId(null);
                   setCaseFilter({ runId: "", status: "" });
                 }}

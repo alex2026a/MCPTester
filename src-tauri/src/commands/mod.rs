@@ -6,6 +6,7 @@ pub mod capability;
 pub mod events;
 pub mod history;
 pub mod import_export;
+pub mod oauth;
 pub mod server;
 pub mod settings;
 pub mod system;
@@ -15,12 +16,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::mcp::ConnectionManager;
+use crate::mcp::oauth::OAuthService;
 use crate::storage::Database;
 
 /// 应用级共享状态（由 lib.rs setup 注册）
 pub struct AppState {
     pub db: Database,
     pub manager: Arc<ConnectionManager>,
+    /// OAuth 登录/凭据服务（v0.3.0）
+    pub oauth: Arc<OAuthService>,
     /// 数据目录（results/ 落盘、导出默认路径）
     pub data_dir: PathBuf,
     /// 日志目录（便携模式下位于数据目录下）

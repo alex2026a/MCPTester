@@ -46,7 +46,11 @@ async fn stdio_modern_connect_list_call() {
         .expect("连接失败");
 
     let handshake = handshake_of(&h).await;
-    assert_eq!(handshake.lifecycle, LifecycleEra::Modern, "应协商为现代世代");
+    assert_eq!(
+        handshake.lifecycle,
+        LifecycleEra::Modern,
+        "应协商为现代世代"
+    );
     assert_eq!(handshake.protocol_version, "2026-07-28");
     assert_eq!(handshake.server_name, "mock-mcp-server");
 
@@ -61,10 +65,32 @@ async fn stdio_modern_connect_list_call() {
     );
 
     // 调用 echo（确定性断言）
-    let record = h.call_tool("echo", serde_json::json!({ "text": "hi" })).await;
+    let record = h
+        .call_tool("echo", serde_json::json!({ "text": "hi" }))
+        .await;
     assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
-    assert_eq!(record.method, mcptester_lib::mcp::models::CallMethod::ToolsCall);
+    assert_eq!(
+        record.method,
+        mcptester_lib::mcp::models::CallMethod::ToolsCall
+    );
     assert!(record.error.is_none());
+    {
+        let frames = record.frames.as_ref().expect("应采集原始帧");
+        assert!(
+            frames.rpc_id.as_ref().is_some_and(|id| id.is_number()),
+            "rpc_id 应保留数字类型：{:?}",
+            frames.rpc_id
+        );
+        assert_eq!(
+            frames.request.as_ref().expect("应有请求帧")["method"],
+            serde_json::json!("tools/call")
+        );
+        assert_eq!(
+            frames.response.as_ref().expect("应有响应帧")["result"]["content"][0]["text"],
+            serde_json::json!("echo: hi")
+        );
+        assert!(!frames.truncated);
+    }
     let result = record.result.expect("应有结果");
     let text = serde_json::to_string(&result).unwrap();
     assert!(text.contains("echo: hi"), "结果应包含 echo 输出：{text}");
@@ -74,10 +100,14 @@ async fn stdio_modern_connect_list_call() {
     let resource = h.read_resource("mock://item/42").await;
     assert_eq!(resource.status, mcptester_lib::mcp::models::CallStatus::Ok);
     assert!(
-        serde_json::to_string(&resource.result).unwrap().contains("item:42")
+        serde_json::to_string(&resource.result)
+            .unwrap()
+            .contains("item:42")
     );
 
-    let prompt = h.get_prompt("greet", serde_json::json!({ "name": "MCP" })).await;
+    let prompt = h
+        .get_prompt("greet", serde_json::json!({ "name": "MCP" }))
+        .await;
     assert_eq!(prompt.status, mcptester_lib::mcp::models::CallStatus::Ok);
 
     h.disconnect().await;
@@ -122,7 +152,10 @@ async fn legacy_tools_only_server_skips_undeclared_capabilities() {
 
     assert_eq!(handshake_of(&h).await.lifecycle, LifecycleEra::Legacy);
 
-    let snapshot = h.capabilities(true).await.expect("tools-only 服务器不应枚举失败");
+    let snapshot = h
+        .capabilities(true)
+        .await
+        .expect("tools-only 服务器不应枚举失败");
     assert_eq!(snapshot.tools.len(), 11);
     assert!(snapshot.resources.is_empty());
     assert!(snapshot.resource_templates.is_empty());
@@ -205,7 +238,10 @@ async fn legacy_server_without_capabilities_falls_back_to_probing() {
         .expect("未声明 capabilities 时应兜底探测且不失败");
     assert_eq!(snapshot.tools.len(), 11);
     assert!(
-        snapshot.warnings.iter().any(|w| w.contains("resources/list")),
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.contains("resources/list")),
         "缺失的 resources/list 应降级为警告：{:?}",
         snapshot.warnings
     );
@@ -256,16 +292,10 @@ async fn call_timeout_maps_to_timeout_error() {
     assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Error);
     let error = record.error.expect("应有错误");
     assert!(
-        matches!(
-            error,
-            mcptester_lib::mcp::error::CallError::Timeout { .. }
-        ),
+        matches!(error, mcptester_lib::mcp::error::CallError::Timeout { .. }),
         "应为超时错误，实际：{error:?}"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "超时应及时返回"
-    );
+    assert!(started.elapsed() < Duration::from_secs(4), "超时应及时返回");
 
     h.disconnect().await;
 }
@@ -352,9 +382,7 @@ async fn mrtr_input_required_maps_to_error() {
         .await
         .expect("连接失败");
 
-    let record = h
-        .call_tool("input_required", serde_json::json!({}))
-        .await;
+    let record = h.call_tool("input_required", serde_json::json!({})).await;
     assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Error);
     assert!(
         matches!(
@@ -373,7 +401,14 @@ async fn http_connect_list_call() {
     // 启动 mock HTTP 服务（随机高位端口，避免冲突）
     let port = 18200 + (std::process::id() % 200) as u16;
     let mut child = std::process::Command::new(MOCK_BIN)
-        .args(["--transport", "http", "--era", "both", "--port", &port.to_string()])
+        .args([
+            "--transport",
+            "http",
+            "--era",
+            "both",
+            "--port",
+            &port.to_string(),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -383,7 +418,10 @@ async fn http_connect_list_call() {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let mut ready = false;
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             ready = true;
             break;
         }
@@ -398,16 +436,20 @@ async fn http_connect_list_call() {
         TransportKind::StreamableHttp,
         RuntimeSettings::default(),
     );
-    h.connect_http(&HttpConfig {
-        url,
-        headers: vec![KeyValue {
-            key: "X-Test-Header".to_string(),
-            value: Some("m2a".to_string()),
-            secret: false,
-        }],
-        timeout_secs: None,
-        allow_insecure_tls: false,
-    })
+    h.connect_http(
+        &HttpConfig {
+            url,
+            headers: vec![KeyValue {
+                key: "X-Test-Header".to_string(),
+                value: Some("m2a".to_string()),
+                secret: false,
+            }],
+            timeout_secs: None,
+            allow_insecure_tls: false,
+            oauth: None,
+        },
+        None,
+    )
     .await
     .expect("HTTP 连接失败");
 
@@ -417,7 +459,9 @@ async fn http_connect_list_call() {
     let snapshot = h.capabilities(true).await.expect("枚举失败");
     assert_eq!(snapshot.tools.len(), 11);
 
-    let record = h.call_tool("add", serde_json::json!({ "a": 2, "b": 3 })).await;
+    let record = h
+        .call_tool("add", serde_json::json!({ "a": 2, "b": 3 }))
+        .await;
     assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
     let text = serde_json::to_string(&record.result).unwrap();
     assert!(text.contains('5'), "add 结果应包含 5：{text}");
@@ -438,7 +482,12 @@ async fn cmd_shell_mode_wraps_command() {
     let h = handle("mock-cmd-shell", RuntimeSettings::default());
     let cfg = StdioConfig {
         command: MOCK_BIN.to_string(),
-        args: vec!["--transport".to_string(), "stdio".to_string(), "--era".to_string(), "both".to_string()],
+        args: vec![
+            "--transport".to_string(),
+            "stdio".to_string(),
+            "--era".to_string(),
+            "both".to_string(),
+        ],
         env: Vec::new(),
         cwd: None,
         shell_wrap: ShellWrap::CmdShell,
@@ -462,7 +511,10 @@ async fn sse_connect_list_call() {
 
     let mut ready = false;
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             ready = true;
             break;
         }
@@ -482,6 +534,7 @@ async fn sse_connect_list_call() {
         headers: Vec::new(),
         timeout_secs: None,
         allow_insecure_tls: false,
+        oauth: None,
     })
     .await
     .expect("SSE 连接失败");
@@ -493,7 +546,9 @@ async fn sse_connect_list_call() {
     let snapshot = h.capabilities(true).await.expect("枚举失败");
     assert_eq!(snapshot.tools.len(), 2);
 
-    let record = h.call_tool("echo", serde_json::json!({ "text": "sse" })).await;
+    let record = h
+        .call_tool("echo", serde_json::json!({ "text": "sse" }))
+        .await;
     assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
     let text = serde_json::to_string(&record.result).unwrap();
     assert!(text.contains("echo: sse"), "SSE 调用结果异常：{text}");
@@ -592,12 +647,16 @@ async fn fastmcp_full_bearer_header_connects_and_logs_wire() {
     let (mut child, port) = spawn_fastmcp_mock("legacy", "mock-token", 19000).await;
 
     let h = http_handle("mock-fastmcp-bearer");
-    h.connect_http(&HttpConfig {
-        url: format!("http://127.0.0.1:{port}/mcp"),
-        headers: vec![auth_header("Bearer mock-token")],
-        timeout_secs: None,
-        allow_insecure_tls: false,
-    })
+    h.connect_http(
+        &HttpConfig {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: vec![auth_header("Bearer mock-token")],
+            timeout_secs: None,
+            allow_insecure_tls: false,
+            oauth: None,
+        },
+        None,
+    )
     .await
     .expect("完整 Bearer 头应可连接（v0.1.1 归一化）");
 
@@ -621,9 +680,10 @@ async fn fastmcp_full_bearer_header_connects_and_logs_wire() {
         "报文日志应包含 initialize 握手"
     );
     assert!(
-        wire.iter()
-            .any(|e| e.direction == mcptester_lib::mcp::wire::WireDirection::System
-                && e.summary.contains("连接建立")),
+        wire.iter().any(
+            |e| e.direction == mcptester_lib::mcp::wire::WireDirection::System
+                && e.summary.contains("连接建立")
+        ),
         "报文日志应包含连接建立系统条目"
     );
 
@@ -644,12 +704,16 @@ async fn fastmcp_plain_token_connects() {
     let (mut child, port) = spawn_fastmcp_mock("legacy", "mock-token", 19400).await;
 
     let h = http_handle("mock-fastmcp-plain");
-    h.connect_http(&HttpConfig {
-        url: format!("http://127.0.0.1:{port}/mcp"),
-        headers: vec![auth_header("mock-token")],
-        timeout_secs: None,
-        allow_insecure_tls: false,
-    })
+    h.connect_http(
+        &HttpConfig {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: vec![auth_header("mock-token")],
+            timeout_secs: None,
+            allow_insecure_tls: false,
+            oauth: None,
+        },
+        None,
+    )
     .await
     .expect("纯 token 应可连接");
 
@@ -666,12 +730,16 @@ async fn fastmcp_wrong_token_reports_unauthorized() {
 
     let h = http_handle("mock-fastmcp-wrong");
     let err = h
-        .connect_http(&HttpConfig {
-            url: format!("http://127.0.0.1:{port}/mcp"),
-            headers: vec![auth_header("Bearer wrong-token")],
-            timeout_secs: None,
-            allow_insecure_tls: false,
-        })
+        .connect_http(
+            &HttpConfig {
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                headers: vec![auth_header("Bearer wrong-token")],
+                timeout_secs: None,
+                allow_insecure_tls: false,
+                oauth: None,
+            },
+            None,
+        )
         .await
         .expect_err("错误 token 应连接失败");
 
@@ -706,18 +774,25 @@ async fn fastmcp_wrong_token_reports_unauthorized() {
 async fn http_connection_refused_reports_transport_failed() {
     let h = http_handle("mock-refused");
     let err = h
-        .connect_http(&HttpConfig {
-            url: "http://127.0.0.1:1/mcp".to_string(),
-            headers: Vec::new(),
-            timeout_secs: None,
-            allow_insecure_tls: false,
-        })
+        .connect_http(
+            &HttpConfig {
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                headers: Vec::new(),
+                timeout_secs: None,
+                allow_insecure_tls: false,
+                oauth: None,
+            },
+            None,
+        )
         .await
         .expect_err("端口不通应连接失败");
 
     assert_eq!(err.kind(), "transport_failed", "应分类为传输失败：{err:?}");
     let message = err.message();
-    assert!(message.contains("无法连接服务器"), "应给出定向提示：{message}");
+    assert!(
+        message.contains("无法连接服务器"),
+        "应给出定向提示：{message}"
+    );
     assert!(message.contains("127.0.0.1:1"), "应包含目标地址：{message}");
     assert!(
         !message.contains("reqwest::") && !message.contains('<'),

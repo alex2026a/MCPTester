@@ -43,11 +43,44 @@ export interface StdioConfig {
   shell_wrap: "resolve" | "cmd_shell" | "never";
 }
 
+/** OAuth 授权请求额外参数（v0.3.1） */
+export interface OAuthParam {
+  key: string;
+  value: string;
+}
+
+/** OAuth 2.1 登录配置（v0.3.0；可选字段兼容后端省略） */
+export interface OAuthConfig {
+  scopes: string[];
+  client_id?: string | null;
+  /** UI 掩码；真实 secret 由后端 oauth_credentials 保存 */
+  client_secret?: string | null;
+  /** 完整回调地址；缺省 http://127.0.0.1:33318/oauth/callback */
+  redirect_uri?: string | null;
+  authorization_endpoint?: string | null;
+  token_endpoint?: string | null;
+  registration_endpoint?: string | null;
+  issuer?: string | null;
+  allow_missing_issuer?: boolean;
+  /** 授权请求额外参数（v0.3.1） */
+  authorize_params?: OAuthParam[];
+  /** 显式允许自定义 header 发往跨源授权服务器（v0.3.1） */
+  forward_headers_to_auth_server?: boolean;
+  /** CIMD 客户端元数据文档 URL（v0.3.1） */
+  client_metadata_url?: string | null;
+  /** 手工端点 token 认证方式（v0.3.1） */
+  token_endpoint_auth_method?: string | null;
+  /** 退出登录撤销端点（v0.3.1） */
+  revocation_endpoint?: string | null;
+}
+
 export interface HttpConfig {
   url: string;
   headers: KeyValue[];
   timeout_secs: number | null;
   allow_insecure_tls: boolean;
+  /** Some = OAuth；缺省 = 手工 Authorization / 无认证 */
+  oauth?: OAuthConfig | null;
 }
 
 export interface ServerConfig {
@@ -88,6 +121,18 @@ export interface Handshake {
   instructions: string | null;
 }
 
+export interface ServerOAuthSummary {
+  configured: boolean;
+  authorized: boolean;
+  refreshable: boolean;
+  scopes: string[];
+  expires_at: string | null;
+  /** 403 insufficient_scope 缺少的 scope（v0.3.1） */
+  required_scope?: string | null;
+  /** 连接仍 Ready，但需要补充授权（v0.3.1） */
+  step_up_required?: boolean;
+}
+
 export interface ServerSummary {
   id: string;
   name: string;
@@ -95,11 +140,12 @@ export interface ServerSummary {
   enabled: boolean;
   tags: string[];
   origin?: ServerOrigin | null;
+  oauth?: ServerOAuthSummary | null;
   last_connected_at: string | null;
   state: ConnectionState;
 }
 
-export type SecretKindInput = "env" | "header";
+export type SecretKindInput = "env" | "header" | "oauth";
 export type SecretAction = "keep" | "replace" | "clear";
 
 export interface SecretInput {
@@ -179,6 +225,22 @@ export interface CallError {
   timeout_secs?: number;
   reason?: string;
   capability?: string;
+  /** v0.3.1：OAuth 挑战原文 / 403 详情 */
+  detail?: string;
+  required_scope?: string;
+  resource_metadata_url?: string;
+  /** 非 step-up 的 403 */
+  status?: number;
+}
+
+/** 单次调用的原始 JSON-RPC 帧（脱敏/截断前采集） */
+export interface CallFrames {
+  /** 线上 JSON-RPC id，保留 number / string 类型 */
+  rpc_id: string | number | null;
+  request: unknown | null;
+  response: unknown | null;
+  /** 任一帧因超限/异常未保存 */
+  truncated: boolean;
 }
 
 export interface CallRecord {
@@ -197,6 +259,8 @@ export interface CallRecord {
   truncated: boolean;
   size_bytes: number;
   origin: CallOrigin;
+  /** 原始帧；旧记录缺省或为 null */
+  frames?: CallFrames | null;
   created_at: string;
 }
 
@@ -218,4 +282,20 @@ export interface CallRecordSummary {
   truncated: boolean;
   origin: CallOrigin;
   created_at: string;
+}
+
+/** 参数信封：工具/提示词为 { name, arguments }，资源为 { uri } */
+export type CallParams = Record<string, unknown>;
+
+/** 接口页“最近参数”列表项（不含完整参数） */
+export interface RecentCallParam {
+  id: string;
+  created_at: string;
+  status: CallStatus;
+  duration_ms: number;
+  origin: CallOrigin;
+  preview: string;
+  param_count: number;
+  repeat_count: number;
+  params_bytes: number;
 }

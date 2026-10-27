@@ -23,7 +23,11 @@ pub struct LogGuard {
 pub fn init(log_dir: &Path) -> anyhow::Result<LogGuard> {
     let appender = tracing_appender::rolling::daily(log_dir, "mcptester.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // OAuth token 响应会在 rmcp auth 的 debug 日志中输出；应用侧强制上限
+    if let Ok(directive) = "rmcp::transport::auth=info".parse() {
+        filter = filter.add_directive(directive);
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -60,7 +64,9 @@ pub fn is_sensitive_field(name: &str) -> bool {
     if SENSITIVE_EXACT.contains(&normalized) {
         return true;
     }
-    SENSITIVE_SUFFIX.iter().any(|suffix| normalized.ends_with(suffix))
+    SENSITIVE_SUFFIX
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
 }
 
 /// 值模式：Bearer 令牌
@@ -80,23 +86,53 @@ static RE_SK: LazyLock<Regex> =
 
 /// 值模式：URL query 中的 token/key/secret 参数
 static RE_URL_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)([?&](?:access[_-]?token|token|api[_-]?key|apikey|key|secret|password)=)[^&\s"']+"#)
-        .expect("URL token 正则编译失败")
+    Regex::new(
+        r#"(?i)([?&](?:access[_-]?token|token|api[_-]?key|apikey|key|secret|password)=)[^&\s"']+"#,
+    )
+    .expect("URL token 正则编译失败")
 });
 
 /// 值模式：URL userinfo（`scheme://user:pass@host`）
-static RE_URL_USERINFO: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(://)[^/\s:@]+:[^/\s@]+@").expect("URL userinfo 正则编译失败")
+static RE_URL_USERINFO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(://)[^/\s:@]+:[^/\s@]+@").expect("URL userinfo 正则编译失败"));
+
+/// OAuth JSON 敏感字段（access_token / refresh_token / id_token / client_secret / code）
+static RE_OAUTH_JSON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)("(?:access_token|refresh_token|id_token|client_secret|code)"\s*:\s*")[^"]*(")"#,
+    )
+    .expect("OAuth JSON 正则编译失败")
 });
 
-/// 文本脱敏：应用值模式打码后截断至 200 字符
-pub fn scrub_text(value: &str) -> String {
+/// URL query 中的 OAuth code
+static RE_OAUTH_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)([?&]code=)[^&\s"']+"#).expect("OAuth code 正则编译失败"));
+
+/// 值模式脱敏（不截断）
+fn scrub_patterns(value: &str) -> String {
     let mut s = RE_BEARER.replace_all(value, "${1}[REDACTED]").into_owned();
     s = RE_JWT.replace_all(&s, "[REDACTED:JWT]").into_owned();
     s = RE_SK.replace_all(&s, "[REDACTED:KEY]").into_owned();
-    s = RE_URL_USERINFO.replace_all(&s, "${1}[REDACTED]@").into_owned();
+    s = RE_URL_USERINFO
+        .replace_all(&s, "${1}[REDACTED]@")
+        .into_owned();
     s = RE_URL_TOKEN.replace_all(&s, "${1}[REDACTED]").into_owned();
-    truncate(&s, 200)
+    s
+}
+
+/// 文本脱敏：应用值模式打码后截断至 200 字符
+pub fn scrub_text(value: &str) -> String {
+    truncate(&scrub_patterns(value), 200)
+}
+
+/// OAuth 错误/日志脱敏：在通用脱敏基础上额外处理 JSON 字段与 code 参数，
+/// 截断到 500 字符。
+pub fn scrub_oauth_text(value: &str) -> String {
+    let mut s = RE_OAUTH_JSON
+        .replace_all(value, "${1}[REDACTED]${2}")
+        .into_owned();
+    s = RE_OAUTH_CODE.replace_all(&s, "${1}[REDACTED]").into_owned();
+    truncate(&scrub_patterns(&s), 500)
 }
 
 /// 按字段名脱敏：敏感字段全量打码，其余走值模式打码 + 截断
@@ -149,7 +185,7 @@ mod tests {
             ("password", true),
             ("credential", true),
             ("X-Api-Key", true),
-            ("x-auth-token", true),   // 去 x- 前缀 → auth-token，命中 -token 后缀
+            ("x-auth-token", true), // 去 x- 前缀 → auth-token，命中 -token 后缀
             ("github-token", true),
             ("client-secret", true),
             // 误伤检查（子串不匹配）
@@ -159,8 +195,28 @@ mod tests {
             ("tokens_count", false),
         ];
         for (name, expected) in cases {
-            assert_eq!(is_sensitive_field(name), *expected, "字段 {name} 判定不符预期");
+            assert_eq!(
+                is_sensitive_field(name),
+                *expected,
+                "字段 {name} 判定不符预期"
+            );
         }
+    }
+
+    #[test]
+    fn scrub_oauth_text_masks_json_and_code() {
+        let text = r#"{"access_token":"secret-access","refresh_token":"secret-refresh","client_secret":"secret-client","code":"secret-code"}"#;
+        let scrubbed = scrub_oauth_text(text);
+        assert!(!scrubbed.contains("secret-access"));
+        assert!(!scrubbed.contains("secret-refresh"));
+        assert!(!scrubbed.contains("secret-client"));
+        assert!(!scrubbed.contains("secret-code"));
+        assert!(scrubbed.contains("[REDACTED]"));
+
+        let url = "https://127.0.0.1/callback?code=abc123&state=xyz";
+        let scrubbed = scrub_oauth_text(url);
+        assert!(!scrubbed.contains("abc123"));
+        assert!(scrubbed.contains("state=xyz"));
     }
 
     #[test]
@@ -176,10 +232,7 @@ mod tests {
             scrub_text("Authorization: Bearer abcdefgh12345678"),
             "Authorization: Bearer [REDACTED]"
         );
-        assert_eq!(
-            scrub_text("key=sk-abcdefgh12345678"),
-            "key=[REDACTED:KEY]"
-        );
+        assert_eq!(scrub_text("key=sk-abcdefgh12345678"), "key=[REDACTED:KEY]");
         assert!(
             !scrub_text("token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcd")
                 .contains("eyJzdWIi")

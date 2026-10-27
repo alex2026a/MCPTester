@@ -411,7 +411,23 @@ pub fn spawn_auto_connect(app: AppHandle) {
             return;
         }
         tracing::info!(server_id = %id, name = %config.name, "自动连接默认服务器");
-        match state.manager.connect(&config).await {
+        let auth_manager = match config.http.as_ref() {
+            Some(http) if http.oauth.is_some() => {
+                match state
+                    .oauth
+                    .manager_for(&id, http, crate::mcp::oauth::OAuthStoreMode::Persistent)
+                    .await
+                {
+                    Ok(manager) => Some(manager),
+                    Err(error) => {
+                        tracing::warn!(server_id = %id, error = %error, "自动连接创建 OAuth 管理器失败");
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        match state.manager.connect(&config, auth_manager).await {
             Ok(_) => {
                 let _ = state.db.with_write_blocking(|conn| {
                     server_repo::set_last_connected(conn, &id, Utc::now())
@@ -523,9 +539,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("临时目录创建失败");
         let db = Database::open(&dir.path().join("test.db")).expect("数据库打开失败");
         db.migrate().expect("迁移失败");
+        let oauth = crate::mcp::oauth::OAuthService::new(db.clone(), true);
         let state = AppState {
             db,
-            manager: Arc::new(ConnectionManager::new(RuntimeSettings::default())),
+            manager: Arc::new(ConnectionManager::new(
+                RuntimeSettings::default(),
+                Some(oauth.clone()),
+            )),
+            oauth,
             data_dir: dir.path().to_path_buf(),
             log_dir: dir.path().join("logs"),
             portable: true,

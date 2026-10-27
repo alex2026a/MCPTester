@@ -5,21 +5,26 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use rmcp::transport::auth::AuthorizationManager;
+
 use super::connection::ConnectionHandle;
 use super::error::McpError;
 use super::models::{RuntimeSettings, ServerConfig, TransportKind};
+use super::oauth::AuthStateSink;
 
 /// 连接管理器（应用级单例，由 AppState 持有）
 pub struct ConnectionManager {
     settings: RuntimeSettings,
     connections: Mutex<HashMap<String, Arc<ConnectionHandle>>>,
+    auth_state: Option<Arc<dyn AuthStateSink>>,
 }
 
 impl ConnectionManager {
-    pub fn new(settings: RuntimeSettings) -> Self {
+    pub fn new(settings: RuntimeSettings, auth_state: Option<Arc<dyn AuthStateSink>>) -> Self {
         Self {
             settings,
             connections: Mutex::new(HashMap::new()),
+            auth_state,
         }
     }
 
@@ -46,6 +51,9 @@ impl ConnectionManager {
             config.transport.clone(),
             self.settings.clone(),
         );
+        if let Some(sink) = &self.auth_state {
+            handle.set_auth_state_sink(Arc::clone(sink)).await;
+        }
         guard.insert(config.id.clone(), Arc::clone(&handle));
         handle
     }
@@ -54,6 +62,7 @@ impl ConnectionManager {
     pub async fn connect(
         &self,
         config: &ServerConfig,
+        auth_manager: Option<AuthorizationManager>,
     ) -> Result<Arc<ConnectionHandle>, McpError> {
         let handle = self.get_or_create(config).await;
         if handle.state().await.is_ready() {
@@ -70,7 +79,7 @@ impl ConnectionManager {
                 let http = config.http.as_ref().ok_or_else(|| McpError::Config {
                     message: "缺少 HTTP 配置".to_string(),
                 })?;
-                handle.connect_http(http).await
+                handle.connect_http(http, auth_manager).await
             }
             TransportKind::Sse => {
                 let http = config.http.as_ref().ok_or_else(|| McpError::Config {

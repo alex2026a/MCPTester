@@ -85,8 +85,8 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--args" => {
                 i += 1;
                 let raw = args.get(i).cloned().unwrap_or_default();
-                tool_args = serde_json::from_str(&raw)
-                    .map_err(|e| format!("--args 不是合法 JSON：{e}"))?;
+                tool_args =
+                    serde_json::from_str(&raw).map_err(|e| format!("--args 不是合法 JSON：{e}"))?;
             }
             other => {
                 if mode == Some("stdio") {
@@ -131,6 +131,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                     headers,
                     timeout_secs: None,
                     allow_insecure_tls: false,
+                    oauth: None,
                 }),
             )
         }
@@ -174,7 +175,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             .await
             .map_err(|e| e.message())?,
         TransportKind::StreamableHttp => handle
-            .connect_http(config.http.as_ref().expect("http 配置缺失"))
+            .connect_http(config.http.as_ref().expect("http 配置缺失"), None)
             .await
             .map_err(|e| e.message())?,
         TransportKind::Sse => return Err("SSE 传输 M2b 提供".to_string()),
@@ -183,10 +184,7 @@ async fn run(args: &[String]) -> Result<(), String> {
     let state = handle.state().await;
     println!("== 连接状态 ==\n{state:?}");
 
-    let snapshot = handle
-        .capabilities(true)
-        .await
-        .map_err(|e| e.message())?;
+    let snapshot = handle.capabilities(true).await.map_err(|e| e.message())?;
     println!(
         "== 接口 ==\ntools={} resources={} templates={} prompts={}",
         snapshot.tools.len(),
@@ -206,7 +204,10 @@ async fn run(args: &[String]) -> Result<(), String> {
             record.status, record.duration_ms, record.error
         );
         if let Some(result) = record.result {
-            println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
         }
     }
 

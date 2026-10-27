@@ -71,6 +71,17 @@ pub async fn export_wire_log(
 
 /// 启动事件转发任务（应用启动时调用一次）
 pub fn spawn_event_forwarder(app: AppHandle) {
+    // OAuth 登录事件（v0.3.0）：broadcast -> mcp://oauth
+    {
+        let app = app.clone();
+        let mut receiver = app.state::<AppState>().oauth.subscribe();
+        tauri::async_runtime::spawn(async move {
+            while let Ok(event) = receiver.recv().await {
+                let _ = app.emit("mcp://oauth", event);
+            }
+        });
+    }
+
     tauri::async_runtime::spawn(async move {
         let mut subscribed: HashSet<String> = HashSet::new();
         let mut last_state: HashMap<String, String> = HashMap::new();
@@ -81,7 +92,10 @@ pub fn spawn_event_forwarder(app: AppHandle) {
 
             let (db_handles, manager) = {
                 let state = app.state::<AppState>();
-                (state.manager.all_handles().await, Arc::clone(&state.manager))
+                (
+                    state.manager.all_handles().await,
+                    Arc::clone(&state.manager),
+                )
             };
             let _ = db_handles;
 
@@ -148,7 +162,9 @@ pub fn spawn_event_forwarder(app: AppHandle) {
                                         }),
                                     );
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
                                 Err(_) => break,
                             }
                         }

@@ -25,8 +25,8 @@ use rmcp::model::{
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerConfig,
-    SubscriptionFilter, Tool, ToolAnnotations,
+    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerConfig, SubscriptionFilter,
+    Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
@@ -262,11 +262,7 @@ fn tool_unknown() -> Tool {
 }
 
 fn tool_no_schema() -> Tool {
-    let mut tool = Tool::new(
-        "no_schema",
-        "无可用 inputSchema",
-        schema(json!({})),
-    );
+    let mut tool = Tool::new("no_schema", "无可用 inputSchema", schema(json!({})));
     tool.title = Some("无 Schema".to_string());
     tool.annotations = Some(read_only());
     tool
@@ -329,7 +325,10 @@ impl ServerHandler for MockServer {
         match name.as_str() {
             "echo" => {
                 let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!("echo: {text}"))]).into())
+                Ok(
+                    CallToolResult::success(vec![ContentBlock::text(format!("echo: {text}"))])
+                        .into(),
+                )
             }
             "add" => {
                 let a = args.get("a").and_then(Value::as_f64).unwrap_or(0.0);
@@ -353,7 +352,10 @@ impl ServerHandler for MockServer {
                     .to_string();
                 let delay = args.get("delay_ms").and_then(Value::as_u64).unwrap_or(0);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!("echo: {text}"))]).into())
+                Ok(
+                    CallToolResult::success(vec![ContentBlock::text(format!("echo: {text}"))])
+                        .into(),
+                )
             }
             "input_required" => {
                 // MRTR：要求客户端提供交互输入（v0.1 期望：明确报错，不自动重试）
@@ -368,7 +370,9 @@ impl ServerHandler for MockServer {
                 let valid = name.chars().count() >= 2
                     && name.chars().count() <= 20
                     && (1..=5).contains(&count)
-                    && tags.map(|items| (1..=3).contains(&items.len())).unwrap_or(false);
+                    && tags
+                        .map(|items| (1..=3).contains(&items.len()))
+                        .unwrap_or(false);
                 if valid {
                     let mut result = CallToolResult::structured(json!({
                         "ok": true,
@@ -386,7 +390,10 @@ impl ServerHandler for MockServer {
                 }
             }
             "strict" => {
-                let value = args.get("value").and_then(Value::as_str).unwrap_or_default();
+                let value = args
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if value.is_empty() {
                     Err(McpError::new(
                         rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -412,10 +419,9 @@ impl ServerHandler for MockServer {
                 "unknown risk executed",
             )])
             .into()),
-            "no_schema" => Ok(CallToolResult::success(vec![ContentBlock::text(
-                "no schema executed",
-            )])
-            .into()),
+            "no_schema" => {
+                Ok(CallToolResult::success(vec![ContentBlock::text("no schema executed")]).into())
+            }
             other => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 format!("未知工具：{other}"),
@@ -565,6 +571,12 @@ async fn async_main() {
     let mut port: u16 = 18080;
     let mut exit_after_ms: u64 = 0;
     let mut fastmcp_compat: Option<String> = None;
+    let mut oauth = false;
+    let mut oauth_no_refresh = false;
+    let mut oauth_dcr_secret = false;
+    let mut oauth_token_ttl: u64 = 2;
+    let mut oauth_require_authorize_param: Option<(String, String)> = None;
+    let mut oauth_cimd = false;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -610,9 +622,27 @@ async fn async_main() {
                     fastmcp_compat = Some(value.clone());
                 }
             }
+            "--oauth" => oauth = true,
+            "--oauth-no-refresh" => oauth_no_refresh = true,
+            "--oauth-dcr-secret" => oauth_dcr_secret = true,
+            "--oauth-token-ttl" => {
+                i += 1;
+                oauth_token_ttl = args
+                    .get(i)
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(oauth_token_ttl);
+            }
+            "--oauth-require-authorize-param" => {
+                i += 1;
+                if let Some(pair) = args.get(i).and_then(|value| value.split_once('=')) {
+                    oauth_require_authorize_param =
+                        Some((pair.0.to_string(), pair.1.to_string()));
+                }
+            }
+            "--oauth-cimd" => oauth_cimd = true,
             "--help" | "-h" => {
                 println!(
-                    "用法：mock-mcp-server --transport stdio|http|sse [--era both|modern|legacy] [--caps all|tools-only|no-templates|none] [--port N] [--exit-after-ms N] [--fastmcp-compat] [--token T]"
+                    "用法：mock-mcp-server --transport stdio|http|sse [--era both|modern|legacy] [--caps all|tools-only|no-templates|none] [--port N] [--exit-after-ms N] [--fastmcp-compat] [--token T] [--oauth] [--oauth-no-refresh] [--oauth-dcr-secret] [--oauth-token-ttl N] [--oauth-require-authorize-param key=value] [--oauth-cimd]"
                 );
                 return;
             }
@@ -630,7 +660,22 @@ async fn async_main() {
 
     match transport.as_str() {
         "stdio" => run_stdio(era, caps).await,
-        "http" => run_http(era, port, fastmcp_compat, caps).await,
+        "http" => {
+            run_http(
+                era,
+                port,
+                fastmcp_compat,
+                caps,
+                oauth.then_some(OAuthMockConfig {
+                    no_refresh: oauth_no_refresh,
+                    dcr_secret: oauth_dcr_secret,
+                    token_ttl: oauth_token_ttl,
+                    require_authorize_param: oauth_require_authorize_param,
+                    cimd: oauth_cimd,
+                }),
+            )
+            .await
+        }
         "sse" => run_sse(port).await,
         other => {
             eprintln!("不支持的传输：{other}");
@@ -654,7 +699,11 @@ async fn run_stdio(era: Era, caps: CapsMode) {
 
 #[derive(Clone)]
 struct SseState {
-    sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>>,
+    sessions: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>,
+        >,
+    >,
 }
 
 async fn run_sse(port: u16) {
@@ -677,7 +726,9 @@ async fn run_sse(port: u16) {
 
 async fn sse_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
-) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
+) -> axum::response::sse::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use std::convert::Infallible;
 
@@ -731,9 +782,7 @@ async fn sse_messages_handler(
 fn sse_dispatch(method: &str, request: &Value, id: Value) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let ok = |result: Value| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-    let err = |code: i64, message: &str| {
-        serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-    };
+    let err = |code: i64, message: &str| serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } });
     let schema = |value: Value| value;
 
     match method {
@@ -764,7 +813,10 @@ fn sse_dispatch(method: &str, request: &Value, id: Value) -> Value {
               "inputSchema": schema(json!({ "type": "object", "properties": { "a": { "type": "number" }, "b": { "type": "number" } }, "required": ["a", "b"] })) }
         ] })),
         "tools/call" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             match name {
                 "echo" => {
@@ -789,7 +841,10 @@ fn sse_dispatch(method: &str, request: &Value, id: Value) -> Value {
             { "uriTemplate": "mock://item/{id}", "name": "item", "description": "按 id 读取条目（模板）" }
         ] })),
         "resources/read" => {
-            let uri = params.get("uri").and_then(Value::as_str).unwrap_or_default();
+            let uri = params
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let text = if uri == "mock://hello" {
                 "hello from mock".to_string()
             } else if let Some(id) = uri.strip_prefix("mock://item/") {
@@ -804,7 +859,11 @@ fn sse_dispatch(method: &str, request: &Value, id: Value) -> Value {
               "arguments": [{ "name": "name", "description": "要问候的名字", "required": true }] }
         ] })),
         "prompts/get" => {
-            let name = params.get("arguments").and_then(|a| a.get("name")).and_then(Value::as_str).unwrap_or("世界");
+            let name = params
+                .get("arguments")
+                .and_then(|a| a.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("世界");
             ok(json!({
                 "description": "mock 问候提示词",
                 "messages": [{ "role": "user", "content": { "type": "text", "text": format!("你好，{name}！") } }]
@@ -814,7 +873,311 @@ fn sse_dispatch(method: &str, request: &Value, id: Value) -> Value {
     }
 }
 
-async fn run_http(era: Era, port: u16, fastmcp_compat: Option<String>, caps: CapsMode) {
+#[derive(Clone)]
+struct OAuthMockConfig {
+    no_refresh: bool,
+    dcr_secret: bool,
+    token_ttl: u64,
+    require_authorize_param: Option<(String, String)>,
+    cimd: bool,
+}
+
+#[derive(Clone)]
+struct OAuthMockState {
+    issuer: String,
+    resource: String,
+    access_tokens: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    refresh_tokens: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    codes: Arc<tokio::sync::Mutex<std::collections::HashMap<String, MockCode>>>,
+    clients: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+    config: OAuthMockConfig,
+}
+
+struct MockCode {
+    client_id: String,
+    redirect_uri: String,
+    challenge: String,
+    scope: String,
+}
+
+impl OAuthMockState {
+    fn new(port: u16, config: OAuthMockConfig) -> Self {
+        let issuer = format!("http://127.0.0.1:{port}");
+        Self {
+            resource: format!("{issuer}/mcp"),
+            issuer,
+            access_tokens: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            refresh_tokens: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            codes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            config,
+        }
+    }
+}
+
+async fn oauth_guard(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let token = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let valid = match token {
+        Some(token) => state.access_tokens.lock().await.contains(token),
+        None => false,
+    };
+    if !valid {
+        let challenge = format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            state.issuer
+        );
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_str(&challenge)
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer")),
+            )],
+            axum::Json(json!({
+                "error": "invalid_token",
+                "error_description": "OAuth access token required"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn oauth_prm(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+) -> axum::Json<Value> {
+    axum::Json(json!({
+        "resource": state.resource,
+        "authorization_servers": [state.issuer],
+        "scopes_supported": ["read", "write"],
+        "bearer_methods_supported": ["header"]
+    }))
+}
+
+async fn oauth_metadata(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+) -> axum::Json<Value> {
+    let mut value = json!({
+        "issuer": state.issuer,
+        "authorization_endpoint": format!("{}/authorize", state.issuer),
+        "token_endpoint": format!("{}/token", state.issuer),
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "revocation_endpoint": format!("{}/revoke", state.issuer),
+        "revocation_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["read", "write"]
+    });
+    if state.config.cimd {
+        value["client_id_metadata_document_supported"] = Value::Bool(true);
+    } else {
+        value["registration_endpoint"] = Value::String(format!("{}/register", state.issuer));
+    }
+    axum::Json(value)
+}
+
+async fn oauth_register(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+    axum::Json(body): axum::Json<Value>,
+) -> axum::Json<Value> {
+    let client_id = format!("client-{}", uuid::Uuid::new_v4());
+    let secret = state
+        .config
+        .dcr_secret
+        .then(|| format!("dcr-secret-{}", uuid::Uuid::new_v4()));
+    state
+        .clients
+        .lock()
+        .await
+        .insert(client_id.clone(), secret.clone());
+    let mut value = json!({
+        "client_id": client_id,
+        "redirect_uris": body.get("redirect_uris").cloned().unwrap_or_else(|| json!([])),
+        "token_endpoint_auth_method": if secret.is_some() { "client_secret_post" } else { "none" }
+    });
+    if let Some(secret) = secret {
+        value["client_secret"] = Value::String(secret);
+    }
+    axum::Json(value)
+}
+
+async fn oauth_authorize(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(redirect_uri) = query.get("redirect_uri").cloned() else {
+        return (axum::http::StatusCode::BAD_REQUEST, "missing redirect_uri").into_response();
+    };
+    if query.get("response_type").map(String::as_str) != Some("code") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "unsupported response_type",
+        )
+            .into_response();
+    }
+    if query.get("code_challenge_method").map(String::as_str) != Some("S256") {
+        return (axum::http::StatusCode::BAD_REQUEST, "PKCE S256 required").into_response();
+    }
+    if let Some((key, value)) = &state.config.require_authorize_param
+        && query.get(key) != Some(value)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("missing authorize param {key}={value}"),
+        )
+            .into_response();
+    }
+    let client_id = query.get("client_id").cloned().unwrap_or_default();
+    let challenge = query.get("code_challenge").cloned().unwrap_or_default();
+    let scope = query
+        .get("scope")
+        .cloned()
+        .unwrap_or_else(|| "read".to_string());
+    let code = format!("code-{}", uuid::Uuid::new_v4());
+    state.codes.lock().await.insert(
+        code.clone(),
+        MockCode {
+            client_id,
+            redirect_uri: redirect_uri.clone(),
+            challenge,
+            scope,
+        },
+    );
+    let mut location = format!("{redirect_uri}?code={code}");
+    if let Some(state_value) = query.get("state") {
+        location.push_str(&format!("&state={state_value}"));
+    }
+    location.push_str(&format!("&iss={}", state.issuer));
+    axum::response::Redirect::temporary(&location).into_response()
+}
+
+async fn oauth_token(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match form.get("grant_type").map(String::as_str) {
+        Some("authorization_code") => {
+            let Some(code) = form.get("code").cloned() else {
+                return (axum::http::StatusCode::BAD_REQUEST, "missing code").into_response();
+            };
+            let Some(record) = state.codes.lock().await.remove(&code) else {
+                return (axum::http::StatusCode::BAD_REQUEST, "invalid code").into_response();
+            };
+            if form.get("client_id") != Some(&record.client_id)
+                || form.get("redirect_uri") != Some(&record.redirect_uri)
+                || form
+                    .get("code_verifier")
+                    .is_none_or(|value| value.is_empty())
+                || form
+                    .get("code_challenge")
+                    .is_some_and(|value| value != &record.challenge)
+            {
+                return (axum::http::StatusCode::BAD_REQUEST, "invalid code exchange")
+                    .into_response();
+            }
+            issue_tokens(&state, &record.scope).await.into_response()
+        }
+        Some("refresh_token") => {
+            let Some(refresh) = form.get("refresh_token").cloned() else {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(json!({ "error": "invalid_request" })),
+                )
+                    .into_response();
+            };
+            if !state.refresh_tokens.lock().await.remove(&refresh) {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error": "invalid_grant",
+                        "error_description": "refresh token revoked"
+                    })),
+                )
+                    .into_response();
+            }
+            if state.config.dcr_secret {
+                let client_id = form.get("client_id").cloned().unwrap_or_default();
+                let secret = state
+                    .clients
+                    .lock()
+                    .await
+                    .get(&client_id)
+                    .cloned()
+                    .flatten();
+                if form.get("client_secret") != secret.as_ref() {
+                    return (axum::http::StatusCode::UNAUTHORIZED, "invalid client")
+                        .into_response();
+                }
+            }
+            issue_tokens(
+                &state,
+                form.get("scope").map(String::as_str).unwrap_or("read"),
+            )
+            .await
+            .into_response()
+        }
+        _ => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "unsupported grant_type",
+        )
+            .into_response(),
+    }
+}
+
+async fn issue_tokens(state: &OAuthMockState, scope: &str) -> axum::Json<Value> {
+    let access = format!("access-{}", uuid::Uuid::new_v4());
+    let refresh = format!("refresh-{}", uuid::Uuid::new_v4());
+    state.access_tokens.lock().await.insert(access.clone());
+    let mut value = json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": state.config.token_ttl,
+        "scope": scope
+    });
+    if !state.config.no_refresh {
+        state.refresh_tokens.lock().await.insert(refresh.clone());
+        value["refresh_token"] = Value::String(refresh);
+    }
+    axum::Json(value)
+}
+
+async fn oauth_revoke(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+) -> axum::http::StatusCode {
+    state.access_tokens.lock().await.clear();
+    state.refresh_tokens.lock().await.clear();
+    axum::http::StatusCode::OK
+}
+
+async fn oauth_revoke_form(
+    axum::extract::State(state): axum::extract::State<OAuthMockState>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> axum::http::StatusCode {
+    if let Some(token) = form.get("token") {
+        state.access_tokens.lock().await.remove(token);
+        state.refresh_tokens.lock().await.remove(token);
+    }
+    axum::http::StatusCode::OK
+}
+
+async fn run_http(
+    era: Era,
+    port: u16,
+    fastmcp_compat: Option<String>,
+    caps: CapsMode,
+    oauth: Option<OAuthMockConfig>,
+) {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -825,24 +1188,49 @@ async fn run_http(era: Era, port: u16, fastmcp_compat: Option<String>, caps: Cap
         StreamableHttpServerConfig::default(),
     );
 
-    let mut app = axum::Router::new().nest_service("/mcp", service);
-    if let Some(token) = fastmcp_compat {
+    let app = if let Some(oauth_config) = oauth {
+        use axum::routing::{get, post};
+        let state = OAuthMockState::new(port, oauth_config);
+        let mcp = axum::Router::new().nest_service("/mcp", service).layer(
+            axum::middleware::from_fn_with_state(state.clone(), oauth_guard),
+        );
+        let routes = axum::Router::new()
+            .route("/.well-known/oauth-protected-resource", get(oauth_prm))
+            .route("/.well-known/oauth-protected-resource/mcp", get(oauth_prm))
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(oauth_metadata),
+            )
+            .route("/register", post(oauth_register))
+            .route("/authorize", get(oauth_authorize))
+            .route("/token", post(oauth_token))
+            .route("/revoke", post(oauth_revoke_form))
+            .route("/test/revoke", post(oauth_revoke))
+            .with_state(state);
+        println!("mock-mcp-server (http, oauth) listening on http://127.0.0.1:{port}/mcp");
+        mcp.merge(routes)
+    } else if let Some(token) = fastmcp_compat {
         // v0.1.1：FastMCP 兼容层（鉴权 + 无会话 400），用于客户端回归测试
-        app = app.layer(axum::middleware::from_fn_with_state(
-            FastmcpCompat {
-                token: Arc::from(token.as_str()),
-            },
-            fastmcp_compat_layer,
-        ));
         println!("mock-mcp-server (http, fastmcp-compat) listening on http://127.0.0.1:{port}/mcp");
+        axum::Router::new().nest_service("/mcp", service).layer(
+            axum::middleware::from_fn_with_state(
+                FastmcpCompat {
+                    token: Arc::from(token.as_str()),
+                },
+                fastmcp_compat_layer,
+            ),
+        )
     } else {
         println!("mock-mcp-server (http) listening on http://127.0.0.1:{port}/mcp");
-    }
+        axum::Router::new().nest_service("/mcp", service)
+    };
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("mock HTTP 端口绑定失败");
-    axum::serve(listener, app).await.expect("mock HTTP 服务失败");
+    axum::serve(listener, app)
+        .await
+        .expect("mock HTTP 服务失败");
 }
 
 // ---------------------------------------------------------------------------

@@ -15,8 +15,8 @@ use crate::credentials::{self, SecretKind};
 use crate::mcp::connection::ConnectionHandle;
 use crate::mcp::error::McpErrorInfo;
 use crate::mcp::models::{
-    ConnectionState, Handshake, HttpConfig, KeyValue, ServerConfig, ServerSummary, StdioConfig,
-    TransportKind,
+    ConnectionState, Handshake, HttpConfig, KeyValue, OAuthSummary, ServerConfig, ServerSummary,
+    StdioConfig, TransportKind,
 };
 use crate::mcp::wire::WireEntry;
 use crate::storage::server_repo::{self, CredentialRef};
@@ -27,6 +27,9 @@ use crate::storage::server_repo::{self, CredentialRef};
 pub enum SecretKindInput {
     Env,
     Header,
+    /// serde 的 snake_case 会把 OAuth 转成 `o_auth`，而前端契约是 `oauth`，必须显式固定
+    #[serde(rename = "oauth")]
+    OAuth,
 }
 
 impl From<SecretKindInput> for SecretKind {
@@ -34,6 +37,7 @@ impl From<SecretKindInput> for SecretKind {
         match value {
             SecretKindInput::Env => SecretKind::Env,
             SecretKindInput::Header => SecretKind::Header,
+            SecretKindInput::OAuth => SecretKind::OAuth,
         }
     }
 }
@@ -82,12 +86,47 @@ pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerSummar
         .with_read_blocking(server_repo::list)
         .map_err(|e| e.to_string())?;
 
+    let oauth_summaries = state.oauth.summaries().await;
     let mut summaries = Vec::with_capacity(servers.len());
     for config in servers {
-        let state_value = match state.manager.handle(&config.id).await {
+        let handle = state.manager.handle(&config.id).await;
+        let state_value = match &handle {
             Some(handle) => handle.state().await,
             None => ConnectionState::Disconnected,
         };
+        let challenge = match &handle {
+            Some(handle) => handle.last_oauth_challenge().await,
+            None => None,
+        };
+        let configured = config
+            .http
+            .as_ref()
+            .and_then(|http| http.oauth.as_ref())
+            .is_some();
+        let oauth = configured.then(|| {
+            let status = oauth_summaries.get(&config.id);
+            OAuthSummary {
+                configured: true,
+                authorized: status.is_some_and(|status| status.authorized)
+                    && !matches!(
+                        state_value,
+                        ConnectionState::Error {
+                            error: crate::mcp::error::McpError::OAuthRequired { .. }
+                        }
+                    ),
+                refreshable: status.is_some_and(|status| status.refreshable),
+                scopes: status
+                    .map(|status| status.scopes.clone())
+                    .unwrap_or_default(),
+                expires_at: status.and_then(|status| status.expires_at),
+                required_scope: challenge
+                    .as_ref()
+                    .and_then(|challenge| challenge.required_scope.clone()),
+                step_up_required: challenge
+                    .as_ref()
+                    .is_some_and(crate::mcp::connection::OAuthChallenge::is_insufficient_scope),
+            }
+        });
         summaries.push(ServerSummary {
             id: config.id,
             name: config.name,
@@ -95,6 +134,7 @@ pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerSummar
             enabled: config.enabled,
             tags: config.tags,
             origin: config.origin,
+            oauth,
             last_connected_at: config.last_connected_at,
             state: state_value,
         });
@@ -105,11 +145,21 @@ pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerSummar
 /// 服务器详情（编辑用；敏感值为掩码/占位）
 #[tauri::command]
 pub async fn get_server(state: State<'_, AppState>, id: String) -> Result<ServerConfig, String> {
-    state
+    let mut config = state
         .db
         .with_read_blocking(|conn| server_repo::get(conn, &id))
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "服务器不存在".to_string())
+        .ok_or_else(|| "服务器不存在".to_string())?;
+    if let Some(http) = config.http.as_mut()
+        && let Some(oauth) = http.oauth.as_mut()
+    {
+        oauth.client_secret = state
+            .oauth
+            .has_user_client_secret(&id)
+            .await
+            .then(|| "****".to_string());
+    }
+    Ok(config)
 }
 
 /// 新增服务器
@@ -132,13 +182,15 @@ pub(crate) async fn add_server_inner(
 
     // 便携模式：凭据随数据目录明文保存（不写 keyring）
     if state.portable {
-        let mut config = draft_to_config(&draft, id, now, now, false);
+        let mut config = draft_to_config(&draft, id.clone(), now, now, false);
         apply_plaintext_secrets(&mut config, &draft.secrets, None);
         let config_for_db = config.clone();
         state
             .db
             .with_write_blocking(move |conn| server_repo::upsert(conn, &config_for_db))
             .map_err(|e| format!("保存服务器失败：{e}"))?;
+        persist_oauth_secret(state, &id, &draft).await?;
+        mask_oauth_secret(&mut config, state, &id).await;
         return Ok(config);
     }
 
@@ -147,6 +199,9 @@ pub(crate) async fn add_server_inner(
     // 1. 敏感值写 keyring（生成版本化 ref）
     let mut written: Vec<(CredentialRef, SecretKind, String)> = Vec::new();
     for secret in &draft.secrets {
+        if matches!(secret.kind, SecretKindInput::OAuth) {
+            continue;
+        }
         if secret.action != SecretAction::Replace && secret.action != SecretAction::Keep {
             continue;
         }
@@ -194,7 +249,64 @@ pub(crate) async fn add_server_inner(
         return Err(format!("保存服务器失败：{e}"));
     }
 
+    persist_oauth_secret(state, &id, &draft).await?;
+    mask_oauth_secret(&mut masked_config, state, &id).await;
     Ok(masked_config)
+}
+
+/// 保存 OAuth client_secret（真实值只进 oauth_credentials）
+async fn persist_oauth_secret(
+    state: &AppState,
+    id: &str,
+    draft: &ServerDraft,
+) -> Result<(), String> {
+    let Some(secret) = draft
+        .secrets
+        .iter()
+        .find(|secret| matches!(secret.kind, SecretKindInput::OAuth))
+    else {
+        return Ok(());
+    };
+    let client_id = draft
+        .http
+        .as_ref()
+        .and_then(|http| http.oauth.as_ref())
+        .and_then(|oauth| oauth.client_id.clone());
+    match secret.action {
+        SecretAction::Keep => Ok(()),
+        SecretAction::Clear => state
+            .oauth
+            .set_user_client_secret(id, client_id, None)
+            .await
+            .map_err(|e| e.to_string()),
+        SecretAction::Replace => {
+            let value = secret
+                .value
+                .as_deref()
+                .filter(|value| !value.is_empty() && !looks_like_masked_secret(value))
+                .ok_or_else(|| "client_secret 未提供新值".to_string())?;
+            state
+                .oauth
+                .set_user_client_secret(id, client_id, Some(value.to_string()))
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// 回显 user client_secret 掩码（DCR / public client 不回显）
+async fn mask_oauth_secret(config: &mut ServerConfig, state: &AppState, id: &str) {
+    let Some(http) = config.http.as_mut() else {
+        return;
+    };
+    let Some(oauth) = http.oauth.as_mut() else {
+        return;
+    };
+    if state.oauth.has_user_client_secret(id).await {
+        oauth.client_secret = Some("****".to_string());
+    } else {
+        oauth.client_secret = None;
+    }
 }
 
 /// 更新服务器（敏感值三态：keep / replace / clear）
@@ -255,6 +367,15 @@ pub(crate) async fn update_server_inner(
                 });
             }
         }
+        persist_oauth_secret(state, &id, &draft).await?;
+        mask_oauth_secret(&mut config, state, &id).await;
+        if let Some(http) = config.http.as_ref() {
+            state
+                .oauth
+                .on_config_changed(&id, http)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         return Ok(config);
     }
 
@@ -266,6 +387,9 @@ pub(crate) async fn update_server_inner(
     // v0.1.1：keep 语义保护——这些 (kind, name) 的旧 keyring 条目必须保留（修复此前被误删的问题）
     let mut keep_keys: Vec<(String, String)> = Vec::new();
     for secret in &draft.secrets {
+        if matches!(secret.kind, SecretKindInput::OAuth) {
+            continue;
+        }
         let kind: SecretKind = secret.kind.clone().into();
         let kind_str = kind.path_segment().to_string();
         match secret.action {
@@ -314,6 +438,7 @@ pub(crate) async fn update_server_inner(
     let new_refs_clone = new_refs.clone();
     let delete_keys = to_delete_keys.clone();
     let config_for_tx = config.clone();
+    let id_for_tx = id.clone();
     let result = state.db.with_write_blocking(move |conn| {
         let tx = conn.transaction()?;
         server_repo::upsert(&tx, &config_for_tx)?;
@@ -321,7 +446,7 @@ pub(crate) async fn update_server_inner(
             server_repo::upsert_credential(&tx, item)?;
         }
         for (kind, name) in &delete_keys {
-            server_repo::delete_credential(&tx, &id, kind, name)?;
+            server_repo::delete_credential(&tx, &id_for_tx, kind, name)?;
         }
         tx.commit()?;
         Ok(())
@@ -348,6 +473,15 @@ pub(crate) async fn update_server_inner(
         }
     }
 
+    persist_oauth_secret(state, &id, &draft).await?;
+    mask_oauth_secret(&mut config, state, &id).await;
+    if let Some(http) = config.http.as_ref() {
+        state
+            .oauth
+            .on_config_changed(&id, http)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(config)
 }
 
@@ -394,13 +528,51 @@ pub async fn test_server_connection(
     id: Option<String>,
 ) -> Result<ConnectionTestReport, McpErrorInfo> {
     let config = resolve_config_for_test(&state, id.as_deref(), &draft)?;
+    let test_id = format!("__test__{}", uuid::Uuid::new_v4());
     let handle = ConnectionHandle::new(
-        format!("__test__{}", uuid::Uuid::new_v4()),
+        test_id.clone(),
         config.name.clone(),
         config.protocol_version_pin.clone(),
         config.transport.clone(),
         state.manager.settings().clone(),
     );
+
+    let oauth_mode = match config.http.as_ref().and_then(|http| http.oauth.as_ref()) {
+        Some(_) => {
+            let saved = match id.as_deref() {
+                Some(id) => state
+                    .db
+                    .with_read_blocking(|conn| server_repo::get(conn, id))
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let same = saved.as_ref().is_some_and(|saved| {
+                saved.http.as_ref().is_some_and(|old| {
+                    config
+                        .http
+                        .as_ref()
+                        .is_some_and(|new| old.url == new.url && old.oauth == new.oauth)
+                })
+            });
+            Some(if same {
+                crate::mcp::oauth::OAuthStoreMode::Persistent
+            } else {
+                crate::mcp::oauth::OAuthStoreMode::InMemory
+            })
+        }
+        None => None,
+    };
+    let mut auth_manager = match (oauth_mode, config.http.as_ref()) {
+        (Some(mode), Some(http)) => Some(
+            state
+                .oauth
+                .manager_for(id.as_deref().unwrap_or(&test_id), http, mode)
+                .await
+                .map_err(|e| e.to_info())?,
+        ),
+        _ => None,
+    };
 
     let mut steps: Vec<TestStep> = Vec::new();
     let report_failure =
@@ -440,7 +612,7 @@ pub async fn test_server_connection(
                 .http
                 .as_ref()
                 .ok_or_else(|| config_error("缺少 HTTP 配置"))?;
-            handle.connect_http(http).await
+            handle.connect_http(http, auth_manager.take()).await
         }
         TransportKind::Sse => {
             let http = config
@@ -468,6 +640,7 @@ pub async fn test_server_connection(
                 kind: "internal".to_string(),
                 message: format!("连接后状态异常：{other:?}"),
                 raw: None,
+                ..Default::default()
             };
             return Ok(report_failure(
                 steps,
@@ -582,6 +755,24 @@ fn resolve_config_for_test(
         };
 
         for secret in &draft.secrets {
+            if matches!(secret.kind, SecretKindInput::OAuth) {
+                let value = match secret.action {
+                    SecretAction::Clear => None,
+                    SecretAction::Replace => {
+                        let raw = secret.value.as_deref().unwrap_or_default();
+                        if !raw.is_empty() && !looks_like_masked_secret(raw) {
+                            Some(raw.to_string())
+                        } else {
+                            existing_id.and_then(|id| state.oauth.user_client_secret_blocking(id))
+                        }
+                    }
+                    SecretAction::Keep => {
+                        existing_id.and_then(|id| state.oauth.user_client_secret_blocking(id))
+                    }
+                };
+                apply_secret_value(&mut config, "oauth", &secret.key, value);
+                continue;
+            }
             let kind: SecretKind = secret.kind.clone().into();
             let kind_str = kind.path_segment().to_string();
             let value = match secret.action {
@@ -613,10 +804,14 @@ fn lookup_secret_value(
     kind: &str,
     name: &str,
 ) -> Result<Option<String>, McpErrorInfo> {
-    match refs.iter().find(|item| item.kind == kind && item.name == name) {
+    match refs
+        .iter()
+        .find(|item| item.kind == kind && item.name == name)
+    {
         Some(item) => {
-            let value = credentials::get_secret(&item.reference)
-                .map_err(|e| config_error(format!("敏感值「{name}」读取失败（{e}）：请重新填写")))?;
+            let value = credentials::get_secret(&item.reference).map_err(|e| {
+                config_error(format!("敏感值「{name}」读取失败（{e}）：请重新填写"))
+            })?;
             Ok(Some(value))
         }
         None => Ok(None),
@@ -634,6 +829,12 @@ fn apply_secret_value(config: &mut ServerConfig, kind: &str, name: &str, value: 
             .http
             .as_mut()
             .and_then(|http| http.headers.iter_mut().find(|kv| kv.key == name)),
+        "oauth" => {
+            if let Some(oauth) = config.http.as_mut().and_then(|http| http.oauth.as_mut()) {
+                oauth.client_secret = value.clone();
+            }
+            None
+        }
         _ => None,
     };
     if let Some(slot) = slot {
@@ -669,6 +870,9 @@ pub async fn delete_server(state: State<'_, AppState>, id: String) -> Result<(),
                 .with_write_blocking(|conn| server_repo::add_secret_cleanup(conn, &item.reference));
         }
     }
+    if let Err(e) = state.oauth.clear(&id).await {
+        tracing::warn!(server_id = %id, error = %e, "清理 OAuth 凭据失败");
+    }
     Ok(())
 }
 
@@ -679,11 +883,25 @@ pub async fn connect_server(
     id: String,
 ) -> Result<ConnectionState, McpErrorInfo> {
     let config = load_resolved_config(&state, &id)?;
-    let handle = state.manager.connect(&config).await.map_err(|e| e.to_info())?;
+    let auth_manager = match config.http.as_ref() {
+        Some(http) if http.oauth.is_some() => Some(
+            state
+                .oauth
+                .manager_for(&id, http, crate::mcp::oauth::OAuthStoreMode::Persistent)
+                .await
+                .map_err(|e| e.to_info())?,
+        ),
+        _ => None,
+    };
+    let handle = state
+        .manager
+        .connect(&config, auth_manager)
+        .await
+        .map_err(|e| e.to_info())?;
     // 记录最后连接时间（仅成功时）
-    let _ = state.db.with_write_blocking(|conn| {
-        server_repo::set_last_connected(conn, &id, Utc::now())
-    });
+    let _ = state
+        .db
+        .with_write_blocking(|conn| server_repo::set_last_connected(conn, &id, Utc::now()));
     Ok(handle.state().await)
 }
 
@@ -741,6 +959,16 @@ pub async fn update_server_meta(
     Ok(config)
 }
 
+/// 保存服务器自定义排序（要求提交当前全部服务器 ID）
+#[tauri::command]
+pub async fn reorder_servers(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
+    state
+        .db
+        .with_write(move |conn| server_repo::reorder(conn, &ids))
+        .await
+        .map_err(|e| format!("保存服务器顺序失败：{e}"))
+}
+
 // ---------------------------------------------------------------------------
 // 内部辅助
 // ---------------------------------------------------------------------------
@@ -758,6 +986,14 @@ pub(crate) fn validate_draft(draft: &ServerDraft) -> Result<(), String> {
             if stdio.command.trim().is_empty() {
                 return Err("命令不能为空".to_string());
             }
+            if draft
+                .http
+                .as_ref()
+                .and_then(|http| http.oauth.as_ref())
+                .is_some()
+            {
+                return Err("OAuth 仅支持 Streamable HTTP".to_string());
+            }
         }
         TransportKind::StreamableHttp | TransportKind::Sse => {
             let http = draft
@@ -767,7 +1003,198 @@ pub(crate) fn validate_draft(draft: &ServerDraft) -> Result<(), String> {
             if !(http.url.starts_with("http://") || http.url.starts_with("https://")) {
                 return Err("URL 必须以 http:// 或 https:// 开头".to_string());
             }
+            if draft.transport == TransportKind::Sse && http.oauth.is_some() {
+                return Err("OAuth 仅支持 Streamable HTTP，不支持遗留 SSE".to_string());
+            }
+            if let Some(oauth) = http.oauth.as_ref() {
+                validate_oauth(http, oauth, &draft.secrets)?;
+            }
         }
+    }
+    Ok(())
+}
+
+fn validate_oauth(
+    http: &HttpConfig,
+    oauth: &crate::mcp::models::OAuthConfig,
+    secrets: &[SecretInput],
+) -> Result<(), String> {
+    if http
+        .headers
+        .iter()
+        .any(|header| header.key.trim().eq_ignore_ascii_case("authorization"))
+    {
+        return Err("OAuth 模式下不能同时配置 Authorization 请求头".to_string());
+    }
+    let mut header_keys = std::collections::HashSet::new();
+    for header in &http.headers {
+        let key = header.key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return Err("OAuth 模式下请求头名称不能为空".to_string());
+        }
+        if !header_keys.insert(key.clone()) {
+            return Err(format!("OAuth 模式下请求头「{key}」重复"));
+        }
+    }
+    ensure_oauth_url(&http.url, "MCP 端点")?;
+    validate_authorize_params(oauth)?;
+    if oauth.client_secret.is_some() && oauth.client_id.is_none() {
+        return Err("client_secret 必须与 client_id 同时填写".to_string());
+    }
+    if let Some(url) = oauth.client_metadata_url.as_deref() {
+        validate_client_metadata_url(url)?;
+        if oauth.client_id.is_none()
+            && (oauth.client_secret.is_some()
+                || secrets.iter().any(|secret| {
+                    matches!(secret.kind, SecretKindInput::OAuth)
+                        && secret.action == SecretAction::Replace
+                }))
+        {
+            return Err("CIMD 是公共客户端，不能同时配置 client_secret".to_string());
+        }
+    }
+    if let Some(method) = oauth.token_endpoint_auth_method.as_deref()
+        && !matches!(method, "client_secret_basic" | "client_secret_post" | "none")
+    {
+        return Err(
+            "token_endpoint_auth_method 只能是 client_secret_basic/client_secret_post/none"
+                .to_string(),
+        );
+    }
+    for scope in &oauth.scopes {
+        if scope.is_empty() || scope.chars().any(char::is_whitespace) {
+            return Err(format!("scope「{scope}」不能为空或包含空白字符"));
+        }
+    }
+    for endpoint in [
+        oauth.authorization_endpoint.as_deref(),
+        oauth.token_endpoint.as_deref(),
+        oauth.registration_endpoint.as_deref(),
+        oauth.revocation_endpoint.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure_oauth_url(endpoint, "OAuth 端点")?;
+    }
+    if let Some(value) = oauth.revocation_endpoint.as_deref() {
+        let url = url::Url::parse(value).map_err(|e| format!("撤销端点 URL 非法：{e}"))?;
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err("撤销端点不能包含 query 或 fragment".to_string());
+        }
+    }
+    if let Some(redirect) = oauth.redirect_uri.as_deref() {
+        validate_redirect_uri(redirect)?;
+    }
+    for secret in secrets {
+        if matches!(secret.kind, SecretKindInput::OAuth) && secret.action == SecretAction::Replace {
+            if oauth.client_id.is_none() {
+                return Err("填写 client_secret 前必须先填写 client_id".to_string());
+            }
+            if secret
+                .value
+                .as_deref()
+                .is_none_or(|value| value.is_empty() || looks_like_masked_secret(value))
+            {
+                return Err("client_secret 不能为空或掩码".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 授权请求额外参数：key 字符集、保留参数、重复 key、CR/LF。
+fn validate_authorize_params(
+    oauth: &crate::mcp::models::OAuthConfig,
+) -> Result<(), String> {
+    const RESERVED: &[&str] = &[
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "scope",
+        "resource",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for param in &oauth.authorize_params {
+        let key = param.key.trim();
+        if key.is_empty() {
+            return Err("授权请求参数 key 不能为空".to_string());
+        }
+        if !key.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
+        }) {
+            return Err(format!(
+                "授权请求参数「{key}」只能包含字母、数字、_ - . :"
+            ));
+        }
+        let lower = key.to_ascii_lowercase();
+        if RESERVED.contains(&lower.as_str()) {
+            return Err(format!("授权请求参数「{key}」是保留参数，不能覆盖"));
+        }
+        if !seen.insert(lower.clone()) {
+            return Err(format!("授权请求参数「{key}」重复"));
+        }
+        if param.value.contains('\r') || param.value.contains('\n') {
+            return Err(format!("授权请求参数「{key}」的值不能包含换行"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_client_metadata_url(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|e| format!("CIMD URL 非法：{e}"))?;
+    if url.scheme() != "https" {
+        return Err("CIMD URL 必须使用 https".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("CIMD URL 不能包含用户名或密码".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("CIMD URL 不能包含 query 或 fragment".to_string());
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        return Err("CIMD URL 必须包含非根路径".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_oauth_url(value: &str, label: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|e| format!("{label} URL 非法：{e}"))?;
+    let loopback = url
+        .host_str()
+        .map(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host == "127.0.0.1"
+                || host == "[::1]"
+                || host == "::1"
+        })
+        .unwrap_or(false);
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err(format!("{label} 必须使用 https（loopback 除外）：{value}"));
+    }
+    Ok(())
+}
+
+fn validate_redirect_uri(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|e| format!("回调地址非法：{e}"))?;
+    if url.scheme() != "http" {
+        return Err("回调地址必须使用 http（loopback）".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("回调地址不能包含 query 或 fragment".to_string());
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if !matches!(
+        host.as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    ) {
+        return Err("回调地址只允许 127.0.0.1 / localhost / [::1]".to_string());
+    }
+    if url.port().unwrap_or(0) == 0 {
+        return Err("回调地址必须显式指定非 0 端口".to_string());
     }
     Ok(())
 }
@@ -781,6 +1208,10 @@ pub(crate) fn draft_to_config(
 ) -> ServerConfig {
     let mut stdio = draft.stdio.clone();
     let mut http = draft.http.clone();
+    // OAuth client_secret 的单一事实源是 oauth_credentials，config_json 永不落值
+    if let Some(oauth) = http.as_mut().and_then(|http| http.oauth.as_mut()) {
+        oauth.client_secret = None;
+    }
     if mask_secrets {
         if let Some(config) = stdio.as_mut() {
             apply_masks(&mut config.env, &draft.secrets, SecretKindInput::Env);
@@ -819,6 +1250,8 @@ pub(crate) fn apply_plaintext_secrets(
             SecretKindInput::Header => {
                 (config.http.as_mut().map(|http| &mut http.headers), "header")
             }
+            // OAuth client_secret 由 OAuthService 存 oauth_credentials，不写 config
+            SecretKindInput::OAuth => continue,
         };
         let Some(items) = items else { continue };
         let Some(item) = items.iter_mut().find(|item| item.key == secret.key) else {
@@ -1013,6 +1446,13 @@ pub(crate) fn load_resolved_config(
         }
     }
 
+    // OAuth：只注入 user 预注册 secret；DCR secret 由 OAuthService 自行读取
+    if let Some(oauth) = config.http.as_mut().and_then(|http| http.oauth.as_mut())
+        && let Some(secret) = state.oauth.user_client_secret_blocking(id)
+    {
+        oauth.client_secret = Some(secret);
+    }
+
     // 待配置占位符：给出可操作错误，而不是带着空值去连服务器
     check_pending_secrets(&config)?;
     // v0.1.2：掩码遗留检测（旧版本编辑保存曾把掩码写回凭据库）
@@ -1026,6 +1466,7 @@ pub(crate) fn config_error(message: impl Into<String>) -> McpErrorInfo {
         kind: "config".to_string(),
         message: message.into(),
         raw: None,
+        ..Default::default()
     }
 }
 
@@ -1058,6 +1499,7 @@ fn check_masked_items(items: &[KeyValue], scope: &str) -> Result<(), McpErrorInf
                     kv.key
                 ),
                 raw: None,
+                ..Default::default()
             });
         }
     }
@@ -1093,6 +1535,7 @@ fn check_pending_items(items: &[KeyValue], scope: &str) -> Result<(), McpErrorIn
                     kv.key
                 ),
                 raw: None,
+                ..Default::default()
             });
         }
     }
@@ -1134,6 +1577,45 @@ pub fn startup_secret_check(state: &AppState) {
             });
         }
     }
+
+    // 3. OAuth 孤儿清理（v0.3.0）：服务器已删除 / refresh 分块缺失
+    let oauth_rows = state
+        .db
+        .with_read_blocking(crate::storage::oauth_repo::list_all)
+        .unwrap_or_default();
+    for row in oauth_rows {
+        let exists = state
+            .db
+            .with_read_blocking(|conn| server_repo::get(conn, &row.server_id))
+            .ok()
+            .flatten()
+            .is_some();
+        if !exists {
+            tracing::warn!(server_id = %row.server_id, "清理孤儿 OAuth 凭据");
+            let base = crate::mcp::oauth::store::refresh_ref(&row.server_id);
+            let _ = credentials::delete_secret_chunked(&base, row.refresh_chunks.max(0) as u32);
+            if let Some(reference) = row.client_secret_ref.as_deref() {
+                let _ = credentials::delete_secret(reference);
+            }
+            let server_id = row.server_id.clone();
+            let _ = state
+                .db
+                .with_write_blocking(|conn| crate::storage::oauth_repo::delete(conn, &server_id));
+        } else if row.has_refresh_token && !state.portable {
+            let base = crate::mcp::oauth::store::refresh_ref(&row.server_id);
+            let readable = row.refresh_ref.as_deref().is_some_and(|reference| {
+                credentials::get_secret_chunked(reference, row.refresh_chunks.max(0) as u32).is_ok()
+            });
+            if !readable {
+                tracing::warn!(server_id = %row.server_id, "清理缺失的 OAuth refresh token");
+                let _ = credentials::delete_secret_chunked(&base, row.refresh_chunks.max(0) as u32);
+                let server_id = row.server_id.clone();
+                let _ = state.db.with_write_blocking(|conn| {
+                    crate::storage::oauth_repo::clear_token(conn, &server_id)
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1143,6 +1625,200 @@ mod tests {
     use crate::mcp::models::RuntimeSettings;
     use crate::storage::Database;
     use std::sync::Arc;
+
+    fn oauth_draft() -> ServerDraft {
+        ServerDraft {
+            name: "oauth".to_string(),
+            transport: TransportKind::StreamableHttp,
+            stdio: None,
+            http: Some(HttpConfig {
+                url: "https://example.com/mcp".to_string(),
+                headers: Vec::new(),
+                timeout_secs: None,
+                allow_insecure_tls: false,
+                oauth: Some(crate::mcp::models::OAuthConfig::default()),
+            }),
+            protocol_version_pin: None,
+            enabled: true,
+            tags: Vec::new(),
+            secrets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn oauth_validation_rejects_sse_and_conflicts() {
+        let mut draft = oauth_draft();
+        draft.transport = TransportKind::Sse;
+        assert!(validate_draft(&draft).is_err(), "SSE 不允许 OAuth");
+
+        let mut draft = oauth_draft();
+        draft.http.as_mut().unwrap().headers.push(KeyValue {
+            key: "Authorization".to_string(),
+            value: Some("Bearer x".to_string()),
+            secret: true,
+        });
+        assert!(
+            validate_draft(&draft).is_err(),
+            "OAuth 与 Authorization 冲突"
+        );
+
+        let mut draft = oauth_draft();
+        draft.http.as_mut().unwrap().url = "http://example.com/mcp".to_string();
+        assert!(validate_draft(&draft).is_err(), "远端 http 资源不允许");
+
+        let mut draft = oauth_draft();
+        draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap()
+            .redirect_uri = Some("http://127.0.0.1:33318/callback?x=1".to_string());
+        assert!(validate_draft(&draft).is_err(), "redirect 不允许 query");
+
+        let mut draft = oauth_draft();
+        draft.secrets.push(SecretInput {
+            kind: SecretKindInput::OAuth,
+            key: "client_secret".to_string(),
+            action: SecretAction::Replace,
+            value: Some("secret".to_string()),
+        });
+        assert!(validate_draft(&draft).is_err(), "secret 需要 client_id");
+    }
+
+    #[test]
+    fn oauth_validation_rejects_duplicate_headers_and_reserved_params() {
+        let mut draft = oauth_draft();
+        draft.http.as_mut().unwrap().headers = vec![
+            KeyValue {
+                key: "X-Api-Key".to_string(),
+                value: Some("a".to_string()),
+                secret: false,
+            },
+            KeyValue {
+                key: "x-api-key".to_string(),
+                value: Some("b".to_string()),
+                secret: false,
+            },
+        ];
+        assert!(validate_draft(&draft).is_err(), "重复 header 应被拒绝");
+
+        let mut draft = oauth_draft();
+        draft.http.as_mut().unwrap().headers = vec![KeyValue {
+            key: "Authorization".to_string(),
+            value: None,
+            secret: true,
+        }];
+        assert!(
+            validate_draft(&draft).is_err(),
+            "secret 形式 Authorization 也应被拒绝"
+        );
+
+        let mut draft = oauth_draft();
+        draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap()
+            .authorize_params = vec![crate::mcp::models::OAuthParam {
+            key: "scope".to_string(),
+            value: "read".to_string(),
+        }];
+        assert!(validate_draft(&draft).is_err(), "保留参数应被拒绝");
+
+        let mut draft = oauth_draft();
+        draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap()
+            .authorize_params = vec![crate::mcp::models::OAuthParam {
+            key: "audience".to_string(),
+            value: "a\nb".to_string(),
+        }];
+        assert!(validate_draft(&draft).is_err(), "CR/LF 应被拒绝");
+    }
+
+    #[test]
+    fn oauth_validation_accepts_cimd_and_rejects_invalid() {
+        let mut draft = oauth_draft();
+        draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap()
+            .client_metadata_url =
+            Some("https://client.example.com/oauth-client-metadata.json".to_string());
+        assert!(validate_draft(&draft).is_ok(), "合法 CIMD URL 应通过");
+
+        let mut draft = oauth_draft();
+        draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap()
+            .client_metadata_url = Some("http://client.example.com/metadata.json".to_string());
+        assert!(validate_draft(&draft).is_err(), "CIMD 必须 HTTPS");
+
+        let mut draft = oauth_draft();
+        let oauth = draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap();
+        oauth.client_metadata_url =
+            Some("https://client.example.com/metadata.json".to_string());
+        oauth.client_secret = Some("****".to_string());
+        assert!(validate_draft(&draft).is_err(), "CIMD 不能配 secret");
+    }
+
+    #[test]
+    fn oauth_draft_wire_format_uses_oauth_secret_kind() {
+        // 回归：SecretKindInput 曾因 serde snake_case 把 OAuth 写成 `o_auth`，
+        // 导致前端提交的 `kind: "oauth"` 在 test_server_connection / add_server 反序列化失败。
+        let draft: ServerDraft = serde_json::from_value(serde_json::json!({
+            "name": "oauth",
+            "transport": "streamable_http",
+            "stdio": null,
+            "http": {
+                "url": "https://example.com/mcp",
+                "headers": [],
+                "timeout_secs": null,
+                "allow_insecure_tls": false,
+                "oauth": { "scopes": [] }
+            },
+            "protocol_version_pin": null,
+            "enabled": true,
+            "tags": [],
+            "secrets": [
+                {
+                    "kind": "oauth",
+                    "key": "client_secret",
+                    "action": "replace",
+                    "value": "s3cret"
+                }
+            ]
+        }))
+        .expect("OAuth 草稿应能从前端 JSON 反序列化");
+
+        assert!(matches!(draft.secrets[0].kind, SecretKindInput::OAuth));
+        assert_eq!(draft.secrets[0].action, SecretAction::Replace);
+
+        // 回写方向也必须是 oauth（与 src/types/models.ts 的类型契约一致）
+        let encoded = serde_json::to_value(&draft.secrets[0]).expect("序列化失败");
+        assert_eq!(encoded["kind"], "oauth");
+    }
 
     #[test]
     fn masked_secret_detection() {
@@ -1159,9 +1835,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("临时目录创建失败");
         let db = Database::open(&dir.path().join("test.db")).expect("数据库打开失败");
         db.migrate().expect("迁移失败");
+        let oauth = crate::mcp::oauth::OAuthService::new(db.clone(), true);
         let state = AppState {
             db,
-            manager: Arc::new(ConnectionManager::new(RuntimeSettings::default())),
+            manager: Arc::new(ConnectionManager::new(
+                RuntimeSettings::default(),
+                Some(oauth.clone()),
+            )),
+            oauth,
             data_dir: dir.path().to_path_buf(),
             log_dir: dir.path().join("logs"),
             portable: true,
@@ -1185,6 +1866,7 @@ mod tests {
                 }],
                 timeout_secs: None,
                 allow_insecure_tls: false,
+                oauth: None,
             }),
             protocol_version_pin: None,
             enabled: true,

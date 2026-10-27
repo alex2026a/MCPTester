@@ -5,11 +5,15 @@
 //!
 //! v0.1.1：`Authorization: Bearer xxx`（完整头值）与仅 `xxx`（token）两种填法均可；
 //! 其他 scheme（Basic 等）原样作为自定义头透传，避免 reqwest `bearer_auth` 盲目再拼前缀。
+//!
+//! v0.3.0：新增 `build_http_oauth`，只有 OAuth 模式使用 `AuthClient`；
+//! 无 OAuth 的服务器继续走原 `reqwest::Client` 路径，避免 401 分类回归。
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
+use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -18,11 +22,12 @@ use super::{AuthorizationValue, normalize_authorization};
 use crate::mcp::error::McpError;
 use crate::mcp::models::HttpConfig;
 
-/// 构建 Streamable HTTP 传输
-pub fn build_http(
-    cfg: &HttpConfig,
-    default_timeout_secs: u64,
-) -> Result<StreamableHttpClientTransport<reqwest::Client>, McpError> {
+struct PreparedHttp {
+    client: reqwest::Client,
+    config: StreamableHttpClientTransportConfig,
+}
+
+fn prepare(cfg: &HttpConfig, default_timeout_secs: u64) -> Result<PreparedHttp, McpError> {
     let mut auth_header: Option<String> = None;
     let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
 
@@ -30,10 +35,8 @@ pub fn build_http(
         let Some(value) = kv.value.as_deref() else {
             continue;
         };
-        let name = HeaderName::from_bytes(kv.key.as_bytes()).map_err(|e| {
-            McpError::Config {
-                message: format!("请求头名称非法「{}」：{e}", kv.key),
-            }
+        let name = HeaderName::from_bytes(kv.key.as_bytes()).map_err(|e| McpError::Config {
+            message: format!("请求头名称非法「{}」：{e}", kv.key),
         })?;
 
         if name == AUTHORIZATION {
@@ -71,14 +74,40 @@ pub fn build_http(
     })?;
 
     let mut config = StreamableHttpClientTransportConfig::with_uri(cfg.url.clone());
-    if let Some(auth) = auth_header {
+    if let Some(auth) = auth_header.clone() {
         config = config.auth_header(auth);
     }
     if !custom_headers.is_empty() {
-        config = config.custom_headers(custom_headers);
+        config = config.custom_headers(custom_headers.clone());
     }
     // 旧世代会话过期时自动重新初始化（现代世代无会话，配置无副作用）
     config = config.reinit_on_expired_session(true);
 
-    Ok(StreamableHttpClientTransport::with_client(client, config))
+    Ok(PreparedHttp { client, config })
+}
+
+/// 构建 Streamable HTTP 传输（无 OAuth）
+pub fn build_http(
+    cfg: &HttpConfig,
+    default_timeout_secs: u64,
+) -> Result<StreamableHttpClientTransport<reqwest::Client>, McpError> {
+    let prepared = prepare(cfg, default_timeout_secs)?;
+    Ok(StreamableHttpClientTransport::with_client(
+        prepared.client,
+        prepared.config,
+    ))
+}
+
+/// 构建 Streamable HTTP 传输（OAuth 模式）
+pub fn build_http_oauth(
+    cfg: &HttpConfig,
+    default_timeout_secs: u64,
+    manager: AuthorizationManager,
+) -> Result<StreamableHttpClientTransport<AuthClient<reqwest::Client>>, McpError> {
+    let prepared = prepare(cfg, default_timeout_secs)?;
+    let auth_client = AuthClient::new(prepared.client, manager);
+    Ok(StreamableHttpClientTransport::with_client(
+        auth_client,
+        prepared.config,
+    ))
 }

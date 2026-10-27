@@ -7,11 +7,68 @@ import type { ConnectionTestReport } from "../api/servers";
 import type {
   HttpConfig,
   KeyValue,
+  OAuthConfig,
+  OAuthParam,
+  SecretInput,
   ServerConfig,
   ServerDraft,
   StdioConfig,
   TransportKind,
 } from "../types/models";
+
+type AuthMode = "none" | "header" | "oauth";
+
+function isAuthorizationHeader(item: KeyValue): boolean {
+  return item.key.trim().toLowerCase() === "authorization";
+}
+
+function initialAuthMode(initial?: ServerConfig | null): AuthMode {
+  if (initial?.http?.oauth) return "oauth";
+  if (initial?.http?.headers.some(isAuthorizationHeader)) return "header";
+  return "none";
+}
+
+function parseScopes(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+}
+
+/** 授权参数文本：一行一个 key=value；按第一个 = 切分，空行/# 注释忽略 */
+function parseAuthorizeParams(text: string): {
+  params: OAuthParam[];
+  error: string | null;
+} {
+  const params: OAuthParam[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const index = line.indexOf("=");
+    if (index <= 0) {
+      return { params: [], error: `授权参数「${line}」缺少 key=value 格式` };
+    }
+    const key = line.slice(0, index).trim();
+    const value = line.slice(index + 1).trim();
+    if (!key) {
+      return { params: [], error: `授权参数「${line}」的 key 不能为空` };
+    }
+    const lower = key.toLowerCase();
+    if (seen.has(lower)) {
+      return { params: [], error: `授权参数「${key}」重复` };
+    }
+    seen.add(lower);
+    params.push({ key, value });
+  }
+  return { params, error: null };
+}
+
+function formatAuthorizeParams(params: OAuthParam[] | undefined): string {
+  return (params ?? [])
+    .map((param) => `${param.key}=${param.value}`)
+    .join("\n");
+}
 
 const TRANSPORTS: { value: TransportKind; label: string }[] = [
   { value: "stdio", label: "stdio（本地进程）" },
@@ -152,6 +209,48 @@ export function ServerForm({
   const [argsText, setArgsText] = useState(
     (initial?.stdio?.args ?? []).join("\n"),
   );
+  const [authMode, setAuthMode] = useState<AuthMode>(initialAuthMode(initial));
+  const [scopesText, setScopesText] = useState(
+    (initial?.http?.oauth?.scopes ?? []).join(" "),
+  );
+  const [clientId, setClientId] = useState(
+    initial?.http?.oauth?.client_id ?? "",
+  );
+  const [clientSecret, setClientSecret] = useState("");
+  const [clearClientSecret, setClearClientSecret] = useState(false);
+  const [redirectUri, setRedirectUri] = useState(
+    initial?.http?.oauth?.redirect_uri ?? "",
+  );
+  const [authorizationEndpoint, setAuthorizationEndpoint] = useState(
+    initial?.http?.oauth?.authorization_endpoint ?? "",
+  );
+  const [tokenEndpoint, setTokenEndpoint] = useState(
+    initial?.http?.oauth?.token_endpoint ?? "",
+  );
+  const [registrationEndpoint, setRegistrationEndpoint] = useState(
+    initial?.http?.oauth?.registration_endpoint ?? "",
+  );
+  const [oauthIssuer, setOauthIssuer] = useState(
+    initial?.http?.oauth?.issuer ?? "",
+  );
+  const [allowMissingIssuer, setAllowMissingIssuer] = useState(
+    initial?.http?.oauth?.allow_missing_issuer ?? false,
+  );
+  const [authorizeParamsText, setAuthorizeParamsText] = useState(
+    formatAuthorizeParams(initial?.http?.oauth?.authorize_params),
+  );
+  const [forwardHeadersToAuthServer, setForwardHeadersToAuthServer] = useState(
+    initial?.http?.oauth?.forward_headers_to_auth_server ?? false,
+  );
+  const [clientMetadataUrl, setClientMetadataUrl] = useState(
+    initial?.http?.oauth?.client_metadata_url ?? "",
+  );
+  const [tokenEndpointAuthMethod, setTokenEndpointAuthMethod] = useState(
+    initial?.http?.oauth?.token_endpoint_auth_method ?? "",
+  );
+  const [revocationEndpoint, setRevocationEndpoint] = useState(
+    initial?.http?.oauth?.revocation_endpoint ?? "",
+  );
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testReport, setTestReport] = useState<ConnectionTestReport | null>(
@@ -167,6 +266,7 @@ export function ServerForm({
       return null;
     }
     const isStdio = transport === "stdio";
+    const isOauth = !isStdio && authMode === "oauth";
     if (isStdio && !stdio.command.trim()) {
       setError("命令不能为空");
       return null;
@@ -175,10 +275,17 @@ export function ServerForm({
       setError("URL 必须以 http:// 或 https:// 开头");
       return null;
     }
+    if (isOauth && transport === "sse") {
+      setError("OAuth 仅支持 Streamable HTTP，不支持遗留 SSE");
+      return null;
+    }
+    if (isOauth && !clientId.trim() && clientSecret.trim() === "") {
+      // 允许 DCR；此处仅提示，不强制
+    }
 
     // v0.1.1：掩码值（含 "****"）视为"未修改"，按 keep 提交——
     // 防止把回显掩码误写回凭据库导致真实 token 丢失（见 01 文档根因 B）
-    const secrets = [
+    const secrets: SecretInput[] = [
       ...(isStdio ? stdio.env : http.headers)
         .filter((kv) => kv.secret || kv.value)
         .map((kv) => {
@@ -194,6 +301,56 @@ export function ServerForm({
           };
         }),
     ];
+    if (isOauth) {
+      secrets.push({
+        kind: "oauth",
+        key: "client_secret",
+        action: clearClientSecret
+          ? "clear"
+          : clientSecret.trim()
+            ? "replace"
+            : "keep",
+        value: clearClientSecret ? null : clientSecret.trim() || null,
+      });
+    } else if (initial?.http?.oauth) {
+      // 从 OAuth 切回手工/无认证：清理旧客户端密钥
+      secrets.push({
+        kind: "oauth",
+        key: "client_secret",
+        action: "clear",
+        value: null,
+      });
+    }
+
+    const effectiveHeaders =
+      authMode === "header"
+        ? http.headers
+        : http.headers.filter((item) => !isAuthorizationHeader(item));
+
+    const authorizeParams = parseAuthorizeParams(authorizeParamsText);
+    if (isOauth && authorizeParams.error) {
+      setError(authorizeParams.error);
+      return null;
+    }
+
+    const oauth: OAuthConfig | null = isOauth
+      ? {
+          scopes: parseScopes(scopesText),
+          client_id: clientId.trim() || null,
+          client_secret: null,
+          redirect_uri: redirectUri.trim() || null,
+          authorization_endpoint: authorizationEndpoint.trim() || null,
+          token_endpoint: tokenEndpoint.trim() || null,
+          registration_endpoint: registrationEndpoint.trim() || null,
+          issuer: oauthIssuer.trim() || null,
+          allow_missing_issuer: allowMissingIssuer,
+          authorize_params: authorizeParams.params,
+          forward_headers_to_auth_server: forwardHeadersToAuthServer,
+          client_metadata_url: clientMetadataUrl.trim() || null,
+          token_endpoint_auth_method: tokenEndpointAuthMethod || null,
+          revocation_endpoint: revocationEndpoint.trim() || null,
+        }
+      : null;
 
     return {
       name: name.trim(),
@@ -207,7 +364,9 @@ export function ServerForm({
               .filter((line) => line.length > 0),
           }
         : null,
-      http: isStdio ? null : http,
+      http: isStdio
+        ? null
+        : { ...http, headers: effectiveHeaders, oauth },
       protocol_version_pin: pin.trim() ? pin.trim() : null,
       enabled: true,
       tags: [],
@@ -261,7 +420,14 @@ export function ServerForm({
           <select
             className="w-full rounded border border-slate-200 px-2 py-1 text-sm"
             value={transport}
-            onChange={(e) => setTransport(e.target.value as TransportKind)}
+            onChange={(e) => {
+              const next = e.target.value as TransportKind;
+              setTransport(next);
+              if (next === "stdio") setAuthMode("none");
+              else if (next === "sse" && authMode === "oauth") {
+                setAuthMode("header");
+              }
+            }}
           >
             {TRANSPORTS.map((item) => (
               <option key={item.value} value={item.value}>
@@ -353,15 +519,234 @@ export function ServerForm({
               服务通常带自定义端口， 如 http://127.0.0.1:8000/mcp
             </div>
           ) : null}
-          <div className="space-y-1 text-xs text-slate-600">
-            请求头（Authorization 填「Bearer xxx」或仅 token
-            均可，建议勾选"敏感"入凭据库）
-            <KeyValueEditor
-              items={http.headers}
-              onChange={(headers) => setHttp({ ...http, headers })}
-              placeholderKey="如 Authorization"
-            />
-          </div>
+          <label className="block space-y-1 text-xs text-slate-600">
+            认证方式
+            <select
+              className="w-full rounded border border-slate-200 px-2 py-1 text-sm"
+              value={authMode}
+              onChange={(e) => {
+                const mode = e.target.value as AuthMode;
+                setAuthMode(mode);
+                if (mode !== "header") {
+                  setHttp((prev) => ({
+                    ...prev,
+                    headers: prev.headers.filter(
+                      (item) => !isAuthorizationHeader(item),
+                    ),
+                  }));
+                }
+                if (mode !== "oauth" && initial?.http?.oauth) {
+                  setClearClientSecret(true);
+                }
+              }}
+            >
+              <option value="none">无认证</option>
+              <option value="header">Authorization 请求头</option>
+              <option value="oauth" disabled={transport === "sse"}>
+                OAuth 2.1 / OAuth 2.0 登录（授权码 + PKCE，仅 Streamable HTTP）
+              </option>
+            </select>
+          </label>
+
+          {authMode === "oauth" ? (
+            <div className="space-y-3 rounded-lg border border-sky-200 bg-sky-50/40 p-3">
+              <div className="grid grid-cols-2 gap-4">
+                <label className="space-y-1 text-xs text-slate-600">
+                  scopes（空格/逗号分隔，留空=自动）
+                  <input
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-sm"
+                    value={scopesText}
+                    onChange={(e) => setScopesText(e.target.value)}
+                    placeholder="如 openid profile"
+                  />
+                </label>
+                <label className="space-y-1 text-xs text-slate-600">
+                  client_id（留空=动态注册）
+                  <input
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-sm"
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <label className="space-y-1 text-xs text-slate-600">
+                  回调地址（需与授权服务器登记一致）
+                  <input
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-sm"
+                    value={redirectUri}
+                    onChange={(e) => setRedirectUri(e.target.value)}
+                    placeholder="http://127.0.0.1:33318/oauth/callback"
+                  />
+                </label>
+                <label className="space-y-1 text-xs text-slate-600">
+                  client_secret（留空=不修改）
+                  <input
+                    type="password"
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-sm"
+                    value={clientSecret}
+                    onChange={(e) => {
+                      setClientSecret(e.target.value);
+                      if (e.target.value) setClearClientSecret(false);
+                    }}
+                    placeholder={
+                      initial?.http?.oauth?.client_secret
+                        ? "已配置（留空=不修改；输入即替换）"
+                        : "仅预注册机密客户端需要"
+                    }
+                    disabled={clearClientSecret}
+                  />
+                </label>
+              </div>
+              {initial?.http?.oauth?.client_secret ? (
+                <label className="flex items-center gap-2 text-xs text-slate-600">
+                  <input
+                    type="checkbox"
+                    checked={clearClientSecret}
+                    onChange={(e) => {
+                      setClearClientSecret(e.target.checked);
+                      if (e.target.checked) setClientSecret("");
+                    }}
+                  />
+                  清除客户端密钥
+                </label>
+              ) : null}
+              <details className="rounded border border-slate-200 bg-white/70 px-2 py-1">
+                <summary className="cursor-pointer text-xs text-slate-500">
+                  高级：手工端点 / issuer
+                </summary>
+                <div className="mt-2 grid grid-cols-2 gap-3">
+                  <label className="space-y-1 text-xs text-slate-600">
+                    authorization_endpoint
+                    <input
+                      className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                      value={authorizationEndpoint}
+                      onChange={(e) => setAuthorizationEndpoint(e.target.value)}
+                    />
+                  </label>
+                  <label className="space-y-1 text-xs text-slate-600">
+                    token_endpoint
+                    <input
+                      className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                      value={tokenEndpoint}
+                      onChange={(e) => setTokenEndpoint(e.target.value)}
+                    />
+                  </label>
+                  <label className="space-y-1 text-xs text-slate-600">
+                    registration_endpoint
+                    <input
+                      className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                      value={registrationEndpoint}
+                      onChange={(e) => setRegistrationEndpoint(e.target.value)}
+                    />
+                  </label>
+                  <label className="space-y-1 text-xs text-slate-600">
+                    issuer
+                    <input
+                      className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                      value={oauthIssuer}
+                      onChange={(e) => setOauthIssuer(e.target.value)}
+                    />
+                  </label>
+                </div>
+                <label className="mt-2 flex items-center gap-2 text-xs text-slate-600">
+                  <input
+                    type="checkbox"
+                    checked={allowMissingIssuer}
+                    onChange={(e) => setAllowMissingIssuer(e.target.checked)}
+                  />
+                  容忍元数据缺少 issuer（仅不规范服务器）
+                </label>
+              </details>
+              <details className="rounded border border-slate-200 bg-white/70 px-2 py-1">
+                <summary className="cursor-pointer text-xs text-slate-500">
+                  高级：授权请求参数 / OAuth 请求头
+                </summary>
+                <label className="mt-2 block space-y-1 text-xs text-slate-600">
+                  授权请求额外参数（一行一个 key=value，空行和 # 注释忽略）
+                  <textarea
+                    className="h-20 w-full resize-y rounded border border-slate-200 px-2 py-1 font-mono text-[11px]"
+                    value={authorizeParamsText}
+                    onChange={(e) => setAuthorizeParamsText(e.target.value)}
+                    placeholder={"audience=https://api.example.com\naccess_type=offline\nprompt=consent"}
+                  />
+                </label>
+                <label className="mt-2 flex items-start gap-2 text-xs text-slate-600">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={forwardHeadersToAuthServer}
+                    onChange={(e) =>
+                      setForwardHeadersToAuthServer(e.target.checked)
+                    }
+                  />
+                  <span>
+                    把自定义请求头发往跨源授权服务器（默认只发同源；开启后可能把网关密钥发给第三方 IdP）
+                  </span>
+                </label>
+                <label className="mt-2 block space-y-1 text-xs text-slate-600">
+                  client_metadata_url（CIMD，HTTPS；留空=动态注册）
+                  <input
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                    value={clientMetadataUrl}
+                    onChange={(e) => setClientMetadataUrl(e.target.value)}
+                    placeholder="https://client.example.com/oauth-client-metadata.json"
+                  />
+                </label>
+                <label className="mt-2 block space-y-1 text-xs text-slate-600">
+                  手工端点 token 认证方式
+                  <select
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                    value={tokenEndpointAuthMethod}
+                    onChange={(e) => setTokenEndpointAuthMethod(e.target.value)}
+                  >
+                    <option value="">默认（client_secret_basic）</option>
+                    <option value="client_secret_basic">client_secret_basic</option>
+                    <option value="client_secret_post">client_secret_post</option>
+                    <option value="none">none（公共客户端）</option>
+                  </select>
+                </label>
+                <label className="mt-2 block space-y-1 text-xs text-slate-600">
+                  revocation_endpoint（退出登录时撤销授权，可选）
+                  <input
+                    className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                    value={revocationEndpoint}
+                    onChange={(e) => setRevocationEndpoint(e.target.value)}
+                    placeholder="https://auth.example.com/revoke"
+                  />
+                </label>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  已用 DCR/CIMD 登录时，切换注册方式请先在服务器卡片点“清除注册”。
+                </p>
+              </details>
+              <p className="text-[11px] text-slate-500">
+                OAuth 模式会忽略 Authorization 请求头；其他自定义请求头默认只发往 MCP 服务器同源地址。
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-1 text-xs text-slate-600">
+              请求头（Authorization 填「Bearer xxx」或仅 token
+              均可，建议勾选"敏感"入凭据库）
+              <KeyValueEditor
+                items={http.headers}
+                onChange={(headers) => setHttp({ ...http, headers })}
+                placeholderKey="如 Authorization"
+              />
+            </div>
+          )}
+
+          {authMode === "oauth" ? (
+            <div className="space-y-1 text-xs text-slate-600">
+              其他请求头
+              <KeyValueEditor
+                items={http.headers.filter(
+                  (item) => !isAuthorizationHeader(item),
+                )}
+                onChange={(headers) => setHttp({ ...http, headers })}
+                placeholderKey="如 X-Trace"
+              />
+            </div>
+          ) : null}
           <div className="grid grid-cols-2 gap-4">
             <label className="space-y-1 text-xs text-slate-600">
               超时覆盖（秒，留空=全局）

@@ -1,5 +1,5 @@
 import { createRef } from "react";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { SchemaForm, type SchemaFormHandle } from "./SchemaForm";
@@ -129,6 +129,72 @@ describe("SchemaForm", () => {
       ref.current?.validate();
     });
     expect(screen.getByText("缺少必填参数「query」")).toBeInTheDocument();
+  });
+
+  it("apply 可回填表单与 JSON 模式，clear 清空并通知", async () => {
+    const ref = createRef<SchemaFormHandle>();
+    const onChange = vi.fn();
+    render(<SchemaForm ref={ref} schema={schema} onChange={onChange} />);
+
+    act(() => ref.current?.apply({ text: "loaded", count: 2 }));
+    expect(screen.getByLabelText("text")).toHaveValue("loaded");
+    expect(screen.getByLabelText("count")).toHaveValue(2);
+    expect(onChange).toHaveBeenLastCalledWith({ text: "loaded", count: 2 });
+
+    await userEvent.click(screen.getByRole("button", { name: "JSON 模式" }));
+    act(() => ref.current?.apply({ text: "json", count: 3 }));
+    expect(screen.getByLabelText("参数 JSON")).toHaveValue(
+      JSON.stringify({ text: "json", count: 3 }, null, 2),
+    );
+
+    act(() => ref.current?.clear());
+    expect(screen.getByLabelText("参数 JSON")).toHaveValue("{}");
+    expect(onChange).toHaveBeenLastCalledWith({});
+  });
+
+  it("snapshot/restore 可恢复 JSON 非法文本，并只触发一次 onChange", async () => {
+    const ref = createRef<SchemaFormHandle>();
+    const onChange = vi.fn();
+    render(<SchemaForm ref={ref} schema={schema} onChange={onChange} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "JSON 模式" }));
+    const textarea = screen.getByLabelText("参数 JSON");
+    fireEvent.change(textarea, { target: { value: "{{" } });
+
+    let snapshot: ReturnType<SchemaFormHandle["snapshot"]> | undefined;
+    act(() => {
+      snapshot = ref.current?.snapshot();
+    });
+    expect(snapshot?.jsonMode).toBe(true);
+    expect(snapshot?.jsonText).toBe("{{");
+
+    onChange.mockClear();
+    act(() => {
+      if (snapshot) ref.current?.restore(snapshot);
+    });
+    expect(screen.getByLabelText("参数 JSON")).toHaveValue("{{");
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("清空按钮清空当前参数", async () => {
+    const onChange = vi.fn();
+    render(<SchemaForm schema={schema} onChange={onChange} />);
+    await userEvent.type(screen.getByLabelText("text"), "hello");
+
+    await userEvent.click(screen.getByRole("button", { name: "清空" }));
+    expect(screen.getByLabelText("text")).toHaveValue("");
+    expect(onChange).toHaveBeenLastCalledWith({});
+  });
+
+  it("JSON 非法输入也触发 onDirty", async () => {
+    const onDirty = vi.fn();
+    render(<SchemaForm schema={schema} onChange={() => {}} onDirty={onDirty} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "JSON 模式" }));
+    const textarea = screen.getByLabelText("参数 JSON");
+    await userEvent.clear(textarea);
+    await userEvent.type(textarea, "{{");
+    expect(onDirty).toHaveBeenCalled();
   });
 
   it("校验函数覆盖必填/类型/枚举", () => {

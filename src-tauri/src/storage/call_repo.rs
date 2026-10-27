@@ -9,19 +9,39 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::mcp::models::{
-    CallMethod, CallOrigin, CallRecord, CallRecordSummary, CallStatus, TransportKind,
+    CallFrames, CallMethod, CallOrigin, CallRecord, CallRecordSummary, CallStatus, TransportKind,
 };
+use crate::mcp::wire::FRAME_MAX_BYTES;
 
 /// 大结果阈值（1MB）
 const TRUNCATE_THRESHOLD: u64 = 1024 * 1024;
 /// 落盘目录总量上限（1GB）
 const RESULTS_DIR_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// 含原始帧导出的安全上限（50MB）
+const EXPORT_FRAMES_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+/// 原始帧落库限长；超限返回 None 并标记 truncated
+fn frame_text(value: Option<&serde_json::Value>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    let Ok(text) = serde_json::to_string(value) else {
+        return (None, true);
+    };
+    if text.len() > FRAME_MAX_BYTES {
+        (None, true)
+    } else {
+        (Some(text), false)
+    }
+}
 
 /// 历史筛选条件
 #[derive(Debug, Clone, Default)]
 pub struct CallFilter {
     pub server_id: Option<String>,
     pub method: Option<String>,
+    /// 精确接口名 / URI（区别于 keyword 模糊匹配）
+    pub target: Option<String>,
     pub status: Option<String>,
     /// manual / test；None = 全部
     pub origin: Option<String>,
@@ -30,6 +50,20 @@ pub struct CallFilter {
     pub keyword_full: bool,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+}
+
+/// 接口页“历史参数”列表项（只含预览，不含完整参数）
+#[derive(Debug, Clone)]
+pub struct RecentParamRow {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub status: CallStatus,
+    pub duration_ms: u64,
+    pub origin: CallOrigin,
+    pub preview: String,
+    pub param_count: u32,
+    pub repeat_count: u32,
+    pub params_bytes: u64,
 }
 
 /// 插入结果（供调用方回写 `truncated/size_bytes`）。
@@ -80,11 +114,26 @@ pub fn insert(
         }
     });
 
+    let frames = record.frames.as_ref();
+    let rpc_id_text = frames
+        .and_then(|item| item.rpc_id.as_ref())
+        .map(serde_json::to_string)
+        .transpose()?;
+    let (request_frame_text, request_frame_truncated) =
+        frame_text(frames.and_then(|item| item.request.as_ref()));
+    let (response_frame_text, response_frame_truncated) =
+        frame_text(frames.and_then(|item| item.response.as_ref()));
+    let frames_truncated = frames.is_some_and(|item| item.truncated)
+        || request_frame_truncated
+        || response_frame_truncated;
+
     conn.execute(
         "INSERT INTO call_records
             (id, server_id, server_name, method, target, params_json, result_json, error_json,
-             status, duration_ms, protocol_version, transport, truncated, size_bytes, origin, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             status, duration_ms, protocol_version, transport, truncated, size_bytes, origin,
+             rpc_id, request_frame_json, response_frame_json, frames_truncated, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20)",
         rusqlite::params![
             record.id,
             record.server_id,
@@ -101,6 +150,10 @@ pub fn insert(
             if truncated { 1 } else { 0 },
             size_bytes as i64,
             record.origin.as_str(),
+            rpc_id_text,
+            request_frame_text,
+            response_frame_text,
+            if frames_truncated { 1 } else { 0 },
             record.created_at.to_rfc3339(),
         ],
     )?;
@@ -127,6 +180,10 @@ pub fn list(
     if let Some(method) = &filter.method {
         conditions.push("method = ?".to_string());
         params.push(Box::new(method.clone()));
+    }
+    if let Some(target) = &filter.target {
+        conditions.push("target = ?".to_string());
+        params.push(Box::new(target.clone()));
     }
     if let Some(status) = &filter.status {
         conditions.push("status = ?".to_string());
@@ -217,13 +274,172 @@ pub fn list(
     Ok((items, total as u64))
 }
 
+/// 查询某接口最近发送过的参数（按 params_json + origin 去重）。
+///
+/// 只返回预览与统计，不返回完整参数；完整参数由 `get_params` 读取。
+pub fn recent_params(
+    conn: &Connection,
+    server_id: &str,
+    method: &str,
+    target: &str,
+    include_test: bool,
+    limit: u64,
+) -> anyhow::Result<Vec<RecentParamRow>> {
+    let limit = limit.clamp(1, 50);
+    let sql = r#"
+        WITH filtered AS (
+            SELECT id, created_at, status, duration_ms, origin, params_json
+            FROM call_records
+            WHERE server_id = ?1
+              AND method = ?2
+              AND target = ?3
+              AND (?4 = 1 OR origin = 'manual')
+        ),
+        ranked AS (
+            SELECT *,
+                COUNT(*) OVER (PARTITION BY params_json, origin) AS repeat_count,
+                ROW_NUMBER() OVER (
+                    PARTITION BY params_json, origin
+                    ORDER BY created_at DESC, id DESC
+                ) AS rn
+            FROM filtered
+        )
+        SELECT id, created_at, status, duration_ms, origin,
+               substr(params_json, 1, 65536) AS preview_json,
+               length(CAST(params_json AS BLOB)) AS params_bytes,
+               repeat_count
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY created_at DESC
+        LIMIT ?5
+    "#;
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            server_id,
+            method,
+            target,
+            if include_test { 1 } else { 0 },
+            limit as i64
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        },
+    )?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, created_at, status, duration_ms, origin, preview_json, params_bytes, repeat_count) =
+            row?;
+        let params_bytes = params_bytes.max(0) as u64;
+        let (preview, param_count) = if params_bytes > 65_536 {
+            (
+                format!(
+                    "参数较大（{} KB），点击加载",
+                    params_bytes.div_ceil(1024)
+                ),
+                0,
+            )
+        } else {
+            preview_params(&preview_json)
+        };
+        items.push(RecentParamRow {
+            id,
+            created_at: parse_time(&created_at)?,
+            status: parse_status(&status)?,
+            duration_ms: duration_ms.max(0) as u64,
+            origin: parse_origin(&origin)?,
+            preview,
+            param_count,
+            repeat_count: repeat_count.max(0) as u32,
+            params_bytes,
+        });
+    }
+    Ok(items)
+}
+
+/// 读取单条记录的参数（不读结果，避免大结果过 IPC）。
+pub fn get_params(
+    conn: &Connection,
+    id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let text = conn
+        .query_row(
+            "SELECT params_json FROM call_records WHERE id = ?1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(text.map(|text| serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)))
+}
+
+/// 生成参数预览：优先取 arguments，其次取整个 params 对象。
+fn preview_params(params_json: &str) -> (String, u32) {
+    let value: serde_json::Value =
+        serde_json::from_str(params_json).unwrap_or(serde_json::Value::Null);
+    let args = value
+        .get("arguments")
+        .or_else(|| value.get("params"))
+        .unwrap_or(&value);
+    let Some(object) = args.as_object() else {
+        return (preview_value(args), args.as_array().map(Vec::len).unwrap_or(0) as u32);
+    };
+    let mut parts = Vec::new();
+    for (key, value) in object.iter().take(3) {
+        let shown = if is_sensitive_key(key) {
+            "***".to_string()
+        } else {
+            preview_value(value)
+        };
+        parts.push(format!("{key}={shown}"));
+    }
+    if object.len() > 3 {
+        parts.push("…".to_string());
+    }
+    (parts.join(" · "), object.len() as u32)
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["token", "secret", "password", "authorization", "key"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+fn preview_value(value: &serde_json::Value) -> String {
+    let text = match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Array(items) => format!("[{}]", items.len()),
+        serde_json::Value::Object(_) => "{…}".to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    };
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(40).collect();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
 /// 读取单条完整记录
 pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<CallRecord>> {
     let row = conn
         .query_row(
             "SELECT id, server_id, server_name, method, target, params_json, result_json,
                     error_json, status, duration_ms, protocol_version, transport, truncated,
-                    size_bytes, origin, created_at
+                    size_bytes, origin, rpc_id, request_frame_json, response_frame_json,
+                    frames_truncated, created_at
              FROM call_records WHERE id = ?1",
             [id],
             |row| {
@@ -243,7 +459,11 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<CallRecord>> {
                     truncated: row.get::<_, i64>(12)? != 0,
                     size_bytes: row.get::<_, i64>(13)? as u64,
                     origin: row.get(14)?,
-                    created_at: row.get(15)?,
+                    rpc_id: row.get(15)?,
+                    request_frame_json: row.get(16)?,
+                    response_frame_json: row.get(17)?,
+                    frames_truncated: row.get::<_, i64>(18)? != 0,
+                    created_at: row.get(19)?,
                 })
             },
         )
@@ -372,19 +592,41 @@ pub fn export(
     conn: &Connection,
     filter: &CallFilter,
     path: &Path,
+    include_frames: bool,
 ) -> anyhow::Result<u64> {
-    let (json, count) = export_text(conn, filter)?;
+    let (json, count) = export_text(conn, filter, include_frames)?;
     std::fs::write(path, json)?;
     Ok(count)
 }
 
 /// 生成导出 JSON 文本（v0.1.1：供导出预览，不落盘）
-pub fn export_text(conn: &Connection, filter: &CallFilter) -> anyhow::Result<(String, u64)> {
+///
+/// `include_frames=false` 时剥离 `frames`；为 true 时设置 50MB 安全上限。
+pub fn export_text(
+    conn: &Connection,
+    filter: &CallFilter,
+    include_frames: bool,
+) -> anyhow::Result<(String, u64)> {
     let (items, _) = list(conn, filter, 0, u64::MAX / 2)?;
     let mut records = Vec::with_capacity(items.len());
+    let mut frame_bytes = 0usize;
     for item in &items {
-        if let Some(record) = get(conn, &item.id)? {
-            records.push(record);
+        let Some(record) = get(conn, &item.id)? else {
+            continue;
+        };
+        let mut value = serde_json::to_value(&record)?;
+        if include_frames {
+            if let Some(frames) = value.get("frames") {
+                frame_bytes += serde_json::to_string(frames)
+                    .map(|text| text.len())
+                    .unwrap_or(0);
+            }
+        } else if let Some(object) = value.as_object_mut() {
+            object.remove("frames");
+        }
+        records.push(value);
+        if include_frames && frame_bytes > EXPORT_FRAMES_MAX_BYTES {
+            anyhow::bail!("包含原始帧的导出超过 50MB，请缩小筛选范围后重试");
         }
     }
     let count = records.len() as u64;
@@ -445,11 +687,38 @@ struct FullRow {
     truncated: bool,
     size_bytes: u64,
     origin: String,
+    rpc_id: Option<String>,
+    request_frame_json: Option<String>,
+    response_frame_json: Option<String>,
+    frames_truncated: bool,
     created_at: String,
 }
 
 impl FullRow {
     fn into_record(self) -> anyhow::Result<CallRecord> {
+        let (rpc_id, rpc_bad) = parse_frame(self.rpc_id.as_deref());
+        let (request, request_bad) = parse_frame(self.request_frame_json.as_deref());
+        let (response, response_bad) = parse_frame(self.response_frame_json.as_deref());
+        let frames = if rpc_id.is_some()
+            || request.is_some()
+            || response.is_some()
+            || self.frames_truncated
+            || rpc_bad
+            || request_bad
+            || response_bad
+        {
+            Some(CallFrames {
+                rpc_id,
+                request,
+                response,
+                truncated: self.frames_truncated
+                    || rpc_bad
+                    || request_bad
+                    || response_bad,
+            })
+        } else {
+            None
+        };
         Ok(CallRecord {
             id: self.id,
             server_id: self.server_id,
@@ -470,8 +739,19 @@ impl FullRow {
             truncated: self.truncated,
             size_bytes: self.size_bytes,
             origin: parse_origin(&self.origin)?,
+            frames,
             created_at: parse_time(&self.created_at)?,
         })
+    }
+}
+
+fn parse_frame(text: Option<&str>) -> (Option<serde_json::Value>, bool) {
+    match text {
+        Some(text) => match serde_json::from_str(text) {
+            Ok(value) => (Some(value), false),
+            Err(_) => (None, true),
+        },
+        None => (None, false),
     }
 }
 
@@ -552,6 +832,7 @@ mod tests {
             truncated: false,
             size_bytes: 0,
             origin: CallOrigin::Manual,
+            frames: None,
             created_at: Utc::now(),
         }
     }
@@ -642,13 +923,205 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_exact_target_and_read_params() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        insert(&conn, &results, &sample("echo-1", CallMethod::ToolsCall, CallStatus::Ok))
+            .expect("插入失败");
+        let mut other = sample("other-1", CallMethod::ToolsCall, CallStatus::Ok);
+        other.target = "other".to_string();
+        insert(&conn, &results, &other).expect("插入失败");
+
+        let filter = CallFilter {
+            target: Some("echo".to_string()),
+            ..Default::default()
+        };
+        let (items, total) = list(&conn, &filter, 0, 10).expect("查询失败");
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, "echo-1");
+
+        let params = get_params(&conn, "echo-1")
+            .expect("查询失败")
+            .expect("参数应存在");
+        assert_eq!(params["arguments"]["text"], "hi");
+        assert!(get_params(&conn, "missing").expect("查询失败").is_none());
+    }
+
+    #[test]
+    fn recent_params_dedupes_and_keeps_distinct_params() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        let base = Utc::now();
+        for index in 0..100 {
+            let mut record = sample(
+                &format!("same-{index}"),
+                CallMethod::ToolsCall,
+                CallStatus::Ok,
+            );
+            record.created_at = base + chrono::Duration::seconds(index);
+            insert(&conn, &results, &record).expect("插入失败");
+        }
+        for index in 0..5 {
+            let mut record = sample(
+                &format!("diff-{index}"),
+                CallMethod::ToolsCall,
+                CallStatus::Ok,
+            );
+            record.params = serde_json::json!({
+                "name": "echo",
+                "arguments": { "text": format!("value-{index}") }
+            });
+            record.created_at = base + chrono::Duration::seconds(200 + index);
+            insert(&conn, &results, &record).expect("插入失败");
+        }
+
+        let items = recent_params(&conn, "s1", "tools_call", "echo", false, 20)
+            .expect("查询失败");
+        assert_eq!(items.len(), 6, "100 条重复不能饿死 5 条不同参数");
+        assert_eq!(items[0].repeat_count, 1);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.id.starts_with("same-"))
+                .map(|item| item.repeat_count),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn recent_params_keeps_manual_and_test_separate() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        let mut manual = sample("manual-1", CallMethod::ToolsCall, CallStatus::Ok);
+        manual.created_at = Utc::now();
+        insert(&conn, &results, &manual).expect("插入失败");
+
+        let mut test = sample("test-1", CallMethod::ToolsCall, CallStatus::Ok);
+        test.origin = CallOrigin::Test;
+        test.created_at = Utc::now() + chrono::Duration::seconds(1);
+        insert(&conn, &results, &test).expect("插入失败");
+
+        let manual_only = recent_params(&conn, "s1", "tools_call", "echo", false, 20)
+            .expect("查询失败");
+        assert_eq!(manual_only.len(), 1);
+        assert_eq!(manual_only[0].origin, CallOrigin::Manual);
+
+        let all = recent_params(&conn, "s1", "tools_call", "echo", true, 20)
+            .expect("查询失败");
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|item| item.origin == CallOrigin::Test));
+    }
+
+    #[test]
+    fn recent_params_previews_large_and_cjk_params() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+
+        let mut large = sample("large", CallMethod::ToolsCall, CallStatus::Ok);
+        large.params = serde_json::json!({
+            "name": "echo",
+            "arguments": { "text": "汉".repeat(30_000) }
+        });
+        insert(&conn, &results, &large).expect("插入失败");
+
+        let items = recent_params(&conn, "s1", "tools_call", "echo", false, 20)
+            .expect("查询失败");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].params_bytes > 65_536);
+        assert!(items[0].preview.contains("参数较大"));
+    }
+
+    #[test]
+    fn frames_roundtrip_preserves_rpc_id_type() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        let mut record = sample("frames-1", CallMethod::ToolsCall, CallStatus::Ok);
+        record.frames = Some(crate::mcp::models::CallFrames {
+            rpc_id: Some(serde_json::json!(0)),
+            request: Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "tools/call"
+            })),
+            response: Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": { "ok": true }
+            })),
+            truncated: false,
+        });
+        insert(&conn, &results, &record).expect("插入失败");
+
+        let stored = get(&conn, "frames-1").expect("查询失败").expect("记录丢失");
+        let frames = stored.frames.expect("frames 丢失");
+        assert_eq!(frames.rpc_id, Some(serde_json::json!(0)));
+        assert_eq!(
+            frames.request.expect("请求帧丢失")["method"],
+            serde_json::json!("tools/call")
+        );
+        assert_eq!(
+            frames.response.expect("响应帧丢失")["result"]["ok"],
+            serde_json::json!(true)
+        );
+        assert!(!frames.truncated);
+    }
+
+    #[test]
+    fn frames_over_cap_are_dropped_but_rpc_id_kept() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        let mut record = sample("frames-big", CallMethod::ToolsCall, CallStatus::Ok);
+        record.frames = Some(crate::mcp::models::CallFrames {
+            rpc_id: Some(serde_json::json!("abc")),
+            request: Some(serde_json::json!({
+                "blob": "x".repeat(FRAME_MAX_BYTES)
+            })),
+            response: None,
+            truncated: false,
+        });
+        insert(&conn, &results, &record).expect("插入失败");
+
+        let stored = get(&conn, "frames-big")
+            .expect("查询失败")
+            .expect("记录丢失");
+        let frames = stored.frames.expect("frames 丢失");
+        assert_eq!(frames.rpc_id, Some(serde_json::json!("abc")));
+        assert!(frames.request.is_none());
+        assert!(frames.truncated);
+    }
+
+    #[test]
+    fn export_can_include_or_strip_frames() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        let mut record = sample("frames-export", CallMethod::ToolsCall, CallStatus::Ok);
+        record.frames = Some(crate::mcp::models::CallFrames {
+            rpc_id: Some(serde_json::json!(7)),
+            request: Some(serde_json::json!({ "jsonrpc": "2.0", "id": 7 })),
+            response: Some(serde_json::json!({ "jsonrpc": "2.0", "id": 7 })),
+            truncated: false,
+        });
+        insert(&conn, &results, &record).expect("插入失败");
+
+        let (without, _) =
+            export_text(&conn, &CallFilter::default(), false).expect("导出失败");
+        assert!(!without.contains("\"frames\""));
+
+        let (with, _) =
+            export_text(&conn, &CallFilter::default(), true).expect("导出失败");
+        assert!(with.contains("\"frames\""));
+        assert!(with.contains("\"request\""));
+        assert!(with.contains("\"response\""));
+    }
+
+    #[test]
     fn export_writes_json() {
         let (dir, conn) = temp_conn();
         let results = dir.path().join("results");
         insert(&conn, &results, &sample("c1", CallMethod::ToolsCall, CallStatus::Ok))
             .expect("插入失败");
         let path = dir.path().join("export.json");
-        let count = export(&conn, &CallFilter::default(), &path).expect("导出失败");
+        let count = export(&conn, &CallFilter::default(), &path, false).expect("导出失败");
         assert_eq!(count, 1);
         let text = std::fs::read_to_string(&path).expect("读取失败");
         assert!(text.contains("echo: hi"));

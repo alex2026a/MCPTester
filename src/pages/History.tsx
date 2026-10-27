@@ -1,10 +1,11 @@
 import { useCallback, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { EmptyState } from "../components/EmptyState";
 import { ExportPreviewDialog } from "../components/ExportPreviewDialog";
 import { JsonViewer } from "../components/JsonViewer";
 import { ResultViewer } from "../components/ResultViewer";
+import { ServerSelect } from "../components/ServerSelect";
 import { Field, Modal } from "../components/testing/SuiteDialog";
 import { listServers } from "../api/servers";
 import { listTestSuites, saveCallAsCase } from "../api/tests";
@@ -28,26 +29,46 @@ const STATUS_LABEL: Record<string, { text: string; className: string }> = {
   canceled: { text: "取消", className: "text-slate-500" },
 };
 
+/** 把 invoke 抛出的错误转成可展示文本 */
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return String(error);
+}
+
 /** 历史页：筛选 / 列表 / 详情 / 载入重放 / 删除 / 导出 */
 export function History() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const setReplay = useReplayStore((s) => s.setReplay);
 
-  const [filter, setFilter] = useState<CallFilterInput>({
-    keyword_full: false,
-    origin: "manual",
+  const [filter, setFilter] = useState<CallFilterInput>(() => {
+    const originParam = searchParams.get("origin");
+    const origin: CallFilterInput["origin"] =
+      originParam === "all" ? null : originParam === "test" ? "test" : "manual";
+    return {
+      keyword_full: false,
+      origin,
+      server_id: searchParams.get("server_id"),
+      method: searchParams.get("method"),
+      target: searchParams.get("target"),
+    };
   });
   const [keywordDraft, setKeywordDraft] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [includeFrames, setIncludeFrames] = useState(false);
   const [saveOpen, setSaveOpen] = useState(false);
   const [saveSuiteId, setSaveSuiteId] = useState("");
   const [saveName, setSaveName] = useState("");
 
   const exportLoad = useCallback(
-    () => previewExportCallRecords(filter).then((preview) => preview.json),
-    [filter],
+    () =>
+      previewExportCallRecords(filter, includeFrames).then(
+        (preview) => preview.json,
+      ),
+    [filter, includeFrames],
   );
 
   const servers = useQuery({ queryKey: ["servers"], queryFn: listServers });
@@ -109,9 +130,22 @@ export function History() {
   });
 
   const exportRecords = useMutation({
-    mutationFn: (path: string) => exportCallRecords(filter, path),
+    mutationFn: (payload: { path: string; includeFrames: boolean }) =>
+      exportCallRecords(filter, payload.path, payload.includeFrames),
     onError: (error) => toast.fromError(error, "导出失败"),
   });
+
+  function removeTargetFromUrl() {
+    if (!searchParams.has("target")) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete("target");
+    setSearchParams(next, { replace: true });
+  }
+
+  function clearTarget() {
+    setFilter((previous) => ({ ...previous, target: null }));
+    removeTargetFromUrl();
+  }
 
   function replay(record: CallRecord) {
     if (record.method === "probe") {
@@ -144,20 +178,19 @@ export function History() {
     <section className="flex h-full flex-col">
       <div className="mb-3 flex items-center gap-3">
         <h2 className="text-xl font-semibold text-slate-800">历史</h2>
-        <select
-          className="rounded border border-slate-200 px-2 py-1 text-xs"
+        <ServerSelect
+          servers={servers.data ?? []}
           value={filter.server_id ?? ""}
-          onChange={(e) =>
-            setFilter({ ...filter, server_id: e.target.value || null })
-          }
-        >
-          <option value="">全部服务器</option>
-          {(servers.data ?? []).map((server) => (
-            <option key={server.id} value={server.id}>
-              {server.name}
-            </option>
-          ))}
-        </select>
+          onChange={(id) => {
+            setFilter({ ...filter, server_id: id || null, target: null });
+            removeTargetFromUrl();
+          }}
+          placeholder="全部服务器"
+          groupByStatus={false}
+          allowDisabled
+          className="rounded border border-slate-200 px-2 py-1 text-xs"
+          ariaLabel="按服务器筛选"
+        />
         <select
           className="rounded border border-slate-200 px-2 py-1 text-xs"
           value={filter.status ?? ""}
@@ -190,9 +223,14 @@ export function History() {
         <select
           className="rounded border border-slate-200 px-2 py-1 text-xs"
           value={filter.method ?? ""}
-          onChange={(e) =>
-            setFilter({ ...filter, method: e.target.value || null })
-          }
+          onChange={(e) => {
+            setFilter({
+              ...filter,
+              method: e.target.value || null,
+              target: null,
+            });
+            removeTargetFromUrl();
+          }}
         >
           <option value="">全部方法</option>
           {Object.entries(CALL_METHOD_LABEL).map(([value, label]) => (
@@ -233,7 +271,10 @@ export function History() {
             type="button"
             className="rounded border border-red-100 px-2 py-1 text-xs text-red-500 hover:bg-red-50"
             onClick={() => {
-              if (window.confirm("确定清空当前筛选条件下的全部历史记录？")) {
+              const scope = filter.target
+                ? `接口「${filter.target}」的`
+                : "当前筛选条件下的";
+              if (window.confirm(`确定清空${scope}全部历史记录？`)) {
                 clear.mutate();
               }
             }}
@@ -242,6 +283,23 @@ export function History() {
           </button>
         </div>
       </div>
+
+      {filter.target ? (
+        <div className="mb-2 flex items-center gap-2 text-[11px] text-slate-500">
+          <span className="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-0.5 text-slate-600">
+            接口：
+            <span className="max-w-80 truncate font-mono">{filter.target}</span>
+            <button
+              type="button"
+              className="ml-1 rounded px-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
+              aria-label="清除接口筛选"
+              onClick={clearTarget}
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      ) : null}
 
       <div className="flex min-h-0 flex-1 gap-4">
         <div className="w-96 shrink-0 overflow-y-auto rounded-lg border border-slate-200 bg-white">
@@ -290,8 +348,23 @@ export function History() {
               title="选择一条记录"
               description="查看详情、载入重放或删除。"
             />
-          ) : detail.isLoading ? (
+          ) : detail.isPending ? (
             <div className="text-sm text-slate-400">加载详情中…</div>
+          ) : detail.isError ? (
+            <div className="space-y-2">
+              <div className="text-sm text-red-500">详情加载失败</div>
+              <div className="break-all text-xs text-slate-500">
+                {errorText(detail.error)}
+              </div>
+              <button
+                type="button"
+                className="rounded border border-slate-200 px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
+                disabled={detail.isFetching}
+                onClick={() => void detail.refetch()}
+              >
+                {detail.isFetching ? "重试中…" : "重试"}
+              </button>
+            </div>
           ) : detail.data ? (
             <div className="space-y-3">
               <div className="flex items-center gap-2 text-xs">
@@ -344,6 +417,7 @@ export function History() {
                   <JsonViewer
                     value={detail.data.params}
                     defaultMode="tree"
+                    copyLabel="复制参数"
                     contentClassName="max-h-48 overflow-auto"
                   />
                 </div>
@@ -351,7 +425,7 @@ export function History() {
               <ResultViewer record={detail.data} />
             </div>
           ) : (
-            <div className="text-sm text-red-500">详情加载失败</div>
+            <div className="text-sm text-slate-400">暂无详情</div>
           )}
         </div>
       </div>
@@ -406,14 +480,28 @@ export function History() {
 
       {exportOpen ? (
         <ExportPreviewDialog
+          key={includeFrames ? "frames" : "default"}
           title="导出历史记录"
           defaultFilename={`mcptester-history-${new Date()
             .toISOString()
             .slice(0, 16)
             .replace(/[^0-9]/g, "")}.json`}
           load={exportLoad}
-          onSave={(path) => exportRecords.mutateAsync(path)}
-          onClose={() => setExportOpen(false)}
+          onSave={(path) => exportRecords.mutateAsync({ path, includeFrames })}
+          onClose={() => {
+            setExportOpen(false);
+            setIncludeFrames(false);
+          }}
+          extra={
+            <label className="flex items-center gap-1 text-[11px] text-slate-500">
+              <input
+                type="checkbox"
+                checked={includeFrames}
+                onChange={(event) => setIncludeFrames(event.target.checked)}
+              />
+              包含原始帧（体积会明显增大，上限 50MB）
+            </label>
+          }
         />
       ) : null}
     </section>

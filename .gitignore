@@ -27,6 +27,7 @@ MCPTester-portable.zip
 
 # 构建产物归档；zip/exe/msi 一律不入库
 /artifacts/
+/artifacts-size/
 *.zip
 *.exe
 *.msi

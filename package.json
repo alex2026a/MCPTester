@@ -1,7 +1,7 @@
 {
   "name": "mcptester",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,10 +9,13 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target portable",
+    "portable:size": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target portable -SizeOptimized",
     "portable:pack": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target portable -SkipBuild",
     "msi": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target msi",
+    "msi:size": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target msi -SizeOptimized",
     "msi:pack": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target msi -SkipBuild",
     "release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target all -Verify",
+    "release:size": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target all -Verify -SizeOptimized",
     "clean": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target clean",
     "clean:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target clean -CleanMode full",
     "recompile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -Target rebuild",

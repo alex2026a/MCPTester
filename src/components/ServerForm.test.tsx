@@ -63,6 +63,104 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
     expect(auth?.value).toBe("Bearer new-token");
   });
 
+  it("OAuth 模式提交 oauth 配置与 client_secret 三态", async () => {
+    const onSubmit = vi.fn();
+    const oauthInitial: ServerConfig = {
+      ...initial,
+      http: {
+        url: "https://example.com/mcp",
+        headers: [],
+        timeout_secs: null,
+        allow_insecure_tls: false,
+        oauth: {
+          scopes: ["openid", "profile"],
+          client_id: "client-1",
+          client_secret: "****",
+          redirect_uri: "http://127.0.0.1:33318/oauth/callback",
+          allow_missing_issuer: false,
+          authorize_params: [
+            { key: "audience", value: "https://api.example.com" },
+          ],
+          forward_headers_to_auth_server: true,
+        },
+      },
+    };
+    render(
+      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
+
+    expect(screen.getByLabelText("认证方式")).toHaveValue("oauth");
+    expect(screen.getByDisplayValue("openid profile")).toBeInTheDocument();
+
+    await userEvent.type(
+      screen.getByPlaceholderText("已配置（留空=不修改；输入即替换）"),
+      "new-secret",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    const draft = onSubmit.mock.calls[0][0] as ServerDraft;
+    expect(draft.http?.oauth?.client_id).toBe("client-1");
+    expect(draft.http?.oauth?.scopes).toEqual(["openid", "profile"]);
+    expect(draft.http?.oauth?.authorize_params).toEqual([
+      { key: "audience", value: "https://api.example.com" },
+    ]);
+    expect(draft.http?.oauth?.forward_headers_to_auth_server).toBe(true);
+    const secret = draft.secrets.find((item) => item.kind === "oauth");
+    expect(secret?.action).toBe("replace");
+    expect(secret?.value).toBe("new-secret");
+  });
+
+  it("授权参数格式错误时阻止保存", async () => {
+    const onSubmit = vi.fn();
+    const oauthInitial: ServerConfig = {
+      ...initial,
+      http: {
+        ...initial.http!,
+        url: "https://example.com/mcp",
+        oauth: { scopes: [] },
+      },
+    };
+    render(
+      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
+    const textarea = screen.getByLabelText(/授权请求额外参数/);
+    await userEvent.type(textarea, "bad-line");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText(/缺少 key=value 格式/)).toBeInTheDocument();
+  });
+
+  it("切换认证方式会清理 Authorization 头并提交 oauth clear", async () => {
+    const onSubmit = vi.fn();
+    const oauthInitial: ServerConfig = {
+      ...initial,
+      http: {
+        ...initial.http!,
+        oauth: {
+          scopes: [],
+          client_id: "client-1",
+          client_secret: "****",
+        },
+      },
+    };
+    render(
+      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
+
+    await userEvent.selectOptions(screen.getByLabelText("认证方式"), "none");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    const draft = onSubmit.mock.calls[0][0] as ServerDraft;
+    expect(draft.http?.oauth).toBeNull();
+    expect(
+      draft.http?.headers.some(
+        (header) => header.key.toLowerCase() === "authorization",
+      ),
+    ).toBe(false);
+    const secret = draft.secrets.find((item) => item.kind === "oauth");
+    expect(secret?.action).toBe("clear");
+  });
+
   it("本地地址缺端口时显示提示（v0.1.2）", () => {
     const withoutPort: ServerConfig = {
       ...initial,

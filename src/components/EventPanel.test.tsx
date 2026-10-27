@@ -33,13 +33,13 @@ function entry(overrides: Partial<WireEntry>): WireEntry {
   };
 }
 
-function renderPanel() {
+function renderPanel(onOpenChange?: (open: boolean) => void) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <EventPanel serverId="s1" />
+      <EventPanel serverId="s1" onOpenChange={onOpenChange} />
     </QueryClientProvider>,
   );
 }
@@ -66,5 +66,17 @@ describe("EventPanel", () => {
     await waitFor(() => expect(getWireLogMock).toHaveBeenCalledWith("s1"));
     expect((await screen.findAllByText("tools/call")).length).toBeGreaterThan(0);
     expect(screen.getByText(/缓冲/).textContent).toContain("共 1 条");
+  });
+
+  it("展开/收起时通知 onOpenChange", async () => {
+    getWireLogMock.mockResolvedValue([]);
+    const onOpenChange = vi.fn();
+    renderPanel(onOpenChange);
+    const toggle = screen.getByRole("button", { name: /事件面板/ });
+
+    await userEvent.click(toggle);
+    expect(onOpenChange).toHaveBeenLastCalledWith(true);
+    await userEvent.click(toggle);
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
   });
 });

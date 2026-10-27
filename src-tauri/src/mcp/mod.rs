@@ -13,6 +13,7 @@ pub mod error;
 pub mod handler;
 pub mod manager;
 pub mod models;
+pub mod oauth;
 pub mod transport;
 pub mod wire;
 

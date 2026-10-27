@@ -46,7 +46,13 @@ function searchable(value: unknown): string {
   }
 }
 
-export function EventPanel({ serverId }: { serverId: string }) {
+export function EventPanel({
+  serverId,
+  onOpenChange,
+}: {
+  serverId: string;
+  onOpenChange?: (open: boolean) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<PanelTab>("wire");
   const [paused, setPaused] = useState(false);
@@ -87,12 +93,14 @@ export function EventPanel({ serverId }: { serverId: string }) {
   // 首次拉取由用户交互触发（打开面板 / 切到报文页签），其后靠增量推送补齐
   function openPanel(next: boolean) {
     setOpen(next);
+    onOpenChange?.(next);
     if (next) void fetchWire();
   }
 
   function selectTab(next: PanelTab) {
     setTab(next);
     setOpen(true);
+    onOpenChange?.(true);
     if (next === "wire") void fetchWire();
   }
 
@@ -387,7 +395,7 @@ export function EventPanel({ serverId }: { serverId: string }) {
           <div className="flex min-h-0 gap-2 p-2">
             <div
               ref={wireListRef}
-              className="max-h-72 w-[46%] shrink-0 overflow-auto rounded border border-slate-100"
+              className="max-h-[32vh] w-[46%] shrink-0 overflow-auto rounded border border-slate-100"
             >
               {wireLoading && wire.length === 0 ? (
                 <div className="p-3 text-[11px] text-slate-400">加载报文…</div>
@@ -436,7 +444,7 @@ export function EventPanel({ serverId }: { serverId: string }) {
             </div>
           </div>
         ) : tab === "notifications" ? (
-          <div className="max-h-64 overflow-y-auto p-2 font-mono text-[11px] leading-5">
+          <div className="max-h-[32vh] overflow-y-auto p-2 font-mono text-[11px] leading-5">
             {notifications.length === 0 ? (
               <div className="text-slate-400">暂无通知（服务端通知将显示在这里）</div>
             ) : (
@@ -449,7 +457,7 @@ export function EventPanel({ serverId }: { serverId: string }) {
             )}
           </div>
         ) : (
-          <div className="max-h-64 overflow-y-auto p-2 font-mono text-[11px] leading-5">
+          <div className="max-h-[32vh] overflow-y-auto p-2 font-mono text-[11px] leading-5">
             {stderr.length === 0 ? (
               <div className="text-slate-400">暂无 stderr 输出（stdio 服务器子进程日志将显示在这里）</div>
             ) : (
@@ -560,7 +568,14 @@ function EntryDetail({
         value={entry.payload}
         defaultTab="tree"
         tabs={["tree", "raw"]}
-        contentClassName="max-h-64 overflow-auto"
+        copyLabel={
+          title === "请求"
+            ? "复制请求"
+            : title === "响应"
+              ? "复制响应"
+              : "复制内容"
+        }
+        contentClassName="max-h-[24vh] overflow-auto"
       />
     </div>
   );

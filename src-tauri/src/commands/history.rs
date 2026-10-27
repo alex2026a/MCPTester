@@ -4,17 +4,21 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::State;
 
 use crate::commands::AppState;
 use crate::storage::call_repo::{self, CallFilter};
-use crate::mcp::models::{CallRecord, CallRecordSummary};
+use crate::mcp::models::{
+    CallMethod, CallOrigin, CallRecord, CallRecordSummary, CallStatus,
+};
 
 /// 前端筛选参数
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CallFilterInput {
     pub server_id: Option<String>,
     pub method: Option<String>,
+    pub target: Option<String>,
     pub status: Option<String>,
     /// manual / test；None = 全部
     pub origin: Option<String>,
@@ -30,6 +34,7 @@ impl From<CallFilterInput> for CallFilter {
         CallFilter {
             server_id: value.server_id,
             method: value.method,
+            target: value.target,
             status: value.status,
             origin: value.origin,
             keyword: value.keyword,
@@ -69,6 +74,74 @@ pub async fn list_call_records(
             limit,
         })
         .map_err(|e| e.to_string())
+}
+
+/// 接口页“最近参数”列表项。
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentCallParam {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub status: CallStatus,
+    pub duration_ms: u64,
+    pub origin: CallOrigin,
+    pub preview: String,
+    pub param_count: u32,
+    pub repeat_count: u32,
+    pub params_bytes: u64,
+}
+
+/// 某接口最近发送过的参数（默认只看手工调用）。
+#[tauri::command]
+pub async fn list_recent_call_params(
+    state: State<'_, AppState>,
+    server_id: String,
+    method: CallMethod,
+    target: String,
+    limit: Option<u64>,
+    include_test: Option<bool>,
+) -> Result<Vec<RecentCallParam>, String> {
+    state
+        .db
+        .with_read_blocking(move |conn| {
+            call_repo::recent_params(
+                conn,
+                &server_id,
+                method.as_str(),
+                &target,
+                include_test.unwrap_or(false),
+                limit.unwrap_or(20),
+            )
+        })
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| RecentCallParam {
+                    id: item.id,
+                    created_at: item.created_at,
+                    status: item.status,
+                    duration_ms: item.duration_ms,
+                    origin: item.origin,
+                    preview: item.preview,
+                    param_count: item.param_count,
+                    repeat_count: item.repeat_count,
+                    params_bytes: item.params_bytes,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// 只读取一次调用的参数，不读取结果。
+#[tauri::command]
+pub async fn get_call_params(
+    state: State<'_, AppState>,
+    record_id: String,
+) -> Result<Value, String> {
+    state
+        .db
+        .with_read_blocking(move |conn| call_repo::get_params(conn, &record_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "记录不存在".to_string())
 }
 
 /// 详情（含完整参数与结果）
@@ -116,11 +189,15 @@ pub async fn clear_call_records(
 pub async fn preview_export_call_records(
     state: State<'_, AppState>,
     filter: CallFilterInput,
+    include_frames: Option<bool>,
 ) -> Result<ExportPreview, String> {
     let filter: CallFilter = filter.into();
+    let include_frames = include_frames.unwrap_or(false);
     state
         .db
-        .with_read_blocking(move |conn| call_repo::export_text(conn, &filter))
+        .with_read_blocking(move |conn| {
+            call_repo::export_text(conn, &filter, include_frames)
+        })
         .map(|(json, count)| ExportPreview { json, count })
         .map_err(|e| e.to_string())
 }
@@ -138,8 +215,10 @@ pub async fn export_call_records(
     state: State<'_, AppState>,
     filter: CallFilterInput,
     path: Option<String>,
+    include_frames: Option<bool>,
 ) -> Result<String, String> {
     let filter: CallFilter = filter.into();
+    let include_frames = include_frames.unwrap_or(false);
     let target: PathBuf = match path {
         Some(path) => PathBuf::from(path),
         None => results_dir(&state).join(format!(
@@ -153,7 +232,9 @@ pub async fn export_call_records(
     let path_clone = target.clone();
     state
         .db
-        .with_read_blocking(move |conn| call_repo::export(conn, &filter, &path_clone))
+        .with_read_blocking(move |conn| {
+            call_repo::export(conn, &filter, &path_clone, include_frames)
+        })
         .map_err(|e| e.to_string())?;
     Ok(target.display().to_string())
 }

@@ -26,7 +26,10 @@ export function addServer(draft: ServerDraft): Promise<ServerConfig> {
 }
 
 /** 更新服务器（敏感值 keep/replace/clear） */
-export function updateServer(id: string, draft: ServerDraft): Promise<ServerConfig> {
+export function updateServer(
+  id: string,
+  draft: ServerDraft,
+): Promise<ServerConfig> {
   return invoke<ServerConfig>("update_server", { id, draft });
 }
 
@@ -37,6 +40,11 @@ export function updateServerMeta(
   enabled?: boolean,
 ): Promise<ServerConfig> {
   return invoke<ServerConfig>("update_server_meta", { id, name, enabled });
+}
+
+/** 保存服务器自定义排序（需覆盖当前全部服务器 ID） */
+export function reorderServers(ids: string[]): Promise<void> {
+  return invoke<void>("reorder_servers", { ids });
 }
 
 /** 删除服务器 */
@@ -97,12 +105,17 @@ export function importServersFromFile(path: string): Promise<ImportReport> {
 }
 
 /** 导出配置（format: claude | vscode；返回文件路径） */
-export function exportServers(format: "claude" | "vscode", path?: string): Promise<string> {
+export function exportServers(
+  format: "claude" | "vscode",
+  path?: string,
+): Promise<string> {
   return invoke<string>("export_servers", { format, path: path ?? null });
 }
 
 /** 导出预览（v0.1.1：返回 JSON 文本，不落盘） */
-export function previewExportServers(format: "claude" | "vscode"): Promise<string> {
+export function previewExportServers(
+  format: "claude" | "vscode",
+): Promise<string> {
   return invoke<string>("preview_export_servers", { format });
 }
 
@@ -138,5 +151,8 @@ export function testServerConnection(
   draft: ServerDraft,
   id?: string | null,
 ): Promise<ConnectionTestReport> {
-  return invoke<ConnectionTestReport>("test_server_connection", { draft, id: id ?? null });
+  return invoke<ConnectionTestReport>("test_server_connection", {
+    draft,
+    id: id ?? null,
+  });
 }

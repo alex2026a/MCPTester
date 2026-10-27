@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
@@ -34,6 +34,10 @@ beforeEach(() => {
   invokeMock.mockResolvedValue(null);
 });
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe("ResultViewer", () => {
   it("展示状态/耗时，并默认渲染 MCP 文本内容", () => {
     render(<ResultViewer record={record({})} />);
@@ -53,6 +57,23 @@ describe("ResultViewer", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "原文" }));
     expect(await screen.findByText(/"echo: hi"/)).toBeInTheDocument();
+  });
+
+  it("oauth_required 显示 required_scope", () => {
+    render(
+      <ResultViewer
+        record={record({
+          status: "error",
+          result: null,
+          error: {
+            kind: "oauth_required",
+            message: "需要 OAuth 登录授权",
+            required_scope: "write",
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText(/缺少权限：write/)).toBeInTheDocument();
   });
 
   it("错误结果高亮并显示错误消息（仅一次）", () => {
@@ -82,6 +103,32 @@ describe("ResultViewer", () => {
       />,
     );
     expect(screen.getByText("结果已截断")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "打开完整结果" }));
+    expect(await screen.findByText("完整结果")).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("read_full_result", { recordId: "c1" });
+  });
+
+  it("10MB+ 截断结果打开全文前也需要确认", async () => {
+    invokeMock.mockImplementation((async (cmd: string) => {
+      if (cmd === "read_full_result") {
+        return JSON.stringify({ content: [{ type: "text", text: "full" }] });
+      }
+      return null;
+    }) as typeof invoke);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(
+      <ResultViewer
+        record={record({ truncated: true, size_bytes: 12 * 1024 * 1024 })}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "打开完整结果" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(invokeMock).not.toHaveBeenCalledWith("read_full_result", {
+      recordId: "c1",
+    });
+
+    confirm.mockReturnValue(true);
     await userEvent.click(screen.getByRole("button", { name: "打开完整结果" }));
     expect(await screen.findByText("完整结果")).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith("read_full_result", { recordId: "c1" });

@@ -14,6 +14,7 @@ export function JsonViewer({
   text,
   defaultMode = "tree",
   showToolbar = true,
+  copyLabel,
   contentClassName = "max-h-80 overflow-auto",
 }: {
   /** 结构化值（与 text 二选一） */
@@ -22,6 +23,8 @@ export function JsonViewer({
   text?: string;
   defaultMode?: JsonViewerMode;
   showToolbar?: boolean;
+  /** 工具栏复制按钮文案；默认“复制全部” */
+  copyLabel?: string;
   /** 内容区样式（高度/滚动） */
   contentClassName?: string;
 }) {
@@ -32,6 +35,7 @@ export function JsonViewer({
       defaultTab={defaultMode === "text" ? "raw" : "tree"}
       tabs={["tree", "raw"]}
       showToolbar={showToolbar}
+      copyLabel={copyLabel}
       contentClassName={contentClassName}
     />
   );

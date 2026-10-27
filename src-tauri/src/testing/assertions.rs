@@ -845,6 +845,7 @@ mod tests {
             truncated: false,
             size_bytes: 0,
             origin: CallOrigin::Test,
+            frames: None,
             created_at: Utc::now(),
         }
     }

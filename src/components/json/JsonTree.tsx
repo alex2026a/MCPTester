@@ -42,6 +42,8 @@ export interface JsonTreeProps {
   onMatchesChange?: (matches: JsonMatch[]) => void;
   expandDepth?: number | "all";
   className?: string;
+  /** 在固定高度容器内铺满（Explorer 分栏结果区） */
+  fill?: boolean;
 }
 
 interface HoverInfo {
@@ -58,6 +60,7 @@ export function JsonTree({
   onMatchesChange,
   expandDepth = 2,
   className = "",
+  fill = false,
 }: JsonTreeProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<HoverInfo | null>(null);
@@ -196,10 +199,12 @@ export function JsonTree({
   }
 
   return (
-    <div className="relative min-h-0">
+    <div className={`relative min-h-0 ${fill ? "h-full" : ""}`}>
       <div
         ref={containerRef}
-        className={`overflow-auto font-mono text-[11px] leading-5 ${className}`}
+        className={`overflow-auto font-mono text-[11px] leading-5 ${
+          fill ? "h-full" : ""
+        } ${className}`}
         onMouseOver={handleHover}
         onMouseLeave={() => setHover(null)}
       >

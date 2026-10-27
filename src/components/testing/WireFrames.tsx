@@ -140,6 +140,7 @@ function FramePane({ title, entry }: { title: string; entry?: WireEntry }) {
           value={entry.payload}
           defaultTab="tree"
           tabs={["tree", "raw"]}
+          copyLabel={title === "请求" ? "复制请求" : "复制响应"}
           contentClassName="max-h-60 overflow-auto"
         />
       ) : (

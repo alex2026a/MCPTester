@@ -25,11 +25,29 @@ export type SchemaValidation = {
   parseError: string | null;
 };
 
+export type SchemaFormSnapshot = {
+  values: Record<string, unknown>;
+  jsonText: string;
+  jsonMode: boolean;
+  jsonError: string | null;
+  touched: string[];
+  submitted: boolean;
+  jsonTouched: boolean;
+};
+
 export type SchemaFormHandle = {
   /** 提交前校验：展示错误、聚焦第一个错误字段，并返回当前参数 */
   validate: () => SchemaValidation;
   /** 只读取当前参数，不触发错误展示（供「仍要发送」使用） */
   readValue: () => SchemaValidation;
+  /** 用历史参数回填（保持当前表单/JSON 模式） */
+  apply: (value: Record<string, unknown>) => void;
+  /** 清空参数 */
+  clear: () => void;
+  /** 读取当前内部状态（含 JSON 文本/模式），供撤销使用 */
+  snapshot: () => SchemaFormSnapshot;
+  /** 恢复快照，并触发一次 onChange */
+  restore: (snapshot: SchemaFormSnapshot) => void;
 };
 
 function parseArguments(text: string): {
@@ -56,11 +74,14 @@ function missingClass(missing: boolean): string {
 export function SchemaForm({
   schema,
   onChange,
+  onDirty,
   initial,
   ref,
 }: {
   schema: unknown;
   onChange: (value: Record<string, unknown>) => void;
+  /** 任何输入（含 JSON 解析失败）都触发，用于清除“已载入历史参数”提示 */
+  onDirty?: () => void;
   /** 预填参数（重放场景） */
   initial?: Record<string, unknown> | null;
   ref?: Ref<SchemaFormHandle>;
@@ -93,6 +114,7 @@ export function SchemaForm({
   }, [jsonError, jsonMode, schema, values]);
 
   function update(key: string, value: unknown) {
+    onDirty?.();
     const next = { ...values, [key]: value };
     setValues(next);
     onChange(next);
@@ -132,10 +154,56 @@ export function SchemaForm({
     return readValue();
   }, [readValue]);
 
-  useImperativeHandle(ref, () => ({ validate, readValue }), [
-    readValue,
-    validate,
-  ]);
+  const apply = useCallback(
+    (value: Record<string, unknown>) => {
+      setValues(value);
+      setJsonText(JSON.stringify(value, null, 2));
+      setJsonError(null);
+      setTouched(new Set());
+      setSubmitted(false);
+      setJsonTouched(false);
+      onChange(value);
+    },
+    [onChange],
+  );
+
+  const clear = useCallback(() => {
+    onDirty?.();
+    apply({});
+  }, [apply, onDirty]);
+
+  const snapshot = useCallback(
+    (): SchemaFormSnapshot => ({
+      values,
+      jsonText,
+      jsonMode,
+      jsonError,
+      touched: [...touched],
+      submitted,
+      jsonTouched,
+    }),
+    [jsonError, jsonMode, jsonText, jsonTouched, submitted, touched, values],
+  );
+
+  const restore = useCallback(
+    (next: SchemaFormSnapshot) => {
+      setValues(next.values);
+      setJsonText(next.jsonText);
+      setJsonMode(next.jsonMode);
+      setJsonError(next.jsonError);
+      setTouched(new Set(next.touched));
+      setSubmitted(next.submitted);
+      setJsonTouched(next.jsonTouched);
+      onChange(next.values);
+    },
+    [onChange],
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({ validate, readValue, apply, clear, snapshot, restore }),
+    [apply, clear, readValue, restore, snapshot, validate],
+  );
 
   // 提交失败后聚焦第一个错误控件（等本次渲染把 aria-invalid 刷到 DOM 上）
   useEffect(() => {
@@ -182,13 +250,23 @@ export function SchemaForm({
             </span>
           ) : null}
         </span>
-        <button
-          type="button"
-          className="rounded border border-slate-200 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-50"
-          onClick={jsonMode ? switchToForm : switchToJson}
-        >
-          {jsonMode ? "表单模式" : "JSON 模式"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="rounded border border-slate-200 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-50"
+            title="清空当前参数"
+            onClick={clear}
+          >
+            清空
+          </button>
+          <button
+            type="button"
+            className="rounded border border-slate-200 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-50"
+            onClick={jsonMode ? switchToForm : switchToJson}
+          >
+            {jsonMode ? "表单模式" : "JSON 模式"}
+          </button>
+        </div>
       </div>
 
       {jsonMode ? (
@@ -204,6 +282,7 @@ export function SchemaForm({
             className="h-40 w-full rounded border border-slate-200 p-2 font-mono text-xs"
             value={jsonText}
             onChange={(e) => {
+              onDirty?.();
               const text = e.target.value;
               setJsonText(text);
               const parsed = parseArguments(text);

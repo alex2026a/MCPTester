@@ -1,6 +1,6 @@
 [package]
 name = "mcptester"
-version = "0.2.2"
+version = "0.5.0"
 description = "MCP Tester - MCP 服务接口测试桌面工具"
 authors = ["Wxl"]
 edition = "2024"
@@ -21,6 +21,9 @@ mock-server = [
     "rmcp/server-side-http",
     "dep:axum",
 ]
+# 开发期工具（probe）的显式开关。
+# 默认关闭，避免 release 构建额外链接一个不随包分发的 CLI。
+dev-tools = []
 
 [[bin]]
 name = "mcptester"
@@ -34,13 +37,16 @@ required-features = ["mock-server"]
 [[bin]]
 name = "probe"
 path = "src/bin/probe.rs"
+required-features = ["dev-tools"]
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "mcptester_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面端（Windows）只需要 rlib；staticlib/cdylib 是移动端 target 才需要的产物，
+# 保留它们会让同一份库每次 release 多编译/链接两遍。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -59,7 +65,14 @@ anyhow = "1.0.104"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.3", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+] }
 keyring-core = "1.0.1"
 regex = "1.13.1"
 rmcp = { version = "3.5.1", default-features = false, features = [
@@ -68,18 +81,30 @@ rmcp = { version = "3.5.1", default-features = false, features = [
     "transport-streamable-http-client-reqwest",
     "reqwest",
     "which-command",
+    "auth",
 ] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+oauth2 = { version = "5.0", default-features = false }
+async-trait = "0.1"
+base64 = "0.22"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "stream",
+] }
 process-wrap = "10"
 futures = "0.3"
 url = "2"
 axum = { version = "0.8", optional = true }
 sse-stream = "0.2"
 
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# release 配置以构建速度为优先（产物用于分发试用/验收，不追求极限体积）：
+# - thin LTO 保留跨 crate 内联，链接耗时远低于 fat LTO；
+# - codegen-units = 16 让 22k 行代码并行生成，避免单线程成为瓶颈。
+# 如需极限体积，临时改回 codegen-units = 1 / lto = true 并全量重编。
+# 体积优化参考：https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
-codegen-units = 1
-lto = true
+codegen-units = 16
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = true

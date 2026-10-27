@@ -1,8 +1,10 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { EmptyState } from "../components/EmptyState";
 import { ExportPreviewDialog } from "../components/ExportPreviewDialog";
+import { ServerSelect } from "../components/ServerSelect";
+import { ServerStatusActions } from "../components/ServerStatusActions";
 import { CaseEditor } from "../components/testing/CaseEditor";
 import { GenerationDialog } from "../components/testing/GenerationDialog";
 import { LlmDialog } from "../components/testing/LlmDialog";
@@ -22,6 +24,7 @@ import {
   reorderTestCases,
 } from "../api/tests";
 import { listServers } from "../api/servers";
+import { pickDefaultServerId } from "../lib/serverOrder";
 import { toast } from "../stores/toast";
 import type { TestCase, TestSuiteSummary } from "../types/testing";
 
@@ -41,18 +44,19 @@ const PRIORITY_LABEL: Record<string, string> = {
 /** 测试用例库（M1）：套件/用例 CRUD、排序、批量删除、导入导出、契约漂移。 */
 export function Tests() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const servers = useQuery({ queryKey: ["servers"], queryFn: listServers });
   const [serverId, setServerId] = useState("");
   const [suiteId, setSuiteId] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [suiteDialog, setSuiteDialog] = useState<
-    { suite?: TestSuiteSummary } | null
-  >(null);
+  const [suiteDialog, setSuiteDialog] = useState<{
+    suite?: TestSuiteSummary;
+  } | null>(null);
   const [editor, setEditor] = useState<TestCase | "new" | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
-  const [generateOpen, setGenerateOpen] = useState(
-    () => Boolean(searchParams.get("target")),
+  const [generateOpen, setGenerateOpen] = useState(() =>
+    Boolean(searchParams.get("target")),
   );
   const [generateTarget, setGenerateTarget] = useState<string | null>(() =>
     searchParams.get("target"),
@@ -64,8 +68,11 @@ export function Tests() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const serverList = servers.data ?? [];
-  const activeServerId = serverId || serverList[0]?.id || "";
-  const activeServer = serverList.find((server) => server.id === activeServerId);
+  const activeServerId = serverId || pickDefaultServerId(serverList);
+  const activeServer = serverList.find(
+    (server) => server.id === activeServerId,
+  );
+  const ready = activeServer?.state.state === "ready";
 
   const suites = useQuery({
     queryKey: ["test-suites", activeServerId],
@@ -195,28 +202,20 @@ export function Tests() {
     <section className="flex h-full flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2">
         <h2 className="text-xl font-semibold text-slate-800">测试用例</h2>
-        <select
-          className="rounded border border-slate-200 px-2 py-1 text-xs"
+        <ServerSelect
+          servers={serverList}
           value={activeServerId}
-          onChange={(event) => {
-            setServerId(event.target.value);
+          onChange={(id) => {
+            setServerId(id);
             setSuiteId("");
             setSelectedIds([]);
             setContractDiff(null);
           }}
-        >
-          <option value="">选择服务器</option>
-          {serverList.map((server) => (
-            <option key={server.id} value={server.id}>
-              {server.name}
-            </option>
-          ))}
-        </select>
-        {activeServer ? (
-          <span className="text-[11px] text-slate-400">
-            状态：{activeServer.state.state}
-          </span>
-        ) : null}
+          placeholder="选择服务器"
+          className="rounded border border-slate-200 px-2 py-1 text-xs"
+          ariaLabel="选择服务器"
+        />
+        <ServerStatusActions key={activeServer?.id} server={activeServer} />
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -253,7 +252,8 @@ export function Tests() {
           <button
             type="button"
             className="rounded border border-slate-200 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
-            disabled={!activeSuite}
+            disabled={!activeSuite || !ready}
+            title={!ready ? "服务器未连接，请先连接" : undefined}
             onClick={() => {
               setGenerateTarget(null);
               setGenerateOpen(true);
@@ -264,7 +264,8 @@ export function Tests() {
           <button
             type="button"
             className="rounded border border-slate-200 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
-            disabled={!activeSuite}
+            disabled={!activeSuite || !ready}
+            title={!ready ? "服务器未连接，请先连接" : undefined}
             onClick={() => setLlmOpen(true)}
           >
             LLM 辅助
@@ -273,7 +274,10 @@ export function Tests() {
           <button
             type="button"
             className="rounded border border-slate-200 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
-            disabled={!activeSuite || Boolean(runId || activeRun.data)}
+            disabled={
+              !activeSuite || !ready || Boolean(runId || activeRun.data)
+            }
+            title={!ready ? "服务器未连接，请先连接" : undefined}
             onClick={() => setRunDialog("suite")}
           >
             运行套件
@@ -282,8 +286,11 @@ export function Tests() {
             type="button"
             className="rounded border border-slate-200 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50"
             disabled={
-              selectedCases.length === 0 || Boolean(runId || activeRun.data)
+              selectedCases.length === 0 ||
+              !ready ||
+              Boolean(runId || activeRun.data)
             }
+            title={!ready ? "服务器未连接，请先连接" : undefined}
             onClick={() => setRunDialog("selected")}
           >
             运行选中
@@ -304,17 +311,30 @@ export function Tests() {
         />
       </div>
 
+      {activeServer && !ready ? (
+        <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+          {activeServer.state.state === "connecting"
+            ? `服务器「${activeServer.name}」正在连接，生成与运行类操作暂不可用。`
+            : `服务器「${activeServer.name}」当前不可用，生成与运行类操作已禁用。`}
+        </div>
+      ) : null}
+
       {runId || activeRun.data ? (
         <RunProgress
           runId={runId ?? activeRun.data?.run_id ?? ""}
           onClose={() => {
             setRunId(null);
-            void queryClient.invalidateQueries({ queryKey: ["active-test-run"] });
+            void queryClient.invalidateQueries({
+              queryKey: ["active-test-run"],
+            });
           }}
-          onFinished={() => {
+          onFinished={(id) => {
             setRunId(null);
-            void queryClient.invalidateQueries({ queryKey: ["active-test-run"] });
+            void queryClient.invalidateQueries({
+              queryKey: ["active-test-run"],
+            });
             invalidateCases();
+            navigate(`/reports?run=${encodeURIComponent(id)}`);
           }}
         />
       ) : null}
@@ -388,7 +408,11 @@ export function Tests() {
                   type="button"
                   className="rounded border border-red-100 px-1.5 py-1 text-[11px] text-red-500 hover:bg-red-50"
                   onClick={() => {
-                    if (window.confirm(`删除套件「${activeSuite.name}」及其全部用例？`)) {
+                    if (
+                      window.confirm(
+                        `删除套件「${activeSuite.name}」及其全部用例？`,
+                      )
+                    ) {
                       removeSuite.mutate(activeSuite.id);
                     }
                   }}
@@ -397,7 +421,9 @@ export function Tests() {
                 </button>
                 <button
                   type="button"
-                  className="rounded border border-slate-200 px-1.5 py-1 text-[11px] hover:bg-slate-50"
+                  className="rounded border border-slate-200 px-1.5 py-1 text-[11px] hover:bg-slate-50 disabled:opacity-50"
+                  disabled={!ready}
+                  title={!ready ? "服务器未连接，请先连接" : undefined}
                   onClick={() => compareContract.mutate()}
                 >
                   契约漂移
@@ -446,8 +472,14 @@ export function Tests() {
                     className="rounded border border-red-100 px-2 py-1 text-red-500 hover:bg-red-50 disabled:opacity-50"
                     disabled={selectedCases.length === 0}
                     onClick={() => {
-                      if (window.confirm(`删除选中的 ${selectedCases.length} 条用例？`)) {
-                        removeCases.mutate(selectedCases.map((item) => item.id));
+                      if (
+                        window.confirm(
+                          `删除选中的 ${selectedCases.length} 条用例？`,
+                        )
+                      ) {
+                        removeCases.mutate(
+                          selectedCases.map((item) => item.id),
+                        );
                       }
                     }}
                   >
@@ -608,7 +640,9 @@ export function Tests() {
           onClose={() => setRunDialog(null)}
           onStarted={(id) => {
             setRunId(id);
-            void queryClient.invalidateQueries({ queryKey: ["active-test-run"] });
+            void queryClient.invalidateQueries({
+              queryKey: ["active-test-run"],
+            });
           }}
         />
       ) : null}

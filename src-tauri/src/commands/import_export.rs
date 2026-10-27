@@ -9,8 +9,10 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tauri::State;
 
-use crate::commands::server::{add_server_inner, ServerDraft, SecretAction, SecretInput, SecretKindInput};
 use crate::commands::AppState;
+use crate::commands::server::{
+    SecretAction, SecretInput, SecretKindInput, ServerDraft, add_server_inner,
+};
 use crate::mcp::models::{HttpConfig, KeyValue, ServerConfig, ShellWrap, TransportKind};
 use crate::storage::server_repo;
 
@@ -45,8 +47,8 @@ pub async fn import_servers_from_file(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<ImportReport, String> {
-    let json = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取文件失败「{path}」：{e}"))?;
+    let json =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败「{path}」：{e}"))?;
     import_servers_inner(&state, &json).await
 }
 
@@ -115,7 +117,9 @@ pub async fn export_servers(
     let payload = build_export(&servers, &format)?;
     let target = match path {
         Some(path) => std::path::PathBuf::from(path),
-        None => state.data_dir.join(format!("mcptester-export-{format}.json")),
+        None => state
+            .data_dir
+            .join(format!("mcptester-export-{format}.json")),
     };
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -276,6 +280,7 @@ pub(crate) fn build_draft_with_options(
                 .get("allow_insecure_tls")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            oauth: None,
         })
     };
 
@@ -432,10 +437,7 @@ fn export_entry(server: &ServerConfig) -> Value {
                     object.insert("env".to_string(), Value::Object(env));
                 }
             }
-            object.insert(
-                "type".to_string(),
-                Value::String("stdio".to_string()),
-            );
+            object.insert("type".to_string(), Value::String("stdio".to_string()));
             Value::Object(object)
         }
         TransportKind::StreamableHttp | TransportKind::Sse => {
@@ -449,13 +451,11 @@ fn export_entry(server: &ServerConfig) -> Value {
             }
             object.insert(
                 "type".to_string(),
-                Value::String(
-                    if server.transport == TransportKind::Sse {
-                        "sse".to_string()
-                    } else {
-                        "http".to_string()
-                    },
-                ),
+                Value::String(if server.transport == TransportKind::Sse {
+                    "sse".to_string()
+                } else {
+                    "http".to_string()
+                }),
             );
             Value::Object(object)
         }
@@ -492,9 +492,10 @@ mod tests {
         assert_eq!(draft.transport, TransportKind::Stdio);
         let env = &draft.stdio.as_ref().unwrap().env;
         assert!(env.iter().any(|kv| kv.key == "PLAIN" && kv.value.is_some()));
-        assert!(env
-            .iter()
-            .any(|kv| kv.key == "DEPLOY_TOKEN" && kv.secret && kv.value.is_none()));
+        assert!(
+            env.iter()
+                .any(|kv| kv.key == "DEPLOY_TOKEN" && kv.secret && kv.value.is_none())
+        );
         assert_eq!(draft.secrets.len(), 1);
         assert_eq!(draft.secrets[0].action, SecretAction::Replace);
     }
@@ -511,12 +512,16 @@ mod tests {
         // 占位符 → 待配置（无明文、无 keyring 写入）
         assert!(draft.secrets.is_empty());
         let headers = &draft.http.as_ref().unwrap().headers;
-        assert!(headers
-            .iter()
-            .any(|kv| kv.key == "Authorization" && kv.secret && kv.value.is_none()));
-        assert!(headers
-            .iter()
-            .any(|kv| kv.key == "X-Trace" && !kv.secret && kv.value.as_deref() == Some("abc")));
+        assert!(
+            headers
+                .iter()
+                .any(|kv| kv.key == "Authorization" && kv.secret && kv.value.is_none())
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|kv| kv.key == "X-Trace" && !kv.secret && kv.value.as_deref() == Some("abc"))
+        );
     }
 
     #[test]
@@ -555,6 +560,7 @@ mod tests {
                 ],
                 timeout_secs: None,
                 allow_insecure_tls: false,
+                oauth: None,
             }),
             protocol_version_pin: None,
             enabled: true,

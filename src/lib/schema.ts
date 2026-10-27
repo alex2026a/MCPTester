@@ -5,6 +5,8 @@ export type SchemaObject = {
   properties?: Record<string, SchemaObject>;
   /** 标准 JSON Schema 为根级数组；兼容部分服务端在字段上使用 boolean 的写法 */
   required?: string[] | boolean;
+  /** false = 明确禁止额外字段；缺省/true/对象 = 允许 */
+  additionalProperties?: boolean | SchemaObject;
   enum?: unknown[];
   description?: string;
   items?: SchemaObject;
@@ -79,6 +81,68 @@ export function validateAgainstSchema(
     }
   }
   return errors;
+}
+
+/** 历史参数回填时的 Schema 漂移处理（只处理顶层字段）。 */
+export function filterKnownTopLevel(
+  schema: unknown,
+  params: Record<string, unknown>,
+): {
+  value: Record<string, unknown>;
+  dropped: number;
+  unknown: number;
+  disallowsAdditional: boolean;
+} {
+  const root =
+    schema && typeof schema === "object" ? (schema as SchemaObject) : null;
+  const properties = root?.properties;
+  const paramsKeys = Object.keys(params);
+
+  if (!properties) {
+    return {
+      value: params,
+      dropped: 0,
+      unknown: 0,
+      disallowsAdditional: false,
+    };
+  }
+
+  const propertyNames = Object.keys(properties);
+  if (propertyNames.length === 0) {
+    if (root?.additionalProperties === false && paramsKeys.length > 0) {
+      return {
+        value: params,
+        dropped: 0,
+        unknown: paramsKeys.length,
+        disallowsAdditional: true,
+      };
+    }
+    return {
+      value: params,
+      dropped: 0,
+      unknown: 0,
+      disallowsAdditional: false,
+    };
+  }
+
+  if (root?.additionalProperties === false) {
+    const value = Object.fromEntries(
+      Object.entries(params).filter(([key]) => key in properties),
+    );
+    return {
+      value,
+      dropped: paramsKeys.length - Object.keys(value).length,
+      unknown: 0,
+      disallowsAdditional: false,
+    };
+  }
+
+  return {
+    value: params,
+    dropped: 0,
+    unknown: paramsKeys.filter((key) => !(key in properties)).length,
+    disallowsAdditional: false,
+  };
 }
 
 /** 字段类型是否支持自动控件（复杂类型降级为 JSON 编辑） */

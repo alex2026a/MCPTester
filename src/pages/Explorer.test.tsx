@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Explorer } from "./Explorer";
+import { useDraftStore } from "../stores/drafts";
 import { useReplayStore } from "../stores/replay";
+import { useToastStore } from "../stores/toast";
 import type { CapabilitySnapshot, ServerSummary } from "../types/models";
 
 const invokeMock = vi.mocked(invoke);
@@ -84,7 +86,9 @@ function renderExplorer() {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  useDraftStore.getState().clearAll();
   useReplayStore.getState().setReplay(null);
+  useToastStore.setState({ toasts: [] });
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "list_servers":
@@ -106,6 +110,25 @@ beforeEach(() => {
         });
       case "get_capabilities":
         return Promise.resolve(snapshot);
+      case "list_recent_call_params":
+        return Promise.resolve([
+          {
+            id: "call-1",
+            created_at: "2026-10-26T10:32:05Z",
+            status: "ok",
+            duration_ms: 320,
+            origin: "manual",
+            preview: 'text="loaded"',
+            param_count: 1,
+            repeat_count: 1,
+            params_bytes: 32,
+          },
+        ]);
+      case "get_call_params":
+        return Promise.resolve({
+          name: "echo",
+          arguments: { text: "loaded" },
+        });
       case "call_tool":
         return Promise.resolve({
           id: "call-1",
@@ -366,6 +389,97 @@ describe("Explorer 参数校验", () => {
     expect(
       screen.getByRole("button", { name: "仍要发送" }),
     ).toBeInTheDocument();
+  });
+
+  it("历史参数可回填、可撤销，且不触发调用", async () => {
+    renderExplorer();
+
+    await userEvent.click(await screen.findByRole("button", { name: /echo/ }));
+    const input = await screen.findByLabelText("text");
+    await userEvent.click(screen.getByRole("button", { name: /历史参数/ }));
+    await userEvent.click(await screen.findByText('text="loaded"'));
+
+    await waitFor(() => expect(input).toHaveValue("loaded"));
+    expect(screen.getByText(/已载入/)).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("call_tool", expect.anything());
+
+    await userEvent.click(screen.getByRole("button", { name: "撤销" }));
+    expect(input).toHaveValue("");
+  });
+
+  it("Ctrl+Enter 发送工具调用，输入法组合态不发送", async () => {
+    renderExplorer();
+
+    await userEvent.click(await screen.findByRole("button", { name: /echo/ }));
+    const input = await screen.findByLabelText("text");
+    await userEvent.type(input, "hello");
+
+    fireEvent.keyDown(input, {
+      key: "Enter",
+      ctrlKey: true,
+      isComposing: true,
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith("call_tool", expect.anything());
+
+    await userEvent.keyboard("{Control>}{Enter}{/Control}");
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "call_tool",
+        expect.objectContaining({
+          name: "echo",
+          arguments: { text: "hello" },
+        }),
+      ),
+    );
+  });
+
+  it("切换页签后回到工具，恢复未发送草稿；清空后不恢复", async () => {
+    renderExplorer();
+
+    await userEvent.click(await screen.findByRole("button", { name: /echo/ }));
+    const input = await screen.findByLabelText("text");
+    await userEvent.type(input, "draft-value");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Prompts/ }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^Tools/ }));
+    await userEvent.click(screen.getByRole("button", { name: /echo/ }));
+    expect(await screen.findByLabelText("text")).toHaveValue("draft-value");
+
+    await userEvent.click(screen.getByTitle("清空当前参数"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Prompts/ }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^Tools/ }));
+    await userEvent.click(screen.getByRole("button", { name: /echo/ }));
+    expect(await screen.findByLabelText("text")).toHaveValue("");
+  });
+
+  it("切页签保留结果并提示旧结果归属，切回后恢复", async () => {
+    renderExplorer();
+
+    await userEvent.click(await screen.findByRole("button", { name: /echo/ }));
+    await userEvent.type(await screen.findByLabelText("text"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "发送调用" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("call_tool", expect.anything()),
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Prompts/ }),
+    );
+    expect(
+      await screen.findByText(/上一次调用结果属于 工具「echo」/),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /^Tools/ }));
+    await userEvent.click(screen.getByRole("button", { name: /echo/ }));
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/上一次调用结果属于 工具「echo」/),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("JSON 解析失败时不发送，也不提供仍要发送", async () => {

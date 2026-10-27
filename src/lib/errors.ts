@@ -17,6 +17,8 @@ export interface ApiErrorInfo {
   detail?: string;
   supported?: string[];
   timeout_secs?: number;
+  required_scope?: string;
+  resource_metadata_url?: string;
 }
 
 /** UI 展示模型 */
@@ -54,6 +56,58 @@ const KIND_META: Record<string, { title: string; hint: string }> = {
   unauthorized: {
     title: "认证失败",
     hint: "检查 Authorization 请求头：填完整「Bearer <token>」或只填 token 均可（客户端会自动补 Bearer 前缀）；确认 token 未过期或未被轮换。",
+  },
+  oauth_required: {
+    title: "需要 OAuth 登录",
+    hint: "到「服务器」页点击该服务器的「登录/补充授权」，在系统浏览器完成授权后会自动重连。",
+  },
+  forbidden: {
+    title: "服务器拒绝访问（403）",
+    hint: "token 可能有效但权限不足，或服务器策略拒绝；查看详情中的 WWW-Authenticate。",
+  },
+  auth_transient: {
+    title: "OAuth 临时认证失败",
+    hint: "token 刷新或凭据存储暂时失败，可稍后重试；持续失败请重新登录。",
+  },
+  oauth_port_in_use: {
+    title: "OAuth 回调端口被占用",
+    hint: "修改服务器 OAuth 配置中的回调地址端口（默认 33318），或关闭占用该端口的程序后重试。",
+  },
+  oauth_invalid_redirect: {
+    title: "OAuth 回调地址非法",
+    hint: "回调地址必须使用 http、host 为 127.0.0.1/localhost/[::1]，且不能带 query 或 fragment。",
+  },
+  oauth_metadata: {
+    title: "OAuth 元数据发现失败",
+    hint: "确认服务器支持 OAuth；不规范的服务可在高级项手工填写授权/token/注册端点。",
+  },
+  oauth_registration: {
+    title: "OAuth 客户端注册失败",
+    hint: "确认服务器支持动态客户端注册，或填写预注册 client_id（及必要的 client_secret）。",
+  },
+  oauth_token_exchange: {
+    title: "OAuth token 交换失败",
+    hint: "检查 redirect_uri 是否与授权服务器登记一致、scope 是否被允许；必要时重新登录。",
+  },
+  oauth_timeout: {
+    title: "OAuth 登录超时",
+    hint: "浏览器授权未在时限内完成；请重新点击登录并尽快完成授权。",
+  },
+  oauth_canceled: {
+    title: "OAuth 登录已取消",
+    hint: "如需连接，请重新点击「登录」。",
+  },
+  oauth_storage: {
+    title: "OAuth 凭据保存失败",
+    hint: "检查系统凭据库/数据目录权限；便携模式请确认数据目录可写。",
+  },
+  oauth_config: {
+    title: "OAuth 配置错误",
+    hint: "检查 OAuth 参数（端点、client_id、回调地址）后重试。",
+  },
+  oauth_internal: {
+    title: "OAuth 内部错误",
+    hint: "可复制原始细节排障；P1/P2 阶段若持续出现，请查看应用日志。",
   },
   unsupported_client_capability: {
     title: "服务器请求了不支持的能力",

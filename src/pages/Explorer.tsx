@@ -1,11 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { EventPanel } from "../components/EventPanel";
 import { JsonViewer } from "../components/JsonViewer";
+import {
+  RecentParamsButton,
+  type RecentParamsContext,
+} from "../components/RecentParamsButton";
 import { ResultViewer } from "../components/ResultViewer";
-import { SchemaForm, type SchemaFormHandle } from "../components/SchemaForm";
+import {
+  SchemaForm,
+  type SchemaFormHandle,
+  type SchemaFormSnapshot,
+} from "../components/SchemaForm";
+import { ServerSelect } from "../components/ServerSelect";
+import { ServerStatusActions } from "../components/ServerStatusActions";
 import {
   getCapabilities,
   listServers,
@@ -20,10 +36,49 @@ import {
   replayArguments,
   replayTab,
 } from "../lib/replay";
+import { filterKnownTopLevel } from "../lib/schema";
+import { pickDefaultServerId } from "../lib/serverOrder";
+import { draftKey, useDraftStore } from "../stores/drafts";
 import { useReplayStore } from "../stores/replay";
-import type { CallRecord, CapabilitySnapshot } from "../types/models";
+import { toast } from "../stores/toast";
+import { formatDateTime } from "../components/json/format";
+import type {
+  CallRecord,
+  CapabilitySnapshot,
+  RecentCallParam,
+} from "../types/models";
 
 type Tab = "tools" | "resources" | "templates" | "prompts";
+
+type ResultContext = {
+  serverId: string;
+  method: "tools_call" | "resources_read" | "prompts_get";
+  view: Tab;
+  target: string;
+  resolvedTarget?: string;
+};
+
+type HistoryNotice =
+  | {
+      kind: "tool";
+      context: RecentParamsContext;
+      label: string;
+      previousSnapshot: SchemaFormSnapshot | null;
+      dropped: number;
+      unknown: number;
+      disallowsAdditional: boolean;
+      empty: boolean;
+    }
+  | {
+      kind: "prompt";
+      context: RecentParamsContext;
+      label: string;
+      previousArgs: Record<string, unknown>;
+      dropped: number;
+      unknown: number;
+      disallowsAdditional: boolean;
+      empty: boolean;
+    };
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "tools", label: "Tools" },
@@ -37,12 +92,26 @@ function isBlank(value: string | undefined): boolean {
   return !(value ?? "").trim();
 }
 
+function viewLabel(view: Tab): string {
+  switch (view) {
+    case "tools":
+      return "工具";
+    case "prompts":
+      return "提示词";
+    case "templates":
+      return "资源模板";
+    default:
+      return "资源";
+  }
+}
+
 /** 接口页：枚举 + 调用台（Tools / Resources / 模板 / Prompts） */
 export function Explorer() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const servers = useQuery({ queryKey: ["servers"], queryFn: listServers });
   const appInfo = useQuery({ queryKey: ["appInfo"], queryFn: getAppInfo });
+  const serverList = servers.data ?? [];
   const replay = useReplayStore((s) => s.replay);
   const setReplay = useReplayStore((s) => s.setReplay);
 
@@ -56,6 +125,11 @@ export function Explorer() {
   const [filter, setFilter] = useState("");
   const [selected, setSelected] = useState<string>(() => replay?.target ?? "");
   const [result, setResult] = useState<CallRecord | null>(null);
+  const [resultContext, setResultContext] = useState<ResultContext | null>(null);
+  const [resultCollapsed, setResultCollapsed] = useState(false);
+  const [eventPanelServerId, setEventPanelServerId] = useState<string | null>(
+    null,
+  );
   const [inFlightId, setInFlightId] = useState<string | null>(null);
   const [promptArgs, setPromptArgs] = useState<Record<string, unknown>>(() =>
     replay?.method === "prompts_get" ? replayArguments(replay.params) : {},
@@ -73,6 +147,7 @@ export function Explorer() {
       ? `已载入历史重放：${CALL_METHOD_LABEL[replay.method]} · ${replay.target}`
       : null,
   );
+  const [historyNotice, setHistoryNotice] = useState<HistoryNotice | null>(null);
   const [pendingResource, setPendingResource] = useState<string | null>(() =>
     replay?.method === "resources_read" ? replay.target : null,
   );
@@ -80,13 +155,15 @@ export function Explorer() {
   const toolFormRef = useRef<SchemaFormHandle | null>(null);
 
   const currentServer = serverId
-    ? (servers.data ?? []).find((s) => s.id === serverId)
-    : appInfo.data?.default_server_id
-      ? ((servers.data ?? []).find(
-          (s) => s.id === appInfo.data?.default_server_id,
-        ) ?? (servers.data ?? [])[0])
-      : (servers.data ?? [])[0];
+    ? serverList.find((s) => s.id === serverId)
+    : serverList.find(
+        (s) =>
+          s.id ===
+          pickDefaultServerId(serverList, appInfo.data?.default_server_id),
+      );
   const currentServerId = currentServer?.id;
+  const eventPanelOpen =
+    Boolean(currentServerId) && eventPanelServerId === currentServerId;
   const missingServer =
     Boolean(serverId) && servers.isSuccess && !currentServer;
   const ready = currentServer?.state.state === "ready";
@@ -97,16 +174,25 @@ export function Explorer() {
     enabled: Boolean(currentServer?.id) && ready,
   });
 
-  // 重放值已在首帧由 store 初始化；这里只清空一次性标记，避免返回接口页时重复应用
+  // 重放值已在首帧由 store 初始化；这里清空一次性标记，并把工具/提示词重放写入草稿。
   useEffect(() => {
-    if (replay) setReplay(null);
+    if (!replay) return;
+    if (replay.method === "tools_call" || replay.method === "prompts_get") {
+      useDraftStore
+        .getState()
+        .save(
+          draftKey(replay.serverId, replay.method, replay.target),
+          replayArguments(replay.params),
+        );
+    }
+    setReplay(null);
   }, [replay, setReplay]);
 
   // 启动配置指定的默认服务器由 currentServer 派生，不写入本地 state，
   // 避免 effect 内同步 setState；用户选择后 serverId 优先生效。
 
   // resources/read 可能是模板生成的 URI：能力快照到位后再派生具体资源/模板视图
-  const resourceReplay = useMemo(() => {
+  const resourceReplay = (() => {
     if (!pendingResource || !capabilities.data) return null;
     if (capabilities.data.server_id !== currentServerId) return null;
 
@@ -132,7 +218,7 @@ export function Explorer() {
       };
     }
     return { tab: "resources" as Tab, selected: pendingResource, vars: {} };
-  }, [pendingResource, capabilities.data, currentServerId]);
+  })();
 
   const viewTab = resourceReplay?.tab ?? tab;
   const viewSelected = resourceReplay?.selected ?? selected;
@@ -146,23 +232,32 @@ export function Explorer() {
     selectedItemRef.current?.scrollIntoView?.({ block: "nearest" });
   }, [viewSelected, viewTab, capabilities.data]);
 
+  function acceptResult(record: CallRecord, context: ResultContext) {
+    setResult(record);
+    setResultContext(context);
+    setResultCollapsed(eventPanelOpen);
+    void queryClient.invalidateQueries({ queryKey: ["recent-params"] });
+  }
+
   const refresh = useMutation({
     mutationFn: () => refreshCapabilities(currentServer?.id ?? ""),
     onSuccess: (snapshot) => {
       queryClient.setQueryData(["capabilities", currentServer?.id], snapshot);
     },
+    onError: (error) => toast.fromError(error, "刷新接口失败"),
   });
 
   const sendTool = useMutation({
     mutationFn: async (payload: {
       name: string;
       args: Record<string, unknown>;
+      context: ResultContext;
     }) => {
       const callId = crypto.randomUUID();
       setInFlightId(callId);
       try {
         return await callTool(
-          currentServer?.id ?? "",
+          payload.context.serverId,
           callId,
           payload.name,
           payload.args,
@@ -171,18 +266,26 @@ export function Explorer() {
         setInFlightId(null);
       }
     },
-    onSuccess: (record) => setResult(record),
+    onSuccess: (record, payload) => acceptResult(record, payload.context),
+    onError: (error) => toast.fromError(error, "调用失败"),
   });
 
   const readRes = useMutation({
-    mutationFn: (uri: string) => readResource(currentServer?.id ?? "", uri),
-    onSuccess: (record) => setResult(record),
+    mutationFn: (payload: { uri: string; context: ResultContext }) =>
+      readResource(payload.context.serverId, payload.uri),
+    onSuccess: (record, payload) => acceptResult(record, payload.context),
+    onError: (error) => toast.fromError(error, "读取资源失败"),
   });
 
   const fetchPrompt = useMutation({
-    mutationFn: (payload: { name: string; args: Record<string, unknown> }) =>
-      getPrompt(currentServer?.id ?? "", payload.name, payload.args),
-    onSuccess: (record) => setResult(record),
+    mutationFn: (payload: {
+      name: string;
+      args: Record<string, unknown>;
+      context: ResultContext;
+    }) =>
+      getPrompt(payload.context.serverId, payload.name, payload.args),
+    onSuccess: (record, payload) => acceptResult(record, payload.context),
+    onError: (error) => toast.fromError(error, "获取提示词失败"),
   });
 
   const items = useMemo(() => {
@@ -238,6 +341,13 @@ export function Explorer() {
   const templateNames = currentTemplate
     ? extractTemplateVariables(currentTemplate.uri_template)
     : [];
+  const resolvedTemplateUri = currentTemplate
+    ? templateNames.reduce(
+        (uri, name) =>
+          uri.replace(`{${name}}`, viewTemplateVars[name] ?? ""),
+        currentTemplate.uri_template,
+      )
+    : "";
   const missingTemplateVars = templateNames.filter((name) =>
     isBlank(viewTemplateVars[name]),
   );
@@ -250,9 +360,31 @@ export function Explorer() {
     )
     .map((arg) => arg.name);
 
-  function resetCallState() {
+  const resultMatches = Boolean(
+    result &&
+      resultContext &&
+      currentServerId &&
+      resultContext.serverId === currentServerId &&
+      resultContext.view === viewTab &&
+      ((viewTab === "tools" &&
+        resultContext.method === "tools_call" &&
+        currentTool &&
+        resultContext.target === currentTool.name) ||
+        (viewTab === "prompts" &&
+          resultContext.method === "prompts_get" &&
+          currentPrompt &&
+          resultContext.target === currentPrompt.name) ||
+        (viewTab === "resources" &&
+          resultContext.method === "resources_read" &&
+          resultContext.target === viewSelected) ||
+        (viewTab === "templates" &&
+          resultContext.method === "resources_read" &&
+          currentTemplate &&
+          resultContext.target === currentTemplate.uri_template)),
+  );
+
+  function clearSelectionState() {
     setSelected("");
-    setResult(null);
     setToolArgs({});
     setPromptArgs({});
     setTemplateVars({});
@@ -260,18 +392,128 @@ export function Explorer() {
     setToolForceSend(false);
     setPromptSubmitted(false);
     setPromptForceSend(false);
+    setHistoryNotice(null);
     setFormNonce((value) => value + 1);
+  }
+
+  function clearResultState() {
+    setResult(null);
+    setResultContext(null);
+    setResultCollapsed(false);
+  }
+
+  function resetCallState() {
+    clearSelectionState();
+    clearResultState();
+    setEventPanelServerId(null);
+  }
+
+  function updatePromptArgs(next: Record<string, unknown>) {
+    setPromptArgs(next);
+    setPromptForceSend(false);
+    setHistoryNotice(null);
+    if (currentServer && currentPrompt) {
+      useDraftStore
+        .getState()
+        .save(
+          draftKey(currentServer.id, "prompts_get", currentPrompt.name),
+          next,
+        );
+    }
+  }
+
+  function updateTemplateVars(next: Record<string, string>) {
+    setTemplateVars(next);
+    if (currentServer && currentTemplate) {
+      useDraftStore
+        .getState()
+        .save(
+          draftKey(currentServer.id, "resources_read", currentTemplate.uri_template),
+          next,
+        );
+    }
   }
 
   function handleToolArgsChange(next: Record<string, unknown>) {
     setToolArgs(next);
     setToolForceSend(false);
+    setHistoryNotice(null);
+    if (currentServer && currentTool) {
+      useDraftStore
+        .getState()
+        .save(draftKey(currentServer.id, "tools_call", currentTool.name), next);
+    }
+  }
+
+  function selectItem(key: string) {
+    setTab(viewTab);
+    clearSelectionState();
+    setSelected(key);
+    if (!currentServer) return;
+
+    if (viewTab === "tools") {
+      const nextTool = capabilities.data?.tools.find(
+        (tool) => tool.name === key,
+      );
+      const draft = useDraftStore
+        .getState()
+        .get(draftKey(currentServer.id, "tools_call", key));
+      setToolArgs(
+        draft ? filterKnownTopLevel(nextTool?.input_schema, draft).value : {},
+      );
+      return;
+    }
+
+    if (viewTab === "prompts") {
+      const nextPrompt = capabilities.data?.prompts.find(
+        (prompt) => prompt.name === key,
+      );
+      const names = new Set(
+        (nextPrompt?.arguments ?? []).map((arg) => arg.name),
+      );
+      const draft = useDraftStore
+        .getState()
+        .get(draftKey(currentServer.id, "prompts_get", key));
+      setPromptArgs(
+        draft
+          ? Object.fromEntries(
+              Object.entries(draft)
+                .filter(([name]) => names.has(name))
+                .map(([name, value]) => [name, String(value ?? "")]),
+            )
+          : {},
+      );
+      return;
+    }
+
+    if (viewTab === "templates") {
+      const draft = useDraftStore
+        .getState()
+        .get(draftKey(currentServer.id, "resources_read", key));
+      setTemplateVars(
+        draft
+          ? Object.fromEntries(
+              Object.entries(draft).map(([name, value]) => [
+                name,
+                String(value ?? ""),
+              ]),
+            )
+          : {},
+      );
+    }
   }
 
   function submitTool(force: boolean) {
-    if (!currentTool) return;
+    if (!currentTool || !currentServer || sendTool.isPending) return;
     const form = toolFormRef.current;
     if (!form) return;
+
+    const context: ResultContext = {
+      serverId: currentServer.id,
+      method: "tools_call",
+      view: "tools",
+      target: currentTool.name,
+    };
 
     if (!force) {
       const result = form.validate();
@@ -285,7 +527,7 @@ export function Explorer() {
         return;
       }
       setToolForceSend(false);
-      sendTool.mutate({ name: currentTool.name, args: result.value });
+      sendTool.mutate({ name: currentTool.name, args: result.value, context });
       return;
     }
 
@@ -296,11 +538,11 @@ export function Explorer() {
       return;
     }
     setToolForceSend(false);
-    sendTool.mutate({ name: currentTool.name, args: result.value });
+    sendTool.mutate({ name: currentTool.name, args: result.value, context });
   }
 
   function submitPrompt(force: boolean) {
-    if (!currentPrompt) return;
+    if (!currentPrompt || !currentServer || fetchPrompt.isPending) return;
     if (!force && missingPromptArgs.length > 0) {
       setPromptSubmitted(true);
       setPromptForceSend(true);
@@ -308,28 +550,154 @@ export function Explorer() {
     }
     setPromptSubmitted(false);
     setPromptForceSend(false);
-    fetchPrompt.mutate({ name: currentPrompt.name, args: promptArgs });
+    fetchPrompt.mutate({
+      name: currentPrompt.name,
+      args: promptArgs,
+      context: {
+        serverId: currentServer.id,
+        method: "prompts_get",
+        view: "prompts",
+        target: currentPrompt.name,
+      },
+    });
+  }
+
+  function handleShortcut(
+    event: KeyboardEvent,
+    action: () => void,
+  ) {
+    if (event.repeat) return;
+    if (!(event.ctrlKey || event.metaKey) || event.key !== "Enter") return;
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) {
+      return;
+    }
+    event.preventDefault();
+    action();
+  }
+
+  function readTemplate() {
+    if (!currentTemplate || !currentServer || readRes.isPending) return;
+    if (missingTemplateVars.length > 0) return;
+    readRes.mutate({
+      uri: resolvedTemplateUri,
+      context: {
+        serverId: currentServer.id,
+        method: "resources_read",
+        view: "templates",
+        target: currentTemplate.uri_template,
+        resolvedTarget: resolvedTemplateUri,
+      },
+    });
+  }
+
+  function historyContextMatches(context: RecentParamsContext): boolean {
+    if (!currentServer || context.serverId !== currentServer.id) return false;
+    return (
+      (context.method === "tools_call" &&
+        viewTab === "tools" &&
+        currentTool?.name === context.target) ||
+      (context.method === "prompts_get" &&
+        viewTab === "prompts" &&
+        currentPrompt?.name === context.target)
+    );
+  }
+
+  function applyToolHistory(
+    params: Record<string, unknown>,
+    item: RecentCallParam,
+    context: RecentParamsContext,
+  ) {
+    if (!currentServer || !currentTool) return;
+    if (!historyContextMatches(context)) return;
+    const filtered = filterKnownTopLevel(currentTool.input_schema, params);
+    const previousSnapshot = toolFormRef.current?.snapshot() ?? null;
+    setToolArgs(filtered.value);
+    toolFormRef.current?.apply(filtered.value);
+    setHistoryNotice({
+      kind: "tool",
+      context,
+      label: formatDateTime(item.created_at),
+      previousSnapshot,
+      dropped: filtered.dropped,
+      unknown: filtered.unknown,
+      disallowsAdditional: filtered.disallowsAdditional,
+      empty: Object.keys(params).length === 0,
+    });
+  }
+
+  function applyPromptHistory(
+    params: Record<string, unknown>,
+    item: RecentCallParam,
+    context: RecentParamsContext,
+  ) {
+    if (!currentServer || !currentPrompt) return;
+    if (!historyContextMatches(context)) return;
+    const names = new Set(currentPrompt.arguments.map((arg) => arg.name));
+    const value: Record<string, string> = {};
+    let dropped = 0;
+    for (const [key, raw] of Object.entries(params)) {
+      if (names.has(key)) value[key] = String(raw ?? "");
+      else dropped += 1;
+    }
+    const previousArgs = promptArgs;
+    updatePromptArgs(value);
+    setHistoryNotice({
+      kind: "prompt",
+      context,
+      label: formatDateTime(item.created_at),
+      previousArgs,
+      dropped,
+      unknown: 0,
+      disallowsAdditional: false,
+      empty: Object.keys(params).length === 0,
+    });
+  }
+
+  function undoHistory() {
+    const notice = historyNotice;
+    if (!notice || !historyContextMatches(notice.context)) return;
+    if (notice.kind === "tool") {
+      if (!notice.previousSnapshot) return;
+      toolFormRef.current?.restore(notice.previousSnapshot);
+    } else {
+      updatePromptArgs(notice.previousArgs);
+    }
+    setHistoryNotice(null);
+  }
+
+  function historyNoticeMatches(): boolean {
+    return Boolean(historyNotice && historyContextMatches(historyNotice.context));
+  }
+
+  function historyNoticeDetail(notice: HistoryNotice): string | null {
+    if (notice.empty) return "该历史记录没有参数";
+    if (notice.dropped > 0) {
+      return `已忽略 ${notice.dropped} 个当前 Schema 不允许的字段`;
+    }
+    if (notice.disallowsAdditional && notice.unknown > 0) {
+      return `当前 Schema 不允许额外字段，已保留 ${notice.unknown} 个，发送可能被拒`;
+    }
+    if (notice.unknown > 0) {
+      return `有 ${notice.unknown} 个字段未在当前 Schema 声明，已按历史原样保留；可切换 JSON 模式查看`;
+    }
+    return null;
   }
 
   return (
     <section className="flex h-full flex-col">
-      <div className="mb-3 flex items-center gap-3">
+      <div className="mb-3 flex flex-wrap items-center gap-3">
         <h2 className="text-xl font-semibold text-slate-800">接口</h2>
-        <select
-          className="rounded border border-slate-200 px-2 py-1 text-sm"
+        <ServerSelect
+          servers={serverList}
           value={currentServer?.id ?? ""}
-          onChange={(e) => {
-            setServerId(e.target.value);
+          onChange={(id) => {
+            setServerId(id);
             resetCallState();
           }}
-        >
-          {(servers.data ?? []).map((server) => (
-            <option key={server.id} value={server.id}>
-              {server.name}
-              {server.state.state === "ready" ? "" : "（未连接）"}
-            </option>
-          ))}
-        </select>
+          className="rounded border border-slate-200 px-2 py-1 text-sm"
+          ariaLabel="选择服务器"
+        />
+        <ServerStatusActions key={currentServer?.id} server={currentServer} />
         <button
           type="button"
           className="rounded border border-slate-200 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
@@ -380,8 +748,9 @@ export function Explorer() {
                 : "border border-slate-200 text-slate-600 hover:bg-slate-50"
             }`}
             onClick={() => {
+              if (item.key === viewTab) return;
               setTab(item.key);
-              resetCallState();
+              clearSelectionState();
             }}
           >
             {item.label}
@@ -423,8 +792,27 @@ export function Explorer() {
       ) : !ready ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <EmptyState
-            title="服务器未连接"
-            description="切换到「服务器」页连接后即可枚举与调用接口。"
+            title={
+              currentServer.state.state === "connecting"
+                ? "服务器连接中"
+                : currentServer.state.state === "degraded"
+                  ? "服务器连接降级"
+                  : currentServer.state.state === "lost" ||
+                      currentServer.state.state === "error"
+                    ? "服务器连接不可用"
+                    : "服务器未连接"
+            }
+            description={
+              currentServer.state.state === "connecting"
+                ? "正在连接服务器，请稍候…"
+                : currentServer.state.state === "degraded"
+                  ? "连接已降级，请点击顶部「重连」恢复后继续。"
+                  : currentServer.state.state === "lost"
+                    ? "连接已掉线，请点击顶部「重连」恢复后继续。"
+                    : currentServer.state.state === "error"
+                      ? "连接出错，请点击顶部「重连」或前往「服务器」页查看详情。"
+                      : "请点击顶部「连接」，或前往「服务器」页连接后继续。"
+            }
           />
         </div>
       ) : capabilities.isLoading ? (
@@ -449,10 +837,7 @@ export function Explorer() {
                       ? "bg-slate-100"
                       : "hover:bg-slate-50"
                   }`}
-                  onClick={() => {
-                    resetCallState();
-                    setSelected(item.key);
-                  }}
+                  onClick={() => selectItem(item.key)}
                 >
                   <div className="truncate text-slate-800">{item.title}</div>
                   {item.subtitle ? (
@@ -465,14 +850,26 @@ export function Explorer() {
             )}
           </div>
 
-          <div className="min-w-0 flex-1 space-y-3 overflow-y-auto">
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            <div
+              className={
+                resultMatches
+                  ? "min-h-0 flex-[3] space-y-3 overflow-y-auto pr-1"
+                  : "min-h-0 flex-1 space-y-3 overflow-y-auto pr-1"
+              }
+            >
             {!viewSelected ? (
               <EmptyState
                 title="选择一个接口"
                 description="左侧列表选择后在此发起调用。"
               />
             ) : viewTab === "tools" && currentTool ? (
-              <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+              <div
+                className="space-y-3 rounded-lg border border-slate-200 bg-white p-4"
+                onKeyDown={(event) =>
+                  handleShortcut(event, () => submitTool(false))
+                }
+              >
                 <div>
                   <div className="flex items-center gap-2">
                     <div className="text-sm font-medium text-slate-800">
@@ -482,7 +879,9 @@ export function Explorer() {
                       type="button"
                       className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
                       onClick={() =>
-                        navigate(`/tests?target=${encodeURIComponent(currentTool.name)}`)
+                        navigate(
+                          `/tests?target=${encodeURIComponent(currentTool.name)}`,
+                        )
                       }
                     >
                       生成用例
@@ -512,16 +911,49 @@ export function Explorer() {
                   schema={currentTool.input_schema}
                   initial={toolArgs}
                   onChange={handleToolArgsChange}
+                  onDirty={() => setHistoryNotice(null)}
                 />
-                <div className="flex flex-wrap items-center gap-2">
+                {historyNoticeMatches() && historyNotice ? (
+                  <div className="flex flex-wrap items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
+                    <span>
+                      已载入 {historyNotice.label} 的参数
+                      {historyNoticeDetail(historyNotice)
+                        ? `（${historyNoticeDetail(historyNotice)}）`
+                        : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="rounded border border-sky-200 bg-white px-2 py-0.5 text-[11px] hover:bg-sky-100 disabled:opacity-40"
+                      disabled={
+                        historyNotice.kind === "tool" &&
+                        !historyNotice.previousSnapshot
+                      }
+                      onClick={undoHistory}
+                    >
+                      撤销
+                    </button>
+                  </div>
+                ) : null}
+                <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-t border-slate-100 bg-white/95 px-4 py-2 backdrop-blur">
                   <button
                     type="button"
                     className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
                     disabled={sendTool.isPending}
+                    aria-keyshortcuts="Control+Enter Meta+Enter"
+                    title="发送调用（Ctrl+Enter）"
                     onClick={() => submitTool(false)}
                   >
                     {sendTool.isPending ? "调用中…" : "发送调用"}
                   </button>
+                  <RecentParamsButton
+                    key={`${currentServer.id}:tools_call:${currentTool.name}`}
+                    context={{
+                      serverId: currentServer.id,
+                      method: "tools_call",
+                      target: currentTool.name,
+                    }}
+                    onApply={applyToolHistory}
+                  />
                   {toolForceSend ? (
                     <button
                       type="button"
@@ -538,7 +970,9 @@ export function Explorer() {
                       type="button"
                       className="rounded border border-slate-200 px-3 py-1.5 text-sm hover:bg-slate-50"
                       onClick={() => {
-                        void cancelCall(currentServer.id, inFlightId);
+                        void cancelCall(currentServer.id, inFlightId).catch(
+                          (error) => toast.fromError(error, "取消失败"),
+                        );
                       }}
                     >
                       取消
@@ -560,7 +994,17 @@ export function Explorer() {
                   type="button"
                   className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
                   disabled={readRes.isPending}
-                  onClick={() => readRes.mutate(viewSelected)}
+                  onClick={() =>
+                    readRes.mutate({
+                      uri: viewSelected,
+                      context: {
+                        serverId: currentServer.id,
+                        method: "resources_read",
+                        view: "resources",
+                        target: viewSelected,
+                      },
+                    })
+                  }
                 >
                   {readRes.isPending ? "读取中…" : "读取资源"}
                 </button>
@@ -597,10 +1041,10 @@ export function Explorer() {
                         }`}
                         value={viewTemplateVars[name] ?? ""}
                         onChange={(e) =>
-                          setTemplateVars((prev) => ({
-                            ...prev,
+                          updateTemplateVars({
+                            ...viewTemplateVars,
                             [name]: e.target.value,
-                          }))
+                          })
                         }
                       />
                     </label>
@@ -615,20 +1059,23 @@ export function Explorer() {
                   type="button"
                   className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
                   disabled={readRes.isPending || missingTemplateVars.length > 0}
-                  onClick={() => {
-                    const uri = templateNames.reduce(
-                      (acc, name) =>
-                        acc.replace(`{${name}}`, viewTemplateVars[name] ?? ""),
-                      currentTemplate.uri_template,
-                    );
-                    readRes.mutate(uri);
-                  }}
+                  onClick={readTemplate}
                 >
                   {readRes.isPending ? "读取中…" : "生成 URI 并读取"}
                 </button>
+                {resolvedTemplateUri ? (
+                  <div className="break-all text-[11px] text-slate-400">
+                    即将读取：{resolvedTemplateUri}
+                  </div>
+                ) : null}
               </div>
             ) : viewTab === "prompts" && currentPrompt ? (
-              <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+              <div
+                className="space-y-3 rounded-lg border border-slate-200 bg-white p-4"
+                onKeyDown={(event) =>
+                  handleShortcut(event, () => submitPrompt(false))
+                }
+              >
                 <div className="text-sm font-medium text-slate-800">
                   {currentPrompt.name}
                 </div>
@@ -664,13 +1111,12 @@ export function Explorer() {
                             : "border-slate-200"
                         }`}
                         value={String(promptArgs[arg.name] ?? "")}
-                        onChange={(e) => {
-                          setPromptArgs((prev) => ({
-                            ...prev,
+                        onChange={(e) =>
+                          updatePromptArgs({
+                            ...promptArgs,
                             [arg.name]: e.target.value,
-                          }));
-                          setPromptForceSend(false);
-                        }}
+                          })
+                        }
                       />
                     </label>
                   );
@@ -680,15 +1126,43 @@ export function Explorer() {
                     缺少必填参数：{missingPromptArgs.join("、")}
                   </div>
                 ) : null}
-                <div className="flex flex-wrap items-center gap-2">
+                {historyNoticeMatches() && historyNotice ? (
+                  <div className="flex flex-wrap items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
+                    <span>
+                      已载入 {historyNotice.label} 的参数
+                      {historyNoticeDetail(historyNotice)
+                        ? `（${historyNoticeDetail(historyNotice)}）`
+                        : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="rounded border border-sky-200 bg-white px-2 py-0.5 text-[11px] hover:bg-sky-100"
+                      onClick={undoHistory}
+                    >
+                      撤销
+                    </button>
+                  </div>
+                ) : null}
+                <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-t border-slate-100 bg-white/95 px-4 py-2 backdrop-blur">
                   <button
                     type="button"
                     className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
                     disabled={fetchPrompt.isPending}
+                    aria-keyshortcuts="Control+Enter Meta+Enter"
+                    title="获取提示词（Ctrl+Enter）"
                     onClick={() => submitPrompt(false)}
                   >
                     {fetchPrompt.isPending ? "获取中…" : "获取提示词"}
                   </button>
+                  <RecentParamsButton
+                    key={`${currentServer.id}:prompts_get:${currentPrompt.name}`}
+                    context={{
+                      serverId: currentServer.id,
+                      method: "prompts_get",
+                      target: currentPrompt.name,
+                    }}
+                    onApply={applyPromptHistory}
+                  />
                   {promptForceSend ? (
                     <button
                       type="button"
@@ -732,12 +1206,87 @@ export function Explorer() {
               </div>
             )}
 
-            {result ? <ResultViewer record={result} /> : null}
+            </div>
+
+            {result && !resultMatches ? (
+              <div className="shrink-0 flex flex-wrap items-center gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                <span>
+                  上一次调用结果属于 {viewLabel(resultContext?.view ?? "tools")}「
+                  {resultContext?.resolvedTarget ??
+                    resultContext?.target ??
+                    result.target}
+                  」，已切换接口，未在此处展示。
+                </span>
+                <button
+                  type="button"
+                  className="rounded border border-amber-300 bg-white px-2 py-0.5 text-[11px] hover:bg-amber-100"
+                  onClick={clearResultState}
+                >
+                  清除
+                </button>
+              </div>
+            ) : null}
+
+            {result && resultMatches ? (
+              <div
+                className={
+                  resultCollapsed || eventPanelOpen
+                    ? "shrink-0 overflow-hidden rounded-lg border border-slate-200 bg-white"
+                    : "flex min-h-[140px] flex-[2] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white"
+                }
+              >
+                <button
+                  type="button"
+                  className="flex shrink-0 items-center gap-2 border-b border-slate-100 px-3 py-1.5 text-left text-xs text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-70"
+                  aria-expanded={!resultCollapsed && !eventPanelOpen}
+                  disabled={eventPanelOpen}
+                  title={
+                    eventPanelOpen
+                      ? "关闭事件面板后查看结果"
+                      : resultCollapsed
+                        ? "展开结果"
+                        : "收起结果"
+                  }
+                  onClick={() =>
+                    setResultCollapsed((current) => !current)
+                  }
+                >
+                  <span>
+                    结果 ·{" "}
+                    {result.status === "ok"
+                      ? "成功"
+                      : result.status === "error"
+                        ? "失败"
+                        : "取消"}{" "}
+                    · {result.duration_ms}ms
+                  </span>
+                  <span className="ml-auto text-slate-400">
+                    {eventPanelOpen
+                      ? "关闭事件面板后查看"
+                      : resultCollapsed
+                        ? "展开"
+                        : "收起"}
+                  </span>
+                </button>
+                {resultCollapsed || eventPanelOpen ? null : (
+                  <div className="min-h-0 flex-1" aria-live="polite">
+                    <ResultViewer fill record={result} />
+                  </div>
+                )}
+              </div>
+            ) : null}
           </div>
         </div>
       )}
       {currentServer ? (
-        <EventPanel key={currentServer.id} serverId={currentServer.id} />
+        <EventPanel
+          key={currentServer.id}
+          serverId={currentServer.id}
+          onOpenChange={(open) => {
+            setEventPanelServerId(open ? currentServer.id : null);
+            if (open) setResultCollapsed(true);
+          }}
+        />
       ) : null}
     </section>
   );

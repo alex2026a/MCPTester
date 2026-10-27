@@ -3,7 +3,7 @@
  *
  * 三页签：渲染（MCP 语义）/ 结构（可折叠树）/ 原文（高亮 + 虚拟滚动）。
  * 统一工具栏：搜索（计数 + 上下跳 + 结构视图匹配列表）、展开层级、换行、
- * Markdown、复制全部、全屏、大小与截断提示。
+ * Markdown、复制、全屏、大小与截断提示。
  */
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
@@ -36,8 +36,14 @@ export interface MessageViewerProps {
   /** 限制可用页签（如报文详情只要结构/原文） */
   tabs?: MessageTab[];
   showToolbar?: boolean;
+  /** 工具栏复制按钮文案；默认“复制全部” */
+  copyLabel?: string;
+  /** 是否显示工具栏复制按钮；默认 true（结果区由外层复制菜单接管） */
+  showCopy?: boolean;
   /** 结构 / 原文滚动容器样式 */
   contentClassName?: string;
+  /** 在固定高度容器内铺满（Explorer 分栏结果区） */
+  fill?: boolean;
   /** 截断出口：打开完整结果 */
   onOpenFullResult?: () => void;
   /** 截断出口：在文件夹中显示 */
@@ -59,7 +65,10 @@ export function MessageViewer({
   defaultTab,
   tabs,
   showToolbar = true,
+  copyLabel = "复制全部",
+  showCopy = true,
   contentClassName = "max-h-80 overflow-auto",
+  fill = false,
   onOpenFullResult,
   onRevealFullResult,
 }: MessageViewerProps) {
@@ -169,7 +178,11 @@ export function MessageViewer({
   const rawTruncated = rawText.length > MAX_RAW_PREVIEW;
 
   const toolbar = showToolbar ? (
-    <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-100 px-2 py-1.5 text-xs">
+    <div
+      className={`flex flex-wrap items-center gap-1.5 border-b border-slate-100 px-2 py-1.5 text-xs ${
+        fill ? "shrink-0" : ""
+      }`}
+    >
       <div className="flex items-center gap-1">
         {availableTabs.map((item) => (
           <button
@@ -336,13 +349,15 @@ export function MessageViewer({
         </button>
       ) : null}
 
-      <button
-        type="button"
-        className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-50"
-        onClick={() => void copyAll()}
-      >
-        {copiedAll ? "已复制" : "复制全部"}
-      </button>
+      {showCopy ? (
+        <button
+          type="button"
+          className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-50"
+          onClick={() => void copyAll()}
+        >
+          {copiedAll ? "已复制" : copyLabel}
+        </button>
+      ) : null}
       <button
         type="button"
         className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-50"
@@ -356,7 +371,15 @@ export function MessageViewer({
   let body: ReactNode;
   if (tab === "rendered" && mcpView) {
     body = (
-      <div className={`${fullscreen ? "max-h-[calc(100vh-150px)]" : contentClassName} p-2`}>
+      <div
+        className={`${
+          fullscreen
+            ? "max-h-[calc(100vh-150px)]"
+            : fill
+              ? "h-full overflow-auto"
+              : contentClassName
+        } p-2`}
+      >
         <McpContentView view={mcpView} markdown={markdown} errorTone={errorTone} />
       </div>
     );
@@ -369,14 +392,21 @@ export function MessageViewer({
         onMatchCountChange={handleMatchCount}
         onMatchesChange={handleTreeMatches}
         expandDepth={expandDepth}
-        className={fullscreen ? "max-h-[calc(100vh-150px)]" : contentClassName}
+        fill={fill}
+        className={
+          fullscreen
+            ? "max-h-[calc(100vh-150px)]"
+            : fill
+              ? "h-full"
+              : contentClassName
+        }
       />
     );
   } else {
     body = (
-      <div className="flex min-h-0 flex-col">
+      <div className={`flex min-h-0 flex-col ${fill ? "h-full" : ""}`}>
         {rawTruncated ? (
-          <div className="border-b border-amber-100 bg-amber-50 px-2 py-1 text-[10px] text-amber-700">
+          <div className="shrink-0 border-b border-amber-100 bg-amber-50 px-2 py-1 text-[10px] text-amber-700">
             原文超过 2MB，仅显示前 2MB（复制全部仍为完整内容）。
           </div>
         ) : null}
@@ -386,7 +416,13 @@ export function MessageViewer({
           activeMatch={activeMatch}
           onMatchCountChange={handleMatchCount}
           wrap={wrap}
-          className={fullscreen ? "max-h-[calc(100vh-170px)]" : contentClassName}
+          className={
+            fullscreen
+              ? "max-h-[calc(100vh-170px)]"
+              : fill
+                ? "min-h-0 flex-1 overflow-auto"
+                : contentClassName
+          }
         />
       </div>
     );
@@ -397,11 +433,13 @@ export function MessageViewer({
       className={
         fullscreen
           ? "flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white text-xs"
-          : "rounded border border-slate-200 bg-white text-xs"
+          : fill
+            ? "flex h-full min-h-0 flex-col overflow-hidden rounded border border-slate-200 bg-white text-xs"
+            : "rounded border border-slate-200 bg-white text-xs"
       }
     >
       {toolbar}
-      {body}
+      {fill ? <div className="min-h-0 flex-1">{body}</div> : body}
     </div>
   );
 
