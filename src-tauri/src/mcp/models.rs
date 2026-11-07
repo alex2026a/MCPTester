@@ -98,6 +98,9 @@ pub struct OAuthConfig {
     /// 容忍元数据缺少 issuer（仅兼容不规范服务器）
     #[serde(default)]
     pub allow_missing_issuer: bool,
+    /// 显式允许 OAuth 使用明文 HTTP（资源与授权服务器端点，危险）
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     /// 授权请求额外参数（v0.3.1）；只追加到 authorization request
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authorize_params: Vec<OAuthParam>,
@@ -340,7 +343,20 @@ impl CallStatus {
     }
 }
 
-/// 单次调用的 JSON-RPC 原始帧（脱敏/截断前采集）
+/// 旧世代服务器发起的输入请求/应答（v0.6.0 P0）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServerInput {
+    /// 目前只有 "elicitation"
+    pub kind: String,
+    pub request: serde_json::Value,
+    pub response: Option<serde_json::Value>,
+    pub at: DateTime<Utc>,
+    /// 单条输入超过预算被裁剪
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// 单次调用的原始 JSON-RPC 帧（脱敏/截断前采集）
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CallFrames {
     /// 线上 JSON-RPC id，保留 number / string 类型
@@ -348,6 +364,38 @@ pub struct CallFrames {
     pub request: Option<serde_json::Value>,
     pub response: Option<serde_json::Value>,
     /// 任一帧因超限/异常未保存
+    pub truncated: bool,
+}
+
+/// MRTR 的一轮请求/响应（v0.6.0）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CallRound {
+    /// 1-based 轮次
+    pub round: u32,
+    /// 线上 JSON-RPC id，保留 number / string 类型
+    pub rpc_id: Option<serde_json::Value>,
+    pub request: Option<serde_json::Value>,
+    pub response: Option<serde_json::Value>,
+    /// 该轮服务器要求的输入（`input_required.inputRequests`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_requests: Option<serde_json::Value>,
+    /// 该轮客户端提交的输入（`inputResponses`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_responses: Option<serde_json::Value>,
+    /// 该轮帧因超限/淘汰未保存
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// 一次调用的多轮记录与旧世代服务器输入（v0.6.0）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CallRounds {
+    pub rounds: Vec<CallRound>,
+    /// 旧世代 elicitation 的请求/响应
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_inputs: Vec<ServerInput>,
+    /// 任一帧/输入因预算被裁剪
+    #[serde(default)]
     pub truncated: bool,
 }
 
@@ -373,6 +421,9 @@ pub struct CallRecord {
     /// 原始 JSON-RPC 帧；旧记录/不支持的方法为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<CallFrames>,
+    /// MRTR 多轮与旧世代服务器输入；简单调用为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<CallRounds>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -401,6 +452,9 @@ pub struct OAuthSummary {
     pub refreshable: bool,
     pub scopes: Vec<String>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// 该服务器显式允许明文 HTTP（列表警示用）
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     /// 403 insufficient_scope 的 required_scope（v0.3.1）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_scope: Option<String>,

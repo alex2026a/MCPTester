@@ -52,6 +52,8 @@ function isSensitiveKey(key: string): boolean {
   return SENSITIVE_KEYS.has(normalizeKey(key));
 }
 
+export { isSensitiveKey };
+
 export function looksLikeSecret(value: string): boolean {
   const text = value.trim();
   return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(text));

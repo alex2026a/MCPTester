@@ -79,7 +79,7 @@ const KIND_META: Record<string, { title: string; hint: string }> = {
   },
   oauth_metadata: {
     title: "OAuth 元数据发现失败",
-    hint: "确认服务器支持 OAuth；不规范的服务可在高级项手工填写授权/token/注册端点。",
+    hint: "确认服务器支持 OAuth；使用私有 IP 的授权服务器可能被自动发现的安全策略拦截，可在高级项手工填写授权/token/注册端点与 issuer；如确需明文 HTTP，勾选「允许明文 HTTP」。",
   },
   oauth_registration: {
     title: "OAuth 客户端注册失败",

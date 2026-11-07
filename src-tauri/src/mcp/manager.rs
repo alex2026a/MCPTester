@@ -9,6 +9,7 @@ use rmcp::transport::auth::AuthorizationManager;
 
 use super::connection::ConnectionHandle;
 use super::error::McpError;
+use super::input::{InputBroker, UiInputHandler};
 use super::models::{RuntimeSettings, ServerConfig, TransportKind};
 use super::oauth::AuthStateSink;
 
@@ -17,6 +18,7 @@ pub struct ConnectionManager {
     settings: RuntimeSettings,
     connections: Mutex<HashMap<String, Arc<ConnectionHandle>>>,
     auth_state: Option<Arc<dyn AuthStateSink>>,
+    input: Arc<InputBroker>,
 }
 
 impl ConnectionManager {
@@ -25,7 +27,13 @@ impl ConnectionManager {
             settings,
             connections: Mutex::new(HashMap::new()),
             auth_state,
+            input: Arc::new(InputBroker::new()),
         }
+    }
+
+    /// 应用级输入挂起表（Tauri 事件与命令共用）
+    pub fn input(&self) -> &Arc<InputBroker> {
+        &self.input
     }
 
     /// 当前生效的运行时设置
@@ -44,12 +52,13 @@ impl ConnectionManager {
         if let Some(existing) = guard.get(&config.id) {
             return Arc::clone(existing);
         }
-        let handle = ConnectionHandle::new(
+        let handle = ConnectionHandle::new_with_input(
             config.id.clone(),
             config.name.clone(),
             config.protocol_version_pin.clone(),
             config.transport.clone(),
             self.settings.clone(),
+            Arc::new(UiInputHandler::new(Arc::clone(&self.input))),
         );
         if let Some(sink) = &self.auth_state {
             handle.set_auth_state_sink(Arc::clone(sink)).await;

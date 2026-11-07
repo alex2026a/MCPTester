@@ -695,6 +695,7 @@ fn failure_label(kind: &FailureKind) -> &'static str {
         FailureKind::Timeout => "超时",
         FailureKind::ServerUnhealthy => "服务不健康",
         FailureKind::CaseInvalid => "用例无效",
+        FailureKind::InputRequired => "需要交互输入",
         FailureKind::Unknown => "未知",
     }
 }

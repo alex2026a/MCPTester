@@ -71,9 +71,11 @@ pub fn run() {
                 RuntimeSettings::default(),
                 Some(oauth.clone()),
             ));
+            let input = manager.input().clone();
             let state = AppState {
                 db,
                 manager,
+                input,
                 oauth,
                 data_dir: paths.data_dir.clone(),
                 log_dir: paths.log_dir.clone(),
@@ -151,6 +153,9 @@ pub fn run() {
             commands::call::read_resource,
             commands::call::get_prompt,
             commands::call::cancel_call,
+            commands::input::respond_input,
+            commands::input::cancel_input,
+            commands::input::list_pending_inputs,
             commands::call::probe_server,
             commands::history::list_call_records,
             commands::history::list_recent_call_params,

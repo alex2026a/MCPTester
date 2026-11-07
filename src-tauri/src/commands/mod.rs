@@ -6,6 +6,7 @@ pub mod capability;
 pub mod events;
 pub mod history;
 pub mod import_export;
+pub mod input;
 pub mod oauth;
 pub mod server;
 pub mod settings;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::mcp::ConnectionManager;
+use crate::mcp::input::InputBroker;
 use crate::mcp::oauth::OAuthService;
 use crate::storage::Database;
 
@@ -23,6 +25,8 @@ use crate::storage::Database;
 pub struct AppState {
     pub db: Database,
     pub manager: Arc<ConnectionManager>,
+    /// 交互输入挂起表（v0.6.0）
+    pub input: Arc<InputBroker>,
     /// OAuth 登录/凭据服务（v0.3.0）
     pub oauth: Arc<OAuthService>,
     /// 数据目录（results/ 落盘、导出默认路径）

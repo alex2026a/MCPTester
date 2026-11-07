@@ -16,6 +16,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, MIGRATION_0005),
     (6, MIGRATION_0006),
     (7, MIGRATION_0007),
+    (8, MIGRATION_0008),
 ];
 
 /// 执行所有未应用的迁移
@@ -261,6 +262,13 @@ ALTER TABLE call_records ADD COLUMN response_frame_json TEXT;
 ALTER TABLE call_records ADD COLUMN frames_truncated INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// 迁移 0008：MRTR 多轮记录（v0.6.0）
+///
+/// 单列 JSON；旧记录保持 NULL。旧世代 `server_inputs` 也放在同一个 JSON 里。
+const MIGRATION_0008: &str = r#"
+ALTER TABLE call_records ADD COLUMN rounds_json TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,7 +283,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         // transport 约束生效（非法值应失败）
         let insert_err = conn.execute(
@@ -323,7 +331,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -361,7 +369,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -390,7 +398,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let ref_value: String = conn
             .query_row(
                 "SELECT ref FROM credentials WHERE server_id = 's1' AND kind = 'header'",
@@ -464,8 +472,49 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_v6_to_v7_adds_frame_columns_and_keeps_old_record() {
+    fn upgrade_v7_to_v8_adds_rounds_column_and_keeps_old_record() {
         let mut conn = Connection::open_in_memory().expect("内存库打开失败");
+        for sql in [
+            MIGRATION_0001,
+            MIGRATION_0002,
+            MIGRATION_0003,
+            MIGRATION_0004,
+            MIGRATION_0005,
+            MIGRATION_0006,
+            MIGRATION_0007,
+        ] {
+            conn.execute_batch(sql).expect("迁移失败");
+        }
+        conn.pragma_update(None, "user_version", 7)
+            .expect("版本设置失败");
+        conn.execute(
+            "INSERT INTO call_records
+                (id, server_id, server_name, method, target, params_json, status, duration_ms,
+                 protocol_version, transport, size_bytes, origin, created_at)
+             VALUES ('v7-1', 's1', 'demo', 'tools_call', 'echo', '{}', 'ok', 1,
+                     '2026-07-28', 'stdio', 0, 'manual', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("旧记录插入失败");
+
+        run(&mut conn).expect("升级失败");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+
+        let rounds: Option<String> = conn
+            .query_row(
+                "SELECT rounds_json FROM call_records WHERE id = 'v7-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("旧记录丢失");
+        assert_eq!(rounds, None);
+    }
+
+    #[test]
+    fn upgrade_v6_to_v7_adds_frame_columns_and_keeps_old_record() {        let mut conn = Connection::open_in_memory().expect("内存库打开失败");
         for sql in [
             MIGRATION_0001,
             MIGRATION_0002,
@@ -492,7 +541,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let row: (String, Option<String>, Option<String>, Option<String>, i64) = conn
             .query_row(
@@ -526,7 +575,7 @@ mod tests {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
     }
 }

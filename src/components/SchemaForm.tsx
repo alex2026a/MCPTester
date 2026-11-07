@@ -15,6 +15,7 @@ import {
   validateAgainstSchema,
   type SchemaObject,
 } from "../lib/schema";
+import { isSensitiveKey } from "../lib/sensitive";
 
 export type SchemaValidation = {
   /** 当前表单/JSON 文本对应的参数 */
@@ -76,6 +77,7 @@ export function SchemaForm({
   onChange,
   onDirty,
   initial,
+  maskSensitive = false,
   ref,
 }: {
   schema: unknown;
@@ -84,6 +86,8 @@ export function SchemaForm({
   onDirty?: () => void;
   /** 预填参数（重放场景） */
   initial?: Record<string, unknown> | null;
+  /** 表单模式把敏感字段渲染为 password（JSON 模式不掩码） */
+  maskSensitive?: boolean;
   ref?: Ref<SchemaFormHandle>;
 }) {
   const root = useMemo(() => (schema ?? {}) as SchemaObject, [schema]);
@@ -401,7 +405,8 @@ export function SchemaForm({
                 />
               ) : control === "string" ? (
                 <input
-                  type="text"
+                  type={maskSensitive && isSensitiveKey(key) ? "password" : "text"}
+                  autoComplete={maskSensitive && isSensitiveKey(key) ? "off" : undefined}
                   aria-label={key}
                   aria-required={required || undefined}
                   aria-invalid={showMissing || undefined}

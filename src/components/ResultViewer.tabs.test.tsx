@@ -47,6 +47,116 @@ afterEach(() => {
 });
 
 describe("ResultViewer 请求/响应页签", () => {
+  it("MRTR 记录默认最后一轮，可切到中间轮", async () => {
+    const recordWithRounds = record({
+      rounds: {
+        rounds: [
+          {
+            round: 1,
+            rpc_id: 1,
+            request: {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "echo", arguments: { text: "hi" } },
+            },
+            response: {
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                resultType: "input_required",
+                inputRequests: { name: { method: "elicitation/create" } },
+              },
+            },
+            input_requests: { name: { method: "elicitation/create" } },
+            input_responses: {
+              name: { action: "accept", content: { name: "Ada" } },
+            },
+            truncated: false,
+          },
+          {
+            round: 2,
+            rpc_id: 2,
+            request: {
+              jsonrpc: "2.0",
+              id: 2,
+              method: "tools/call",
+              params: { name: "echo", arguments: { text: "hi" } },
+            },
+            response: {
+              jsonrpc: "2.0",
+              id: 2,
+              result: { content: [{ type: "text", text: "echo: hi" }] },
+            },
+            truncated: false,
+          },
+        ],
+        truncated: false,
+      },
+    });
+    render(<ResultViewer record={recordWithRounds} />);
+
+    const selector = screen.getByRole("combobox", { name: "轮次" });
+    expect(selector).toHaveValue("1");
+    expect(screen.getByText("echo: hi")).toBeInTheDocument();
+
+    await userEvent.selectOptions(selector, "0");
+    expect(await screen.findByText(/该轮为等待输入/)).toBeInTheDocument();
+    expect(screen.getByText("原始响应帧")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "复制响应" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(writeText.mock.calls[0][0])).toMatchObject({
+      result: { resultType: "input_required" },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "请求" }));
+    expect(
+      screen.getByRole("button", { name: "复制请求" }),
+    ).toBeEnabled();
+  });
+
+  it("旧世代服务器输入有独立页签", async () => {
+    render(
+      <ResultViewer
+        record={record({
+          rounds: {
+            rounds: [
+              {
+                round: 1,
+                rpc_id: 1,
+                request: {
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "tools/call",
+                  params: { name: "echo", arguments: {} },
+                },
+                response: { jsonrpc: "2.0", id: 1, result: {} },
+                truncated: false,
+              },
+            ],
+            server_inputs: [
+              {
+                kind: "elicitation",
+                request: {
+                  method: "elicitation/create",
+                  params: { message: "请输入测试值" },
+                },
+                response: { action: "accept", content: { value: "ok" } },
+                at: "2026-10-29T00:00:00Z",
+              },
+            ],
+            truncated: false,
+          },
+        })}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "输入（1）" }));
+    expect(await screen.findByText("旧世代输入 #1")).toBeInTheDocument();
+    expect(screen.getAllByText("elicitation").length).toBeGreaterThan(0);
+  });
+
   it("默认响应页，可切换到请求页", async () => {
     render(<ResultViewer record={record()} />);
     expect(screen.getByRole("button", { name: "响应" })).toHaveAttribute(

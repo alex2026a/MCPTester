@@ -15,9 +15,9 @@ import { buildRequestEnvelope } from "../lib/exchange";
 import { confirmLargeResultRead } from "../lib/largeResult";
 import { getFullResultPath, readFullResult } from "../api/history";
 import { toast } from "../stores/toast";
-import type { CallRecord } from "../types/models";
+import type { CallFrames, CallRecord } from "../types/models";
 
-type ResultTab = "response" | "request";
+type ResultTab = "response" | "request" | "input";
 
 const STATUS: Record<string, { text: string; className: string }> = {
   ok: { text: "成功", className: "text-emerald-600" },
@@ -44,18 +44,40 @@ function ResultViewerBody({
   record: CallRecord;
   fill: boolean;
 }) {
+  const rounds = record.rounds?.rounds ?? null;
+  const serverInputs = record.rounds?.server_inputs ?? [];
   const [activeTab, setActiveTab] = useState<ResultTab>("response");
-  const requestEnvelope = buildRequestEnvelope(record, record.frames);
+  const [roundIndex, setRoundIndex] = useState(() =>
+    rounds ? Math.max(0, rounds.length - 1) : 0,
+  );
+  const safeRoundIndex = rounds
+    ? Math.min(roundIndex, Math.max(0, rounds.length - 1))
+    : 0;
+  const currentRound = rounds ? rounds[safeRoundIndex] : null;
+  const isFinalRound = !rounds || safeRoundIndex >= rounds.length - 1;
+  const currentFrames: CallFrames | null = currentRound
+    ? {
+        rpc_id: currentRound.rpc_id,
+        request: currentRound.request,
+        response: currentRound.response,
+        truncated: currentRound.truncated,
+      }
+    : (record.frames ?? null);
+  const requestEnvelope = buildRequestEnvelope(record, currentFrames);
   const requestAvailable = requestEnvelope !== null;
   const tab: ResultTab =
-    activeTab === "request" && requestAvailable ? "request" : "response";
+    activeTab === "request" && requestAvailable
+      ? "request"
+      : activeTab === "input" && serverInputs.length > 0
+        ? "input"
+        : "response";
   const frameCount =
-    Number(Boolean(record.frames?.request)) +
-    Number(Boolean(record.frames?.response));
+    Number(Boolean(currentFrames?.request)) +
+    Number(Boolean(currentFrames?.response));
   const frameBadge =
-    frameCount === 2 && !record.frames?.truncated
+    frameCount === 2 && !currentFrames?.truncated
       ? { text: "原始帧", className: "text-emerald-600" }
-      : frameCount > 0 || record.frames?.truncated
+      : frameCount > 0 || currentFrames?.truncated
         ? { text: "部分原始", className: "text-amber-600" }
         : { text: "按记录重建", className: "text-slate-400" };
   const isError = record.status === "error";
@@ -115,7 +137,10 @@ function ResultViewerBody({
           <CopyExchangeButton
             key={record.id}
             record={record}
-            primaryAction={tab}
+            frames={currentFrames}
+            rounds={rounds}
+            roundIndex={safeRoundIndex}
+            primaryAction={tab === "request" ? "request" : "response"}
           />
           {record.truncated ? (
             <span className="rounded bg-amber-100 px-1 py-0.5 text-[10px] text-amber-700">
@@ -161,10 +186,44 @@ function ResultViewerBody({
         >
           请求
         </button>
+        {serverInputs.length > 0 ? (
+          <button
+            type="button"
+            className={`rounded px-2 py-0.5 ${
+              tab === "input"
+                ? "bg-slate-800 text-white"
+                : "border border-slate-200 text-slate-600 hover:bg-slate-50"
+            }`}
+            aria-pressed={tab === "input"}
+            onClick={() => setActiveTab("input")}
+          >
+            输入（{serverInputs.length}）
+          </button>
+        ) : null}
+        {rounds && rounds.length > 1 ? (
+          <label className="ml-1 flex items-center gap-1 text-[10px] text-slate-500">
+            轮次
+            <select
+              aria-label="轮次"
+              className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px]"
+              value={safeRoundIndex}
+              onChange={(event) => {
+                setRoundIndex(Number(event.target.value));
+                setShowRawResponse(false);
+              }}
+            >
+              {rounds.map((round, index) => (
+                <option key={round.round} value={index}>
+                  第 {round.round} 轮
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
         <span
           className={`ml-1 text-[10px] ${frameBadge.className}`}
           title={
-            record.frames?.truncated
+            currentFrames?.truncated
               ? "部分原始帧超限或解析失败，已回退重建"
               : frameCount > 0
                 ? "请求/响应来自线上 JSON-RPC 原始帧"
@@ -173,7 +232,7 @@ function ResultViewerBody({
         >
           {frameBadge.text}
         </span>
-        {tab === "response" && record.frames?.response ? (
+        {tab === "response" && currentFrames?.response ? (
           <button
             type="button"
             className="ml-auto rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-50"
@@ -184,7 +243,7 @@ function ResultViewerBody({
         ) : null}
       </div>
 
-      {tab === "response" && isError && record.error ? (
+      {tab === "response" && isFinalRound && isError && record.error ? (
         <div className="mb-2 flex shrink-0 items-start gap-2 rounded border border-red-200 bg-white/70 p-2 text-xs text-red-700">
           {record.error.kind ? (
             <span className="shrink-0 rounded bg-red-100 px-1 py-0.5 font-mono text-[10px]">
@@ -202,7 +261,7 @@ function ResultViewerBody({
         </div>
       ) : null}
 
-      {tab === "response" && record.truncated ? (
+      {tab === "response" && isFinalRound && record.truncated ? (
         <div className="mb-2 flex shrink-0 flex-wrap items-center gap-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-700">
           <span>结果超过 1MB，已截断入库；完整内容已落盘。</span>
           <button
@@ -223,26 +282,45 @@ function ResultViewerBody({
         </div>
       ) : null}
 
+      {tab === "response" && !isFinalRound ? (
+        <div className="mb-2 shrink-0 rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] text-sky-700">
+          该轮为等待输入；最终结果见第 {rounds?.[rounds.length - 1]?.round ?? "?"} 轮。
+        </div>
+      ) : null}
+
       <div
         className={tab === "response" && fill ? "min-h-0 flex-1" : undefined}
         hidden={tab !== "response"}
       >
-        {hasResult ? (
+        {isFinalRound ? (
+          hasResult ? (
+            <MessageViewer
+              key={`${record.id}:response`}
+              value={record.result}
+              method={record.method}
+              sizeBytes={record.size_bytes}
+              truncated={record.truncated}
+              onOpenFullResult={record.truncated ? openFull : undefined}
+              onRevealFullResult={record.truncated ? reveal : undefined}
+              showCopy={false}
+              fill={fill}
+              contentClassName={fill ? undefined : "max-h-96 overflow-auto"}
+            />
+          ) : record.status === "canceled" ? (
+            <div className="text-xs text-slate-400">调用已取消，无结果。</div>
+          ) : null
+        ) : currentFrames?.response ? (
           <MessageViewer
-            key={record.id}
-            value={record.result}
-            method={record.method}
-            sizeBytes={record.size_bytes}
-            truncated={record.truncated}
-            onOpenFullResult={record.truncated ? openFull : undefined}
-            onRevealFullResult={record.truncated ? reveal : undefined}
+            key={`${record.id}:round:${safeRoundIndex}:response`}
+            value={currentFrames.response}
+            tabs={["tree", "raw"]}
             showCopy={false}
             fill={fill}
             contentClassName={fill ? undefined : "max-h-96 overflow-auto"}
           />
-        ) : record.status === "canceled" ? (
-          <div className="text-xs text-slate-400">调用已取消，无结果。</div>
-        ) : null}
+        ) : (
+          <div className="text-xs text-slate-400">该轮没有保存响应。</div>
+        )}
       </div>
 
       <div
@@ -273,6 +351,44 @@ function ResultViewerBody({
         )}
       </div>
 
+      <div
+        className={tab === "input" && fill ? "min-h-0 flex-1 overflow-auto" : undefined}
+        hidden={tab !== "input"}
+      >
+        {serverInputs.length > 0 ? (
+          <div className="space-y-2">
+            {serverInputs.map((input, index) => (
+              <div
+                key={`${record.id}:server-input:${index}`}
+                className="rounded border border-slate-200 p-2"
+              >
+                <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                  <span>旧世代输入 #{index + 1}</span>
+                  <span className="text-slate-300">·</span>
+                  <span>{input.kind}</span>
+                  <span className="text-slate-300">·</span>
+                  <span>{formatDateTime(input.at)}</span>
+                  {input.truncated ? (
+                    <span className="rounded bg-amber-100 px-1 py-0.5 text-[10px] text-amber-700">
+                      已裁剪
+                    </span>
+                  ) : null}
+                </div>
+                <MessageViewer
+                  value={{ request: input.request, response: input.response }}
+                  defaultTab="tree"
+                  tabs={["tree", "raw"]}
+                  showCopy={false}
+                  contentClassName="max-h-60 overflow-auto"
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-xs text-slate-400">没有服务器输入记录。</div>
+        )}
+      </div>
+
       {fullText !== null ? (
         <FullResultDialog
           text={fullText}
@@ -281,9 +397,9 @@ function ResultViewerBody({
         />
       ) : null}
 
-      {showRawResponse && record.frames?.response ? (
+      {showRawResponse && currentFrames?.response ? (
         <RawFrameDialog
-          value={record.frames.response}
+          value={currentFrames.response}
           onClose={() => setShowRawResponse(false)}
         />
       ) : null}

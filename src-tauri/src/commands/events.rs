@@ -82,6 +82,17 @@ pub fn spawn_event_forwarder(app: AppHandle) {
         });
     }
 
+    // 交互输入事件（v0.6.0）：broadcast -> mcp://input
+    {
+        let app = app.clone();
+        let mut receiver = app.state::<AppState>().input.subscribe();
+        tauri::async_runtime::spawn(async move {
+            while let Ok(event) = receiver.recv().await {
+                let _ = app.emit("mcp://input", event);
+            }
+        });
+    }
+
     tauri::async_runtime::spawn(async move {
         let mut subscribed: HashSet<String> = HashSet::new();
         let mut last_state: HashMap<String, String> = HashMap::new();

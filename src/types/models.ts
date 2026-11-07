@@ -62,6 +62,8 @@ export interface OAuthConfig {
   registration_endpoint?: string | null;
   issuer?: string | null;
   allow_missing_issuer?: boolean;
+  /** 显式允许 OAuth 使用明文 HTTP（资源与授权服务器端点，危险） */
+  allow_insecure_http?: boolean;
   /** 授权请求额外参数（v0.3.1） */
   authorize_params?: OAuthParam[];
   /** 显式允许自定义 header 发往跨源授权服务器（v0.3.1） */
@@ -131,6 +133,8 @@ export interface ServerOAuthSummary {
   required_scope?: string | null;
   /** 连接仍 Ready，但需要补充授权（v0.3.1） */
   step_up_required?: boolean;
+  /** 显式允许 OAuth 使用明文 HTTP（列表警示用） */
+  allow_insecure_http?: boolean;
 }
 
 export interface ServerSummary {
@@ -225,6 +229,10 @@ export interface CallError {
   timeout_secs?: number;
   reason?: string;
   capability?: string;
+  /** v0.6.0：不支持的输入类型 */
+  input_kind?: string;
+  /** v0.6.0：Task id */
+  task_id?: string | null;
   /** v0.3.1：OAuth 挑战原文 / 403 详情 */
   detail?: string;
   required_scope?: string;
@@ -240,6 +248,32 @@ export interface CallFrames {
   request: unknown | null;
   response: unknown | null;
   /** 任一帧因超限/异常未保存 */
+  truncated: boolean;
+}
+
+/** MRTR 的一轮请求/响应 */
+export interface CallRound {
+  round: number;
+  rpc_id: string | number | null;
+  request: unknown | null;
+  response: unknown | null;
+  input_requests?: unknown;
+  input_responses?: unknown;
+  truncated: boolean;
+}
+
+/** 旧世代服务器发起的输入 */
+export interface ServerInput {
+  kind: string;
+  request: unknown;
+  response?: unknown;
+  at: string;
+  truncated?: boolean;
+}
+
+export interface CallRounds {
+  rounds: CallRound[];
+  server_inputs?: ServerInput[];
   truncated: boolean;
 }
 
@@ -261,6 +295,8 @@ export interface CallRecord {
   origin: CallOrigin;
   /** 原始帧；旧记录缺省或为 null */
   frames?: CallFrames | null;
+  /** MRTR 多轮与旧世代服务器输入；简单调用为 null */
+  rounds?: CallRounds | null;
   created_at: string;
 }
 

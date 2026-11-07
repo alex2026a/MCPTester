@@ -49,6 +49,8 @@ pub struct McpOAuthHttpClient {
     headers: HeaderMap,
     resource_origin: Origin,
     forward_headers_to_auth_server: bool,
+    /// 与 OAuthConfig 对应：显式允许明文 HTTP
+    allow_insecure_http: bool,
 }
 
 impl McpOAuthHttpClient {
@@ -65,6 +67,10 @@ impl McpOAuthHttpClient {
             .oauth
             .as_ref()
             .is_some_and(|oauth| oauth.forward_headers_to_auth_server);
+        let allow_insecure_http = cfg
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.allow_insecure_http);
 
         let follow_redirects = build_client(
             timeout,
@@ -89,12 +95,15 @@ impl McpOAuthHttpClient {
             headers,
             resource_origin,
             forward_headers_to_auth_server,
+            allow_insecure_http,
         })
     }
 
-    fn validate_url(url: &Url) -> Result<(), OAuthHttpClientError> {
+    fn validate_url(&self, url: &Url) -> Result<(), OAuthHttpClientError> {
         let loopback = is_loopback(url);
-        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        if url.scheme() != "https"
+            && !(url.scheme() == "http" && (loopback || self.allow_insecure_http))
+        {
             return Err(Box::new(OAuthHttpError::InsecureUrl(url.to_string())));
         }
         Ok(())
@@ -205,7 +214,7 @@ fn build_headers(cfg: &HttpConfig) -> Result<HeaderMap, OAuthHttpClientError> {
 
 #[derive(Debug, thiserror::Error)]
 enum OAuthHttpError {
-    #[error("OAuth 端点必须是 https（loopback 除外）：{0}")]
+    #[error("OAuth 端点必须是 https（loopback 或显式允许明文 HTTP 除外）：{0}")]
     InsecureUrl(String),
     #[error("OAuth 请求头配置错误：{0}")]
     InvalidHeader(String),
@@ -223,7 +232,7 @@ impl OAuthHttpClient for McpOAuthHttpClient {
             } = request;
             let url = Url::parse(&request.uri().to_string())
                 .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
-            Self::validate_url(&url)?;
+            self.validate_url(&url)?;
             let apply_headers = self.should_apply_headers(&url);
             let client = match redirect_policy {
                 OAuthHttpRedirectPolicy::Follow if apply_headers => &self.follow_same_origin,
@@ -334,5 +343,39 @@ mod tests {
         let client = McpOAuthHttpClient::new(&cfg).expect("client 创建失败");
         let cross = Url::parse("https://auth.example.com/token").expect("URL 解析失败");
         assert!(client.should_apply_headers(&cross));
+    }
+
+    #[test]
+    fn insecure_http_requires_explicit_opt_in() {
+        let mut cfg = http_config(Vec::new());
+        let client = McpOAuthHttpClient::new(&cfg).expect("client 创建失败");
+        assert!(
+            client
+                .validate_url(&Url::parse("https://auth.example.com/token").expect("URL 解析失败"))
+                .is_ok()
+        );
+        assert!(
+            client
+                .validate_url(&Url::parse("http://127.0.0.1:8000/token").expect("URL 解析失败"))
+                .is_ok()
+        );
+        assert!(
+            client
+                .validate_url(&Url::parse("http://auth.example.com/token").expect("URL 解析失败"))
+                .is_err()
+        );
+
+        cfg.oauth.as_mut().expect("oauth").allow_insecure_http = true;
+        let client = McpOAuthHttpClient::new(&cfg).expect("client 创建失败");
+        assert!(
+            client
+                .validate_url(&Url::parse("http://auth.example.com/token").expect("URL 解析失败"))
+                .is_ok()
+        );
+        assert!(
+            client
+                .validate_url(&Url::parse("ftp://auth.example.com/token").expect("URL 解析失败"))
+                .is_err()
+        );
     }
 }

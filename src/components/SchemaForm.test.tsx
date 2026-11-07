@@ -25,6 +25,24 @@ describe("SchemaForm", () => {
     expect(screen.getByLabelText("mode").tagName).toBe("SELECT");
   });
 
+  it("maskSensitive 把敏感字符串渲染为 password", () => {
+    render(
+      <SchemaForm
+        schema={{
+          type: "object",
+          properties: {
+            token: { type: "string" },
+            name: { type: "string" },
+          },
+        }}
+        onChange={() => {}}
+        maskSensitive
+      />,
+    );
+    expect(screen.getByLabelText("token")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("name")).toHaveAttribute("type", "text");
+  });
+
   it("未操作时不提示必填，提交后给出错误", async () => {
     const ref = createRef<SchemaFormHandle>();
     render(<SchemaForm ref={ref} schema={schema} onChange={() => {}} />);

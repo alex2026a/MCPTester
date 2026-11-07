@@ -331,7 +331,7 @@ impl OAuthService {
                 message: sanitize_detail(&e.to_string()),
             })?;
             let metadata = apply_overrides(metadata.metadata, oauth);
-            validate_metadata(&metadata)?;
+            validate_metadata(&metadata, oauth.allow_insecure_http)?;
             manager.set_metadata(metadata);
             manager
                 .initialize_from_store()
@@ -563,13 +563,15 @@ impl OAuthService {
                 if oauth.authorization_endpoint.is_some() && oauth.token_endpoint.is_some() {
                     manual_metadata(oauth)
                 } else {
-                    return Err(OAuthError::Metadata {
-                        message: sanitize_detail(&discover_error.to_string()),
-                    });
+                    let mut message = sanitize_detail(&discover_error.to_string());
+                    message.push_str(
+                        "；若授权服务器使用私有地址，自动发现可能被安全策略拦截，请在「高级」手工填写 authorization/token 端点与 issuer",
+                    );
+                    return Err(OAuthError::Metadata { message });
                 }
             }
         };
-        validate_metadata(&metadata)?;
+        validate_metadata(&metadata, oauth.allow_insecure_http)?;
         let issuer = metadata.issuer.clone();
         manager.set_metadata(metadata.clone());
 
@@ -1066,7 +1068,7 @@ impl OAuthService {
             match manager.resolve_metadata_from_challenge(challenge).await {
                 Ok(resolution) => {
                     let resolved = apply_overrides(resolution.metadata, oauth);
-                    validate_metadata(&resolved)?;
+                    validate_metadata(&resolved, oauth.allow_insecure_http)?;
                     metadata = Some(resolved);
                 }
                 Err(error) => {
@@ -1316,6 +1318,7 @@ impl OAuthService {
         let Some(endpoint) = endpoint else {
             return Err("授权服务器未提供 revocation_endpoint".to_string());
         };
+        ensure_secure_url(&endpoint, oauth.allow_insecure_http).map_err(|e| e.to_string())?;
         let identity = StoredIdentity::resolve(oauth, Some(row));
         let Some(client_id) = identity.client_id.clone() else {
             return Err("缺少 client_id，无法撤销".to_string());
@@ -1858,21 +1861,24 @@ fn manual_metadata(oauth: &OAuthConfig) -> AuthorizationMetadata {
     metadata
 }
 
-fn validate_metadata(metadata: &AuthorizationMetadata) -> Result<(), OAuthError> {
+fn validate_metadata(
+    metadata: &AuthorizationMetadata,
+    allow_insecure_http: bool,
+) -> Result<(), OAuthError> {
     if metadata.authorization_endpoint.is_empty() || metadata.token_endpoint.is_empty() {
         return Err(OAuthError::Metadata {
             message: "授权端点或 token 端点缺失".to_string(),
         });
     }
-    ensure_secure_url(&metadata.authorization_endpoint)?;
-    ensure_secure_url(&metadata.token_endpoint)?;
+    ensure_secure_url(&metadata.authorization_endpoint, allow_insecure_http)?;
+    ensure_secure_url(&metadata.token_endpoint, allow_insecure_http)?;
     if let Some(registration) = metadata.registration_endpoint.as_deref() {
-        ensure_secure_url(registration)?;
+        ensure_secure_url(registration, allow_insecure_http)?;
     }
     Ok(())
 }
 
-fn ensure_secure_url(value: &str) -> Result<(), OAuthError> {
+fn ensure_secure_url(value: &str, allow_insecure_http: bool) -> Result<(), OAuthError> {
     let url = Url::parse(value).map_err(|e| OAuthError::Metadata {
         message: format!("端点 URL 非法：{e}"),
     })?;
@@ -1885,9 +1891,13 @@ fn ensure_secure_url(value: &str) -> Result<(), OAuthError> {
                 || host == "::1"
         })
         .unwrap_or(false);
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+    if url.scheme() != "https"
+        && !(url.scheme() == "http" && (loopback || allow_insecure_http))
+    {
         return Err(OAuthError::Metadata {
-            message: format!("OAuth 端点必须是 https（loopback 除外）：{value}"),
+            message: format!(
+                "OAuth 端点必须是 https（loopback 或显式允许明文 HTTP 除外）：{value}"
+            ),
         });
     }
     Ok(())
@@ -2130,5 +2140,14 @@ mod tests {
             scopes_from_auth_url(url),
             vec!["read".to_string(), "write".to_string()]
         );
+    }
+
+    #[test]
+    fn metadata_endpoints_require_https_unless_explicitly_allowed() {
+        assert!(ensure_secure_url("https://auth.example.com/token", false).is_ok());
+        assert!(ensure_secure_url("http://127.0.0.1:9000/token", false).is_ok());
+        assert!(ensure_secure_url("http://auth.example.com/token", false).is_err());
+        assert!(ensure_secure_url("http://auth.example.com/token", true).is_ok());
+        assert!(ensure_secure_url("ftp://auth.example.com/token", true).is_err());
     }
 }

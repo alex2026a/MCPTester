@@ -21,25 +21,30 @@ import { writeClipboardText } from "../lib/clipboard";
 import { buildHttpSkeleton } from "../lib/httpSkeleton";
 import { buildTextDigest } from "../lib/textDigest";
 import {
+  buildAllRoundsText,
   buildPairJson,
   buildPairMarkdown,
   buildRequestParamsText,
   buildRequestText,
+  buildRawResponseBodyText,
   buildResponseBodyText,
   buildResponseEnvelopeText,
+  buildServerInputsText,
 } from "../lib/exchange";
 import { confirmLargeResultRead } from "../lib/largeResult";
 import { findSensitiveFields } from "../lib/sensitive";
 import { toErrorInfo } from "../lib/errors";
 import { formatBytes } from "./json/format";
 import { toast } from "../stores/toast";
-import type { CallRecord } from "../types/models";
+import type { CallFrames, CallRecord, CallRound } from "../types/models";
 
 type CopyAction =
   | "request"
   | "response"
   | "pair-markdown"
   | "pair-json"
+  | "all-rounds"
+  | "server-inputs"
   | "params"
   | "response-envelope"
   | "http-skeleton"
@@ -68,6 +73,8 @@ const ACTION_LABEL: Record<CopyAction, string> = {
   response: "响应",
   "pair-markdown": "请求和响应（Markdown）",
   "pair-json": "请求和响应（JSON）",
+  "all-rounds": "全部轮次（JSON）",
+  "server-inputs": "服务器输入（JSON）",
   params: "请求参数",
   "response-envelope": "响应（JSON-RPC）",
   "http-skeleton": "HTTP 请求骨架",
@@ -76,9 +83,17 @@ const ACTION_LABEL: Record<CopyAction, string> = {
 
 export function CopyExchangeButton({
   record,
+  frames,
+  rounds,
+  roundIndex,
   primaryAction = "response",
 }: {
   record: CallRecord;
+  /** 当前轮帧；缺省用 record.frames（v0.5.0 兼容） */
+  frames?: CallFrames | null;
+  /** MRTR 全部轮次；用于「复制全部轮次」 */
+  rounds?: CallRound[] | null;
+  roundIndex?: number;
   primaryAction?: "request" | "response";
 }) {
   const [open, setOpen] = useState(false);
@@ -86,6 +101,22 @@ export function CopyExchangeButton({
   const [busy, setBusy] = useState<CopyAction | null>(null);
   const [copiedAction, setCopiedAction] = useState<CopyAction | null>(null);
   const [redact, setRedact] = useState(false);
+
+  const activeFrames = frames ?? record.frames ?? null;
+  const activeRounds = rounds ?? record.rounds?.rounds ?? null;
+  const activeRoundIndex = Math.min(
+    roundIndex ?? Math.max(0, (activeRounds?.length ?? 1) - 1),
+    Math.max(0, (activeRounds?.length ?? 1) - 1),
+  );
+  const roundLabel =
+    activeRounds && activeRounds.length > 0
+      ? `第 ${activeRoundIndex + 1}/${activeRounds.length} 轮`
+      : null;
+  const finalRound =
+    !activeRounds ||
+    activeRounds.length === 0 ||
+    activeRoundIndex >= activeRounds.length - 1;
+  const serverInputs = record.rounds?.server_inputs ?? [];
 
   const groupRef = useRef<HTMLSpanElement | null>(null);
   const caretRef = useRef<HTMLButtonElement | null>(null);
@@ -102,23 +133,26 @@ export function CopyExchangeButton({
     () => [...new Set(sensitiveFields.map((hit) => hit.key))].slice(0, 3),
     [sensitiveFields],
   );
-  const frameNote = record.frames?.truncated
-    ? "部分原始帧未保存，复制时按记录重建"
-    : record.frames?.request || record.frames?.response
-      ? "请求/响应使用原始帧"
-      : "请求/响应按记录重建，id 可能与线上不同";
+  const frameNote = activeFrames?.truncated
+    ? `${roundLabel ? `${roundLabel} · ` : ""}部分原始帧未保存，复制时按记录重建`
+    : activeFrames?.request || activeFrames?.response
+      ? `${roundLabel ? `${roundLabel} · ` : ""}请求/响应使用原始帧`
+      : `${roundLabel ? `${roundLabel} · ` : ""}请求/响应按记录重建，id 可能与线上不同`;
 
-  const hasResponse =
-    record.truncated ||
-    (record.result !== null && record.result !== undefined) ||
-    Boolean(record.error) ||
-    Boolean(record.frames?.response);
+  const hasResponse = finalRound
+    ? record.truncated ||
+      (record.result !== null && record.result !== undefined) ||
+      Boolean(record.error) ||
+      Boolean(activeFrames?.response)
+    : Boolean(activeFrames?.response);
   const hasRpcResponse =
     record.method !== "probe" &&
-    (record.truncated ||
-      (record.result !== null && record.result !== undefined) ||
-      record.error?.kind === "rpc_error" ||
-      Boolean(record.frames?.response));
+    (finalRound
+      ? record.truncated ||
+        (record.result !== null && record.result !== undefined) ||
+        record.error?.kind === "rpc_error" ||
+        Boolean(activeFrames?.response)
+      : Boolean(activeFrames?.response));
 
   useEffect(() => {
     mountedRef.current = true;
@@ -243,11 +277,12 @@ export function CopyExchangeButton({
     setBusy(action);
     try {
       const needsFull =
-        action === "response" ||
-        action === "response-envelope" ||
-        action === "pair-markdown" ||
-        action === "pair-json" ||
-        action === "text-digest";
+        finalRound &&
+        (action === "response" ||
+          action === "response-envelope" ||
+          action === "pair-markdown" ||
+          action === "pair-json" ||
+          action === "text-digest");
       let fullResult: unknown | undefined;
       if (needsFull) {
         const resolved = await resolveFullResult();
@@ -258,16 +293,18 @@ export function CopyExchangeButton({
       let text: string | null = null;
       switch (action) {
         case "request":
-          text = buildRequestText(record, record.frames, redact);
+          text = buildRequestText(record, activeFrames, redact);
           break;
         case "response":
-          text = buildResponseBodyText(record, fullResult, redact);
+          text = finalRound
+            ? buildResponseBodyText(record, fullResult, redact)
+            : buildRawResponseBodyText(activeFrames, redact);
           break;
         case "response-envelope":
           text = buildResponseEnvelopeText(
             record,
-            fullResult,
-            record.frames,
+            finalRound ? fullResult : undefined,
+            activeFrames,
             redact,
           );
           break;
@@ -275,17 +312,23 @@ export function CopyExchangeButton({
           text = buildRequestParamsText(record, redact);
           break;
         case "pair-markdown":
-          text = buildPairMarkdown(record, fullResult, record.frames, redact);
+          text = buildPairMarkdown(record, fullResult, activeFrames, redact);
           break;
         case "pair-json":
-          text = buildPairJson(record, fullResult, record.frames, redact);
+          text = buildPairJson(record, fullResult, activeFrames, redact);
+          break;
+        case "all-rounds":
+          text = buildAllRoundsText(record, activeRounds, redact);
+          break;
+        case "server-inputs":
+          text = buildServerInputsText(serverInputs, redact);
           break;
         case "text-digest":
           text = buildTextDigest(record, fullResult, redact);
           break;
         case "http-skeleton": {
           const server = await getServer(record.server_id);
-          const requestText = buildRequestText(record, record.frames, true);
+          const requestText = buildRequestText(record, activeFrames, true);
           text = requestText
             ? buildHttpSkeleton(server, requestText, record.protocol_version)
             : null;
@@ -358,25 +401,49 @@ export function CopyExchangeButton({
     {
       action: "response",
       label: "复制响应",
-      hint: hasResponse
-        ? record.truncated
-          ? `完整结果约 ${formatBytes(record.size_bytes)}`
-          : "结果 body；无结果时为错误详情"
-        : "本次调用没有响应",
+      hint: finalRound
+        ? hasResponse
+          ? record.truncated
+            ? `完整结果约 ${formatBytes(record.size_bytes)}`
+            : "结果 body；无结果时为错误详情"
+          : "本次调用没有响应"
+        : "当前轮为等待输入，复制原始响应",
       disabled: !hasResponse,
     },
     {
       action: "pair-markdown",
       label: "复制请求和响应",
-      hint: "Markdown 报告，适合贴 issue / 聊天",
-      disabled: false,
+      hint: finalRound
+        ? "Markdown 报告，适合贴 issue / 聊天"
+        : "请切到最后一轮再复制成对内容",
+      disabled: !finalRound,
     },
     {
       action: "pair-json",
       label: "复制请求和响应（JSON）",
-      hint: "适合脚本或后续导入",
-      disabled: false,
+      hint: finalRound ? "适合脚本或后续导入" : "请切到最后一轮再复制",
+      disabled: !finalRound,
     },
+    ...(activeRounds && activeRounds.length > 1
+      ? [
+          {
+            action: "all-rounds" as const,
+            label: "复制全部轮次（JSON）",
+            hint: `共 ${activeRounds.length} 轮，含输入请求/应答`,
+            disabled: false,
+          },
+        ]
+      : []),
+    ...(serverInputs.length > 0
+      ? [
+          {
+            action: "server-inputs" as const,
+            label: "复制服务器输入",
+            hint: `旧世代 elicitation × ${serverInputs.length}`,
+            disabled: false,
+          },
+        ]
+      : []),
     {
       action: "params",
       label: "复制请求参数",
@@ -408,13 +475,16 @@ export function CopyExchangeButton({
     {
       action: "text-digest",
       label: "复制文本内容",
-      hint: "跳过图片/音频 base64，只保留文本与占位符",
-      disabled: record.result === null && !record.truncated,
+      hint: finalRound
+        ? "跳过图片/音频 base64，只保留文本与占位符"
+        : "当前轮为等待输入，没有最终文本",
+      disabled: !finalRound || (record.result === null && !record.truncated),
     },
   ];
 
   const readingFull =
     busy !== null &&
+    finalRound &&
     record.truncated &&
     (busy === "response" ||
       busy === "response-envelope" ||

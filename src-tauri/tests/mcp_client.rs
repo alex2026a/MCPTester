@@ -6,13 +6,17 @@
 #![cfg(feature = "mock-server")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use mcptester_lib::mcp::connection::ConnectionHandle;
+use mcptester_lib::mcp::input::{InputContext, InputError, InputHandler};
 use mcptester_lib::mcp::models::{
     ConnectionState, HttpConfig, KeyValue, LifecycleEra, RuntimeSettings, ShellWrap, StdioConfig,
     TransportKind,
 };
+use rmcp::model::{ElicitResult, ElicitationAction, InputRequests, InputResponses};
 
 const MOCK_BIN: &str = env!("CARGO_BIN_EXE_mock-mcp-server");
 
@@ -55,7 +59,7 @@ async fn stdio_modern_connect_list_call() {
     assert_eq!(handshake.server_name, "mock-mcp-server");
 
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
     assert_eq!(snapshot.resources.len(), 1);
     assert_eq!(snapshot.resource_templates.len(), 1);
     assert_eq!(snapshot.prompts.len(), 1);
@@ -130,7 +134,7 @@ async fn stdio_legacy_era_negotiates_and_probes() {
 
     // 旧世代仍可枚举与调用
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
 
     h.disconnect().await;
 }
@@ -156,7 +160,7 @@ async fn legacy_tools_only_server_skips_undeclared_capabilities() {
         .capabilities(true)
         .await
         .expect("tools-only 服务器不应枚举失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
     assert!(snapshot.resources.is_empty());
     assert!(snapshot.resource_templates.is_empty());
     assert!(snapshot.prompts.is_empty());
@@ -202,7 +206,7 @@ async fn legacy_server_without_templates_degrades_to_warning() {
         .capabilities(true)
         .await
         .expect("templates/list 返回 -32601 不应导致整体失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
     assert_eq!(snapshot.resources.len(), 1);
     assert!(snapshot.resource_templates.is_empty());
     assert!(
@@ -236,7 +240,7 @@ async fn legacy_server_without_capabilities_falls_back_to_probing() {
         .capabilities(true)
         .await
         .expect("未声明 capabilities 时应兜底探测且不失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
     assert!(
         snapshot
             .warnings
@@ -396,6 +400,283 @@ async fn mrtr_input_required_maps_to_error() {
     h.disconnect().await;
 }
 
+struct ScriptedInput {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl InputHandler for ScriptedInput {
+    fn interactive(&self) -> bool {
+        true
+    }
+
+    async fn request(
+        &self,
+        _context: InputContext,
+        requests: InputRequests,
+        _timeout: Duration,
+    ) -> Result<InputResponses, InputError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut responses = InputResponses::new();
+        for key in requests.keys() {
+            let content = match key.as_str() {
+                "name" => serde_json::json!({ "name": "Ada" }),
+                "city" => serde_json::json!({ "city": "Paris" }),
+                _ => serde_json::json!({ "value": "ok" }),
+            };
+            let result =
+                ElicitResult::new(ElicitationAction::Accept).with_content(content);
+            responses.insert(
+                key.clone(),
+                serde_json::to_value(result).expect("serialize elicit result"),
+            );
+        }
+        Ok(responses)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_elicitation_accepts_and_completes() {
+    let input = Arc::new(ScriptedInput {
+        calls: AtomicUsize::new(0),
+    });
+    let h = ConnectionHandle::new_with_input(
+        "mock-elicit",
+        "mock-elicit",
+        Some("2025-11-25".to_string()),
+        TransportKind::Stdio,
+        RuntimeSettings::default(),
+        input.clone(),
+    );
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "legacy"]))
+        .await
+        .expect("连接失败");
+
+    let record = h.call_tool("elicit_legacy", serde_json::json!({})).await;
+    assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
+    assert_eq!(input.calls.load(Ordering::SeqCst), 1);
+    let text = serde_json::to_string(&record.result).expect("serialize");
+    assert!(text.contains("elicitation: Accept"), "结果异常：{text}");
+
+    h.disconnect().await;
+}
+
+fn mrtr_handle(id: &str, input: Arc<dyn InputHandler>) -> Arc<ConnectionHandle> {
+    ConnectionHandle::new_with_input(
+        id,
+        id,
+        Some("2026-07-28".to_string()),
+        TransportKind::Stdio,
+        RuntimeSettings::default(),
+        input,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_mrtr_single_round_completes() {
+    let input = Arc::new(ScriptedInput {
+        calls: AtomicUsize::new(0),
+    });
+    let h = mrtr_handle("mock-mrtr-single", input.clone());
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "modern"]))
+        .await
+        .expect("连接失败");
+
+    let record = h
+        .call_tool("input_required", serde_json::json!({ "mode": "single" }))
+        .await;
+    assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
+    assert_eq!(input.calls.load(Ordering::SeqCst), 1);
+    let text = serde_json::to_string(&record.result).expect("serialize");
+    assert!(text.contains("hello Ada"), "结果异常：{text}");
+    let rounds = record.rounds.as_ref().expect("应有 rounds");
+    assert_eq!(rounds.rounds.len(), 2);
+    assert!(rounds.rounds[0].input_requests.is_some());
+    assert!(rounds.rounds[0].input_responses.is_some());
+    assert_eq!(rounds.rounds[1].round, 2);
+    assert!(record.frames.is_some());
+
+    h.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_mrtr_two_rounds_completes() {
+    let input = Arc::new(ScriptedInput {
+        calls: AtomicUsize::new(0),
+    });
+    let h = mrtr_handle("mock-mrtr-two", input.clone());
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "modern"]))
+        .await
+        .expect("连接失败");
+
+    let record = h
+        .call_tool("input_required", serde_json::json!({ "mode": "two" }))
+        .await;
+    assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
+    assert_eq!(input.calls.load(Ordering::SeqCst), 2);
+    let text = serde_json::to_string(&record.result).expect("serialize");
+    assert!(text.contains("two rounds done"), "结果异常：{text}");
+    let rounds = record.rounds.as_ref().expect("应有 rounds");
+    assert_eq!(rounds.rounds.len(), 3);
+    assert_eq!(rounds.rounds[0].input_requests.as_ref().unwrap()["name"]["params"]["message"], "请输入 name");
+    assert_eq!(rounds.rounds[1].input_requests.as_ref().unwrap()["city"]["params"]["message"], "请输入 city");
+
+    h.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_mrtr_state_only_retries_without_ui() {
+    let input = Arc::new(ScriptedInput {
+        calls: AtomicUsize::new(0),
+    });
+    let h = mrtr_handle("mock-mrtr-state", input.clone());
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "modern"]))
+        .await
+        .expect("连接失败");
+
+    let record = h
+        .call_tool("input_required", serde_json::json!({ "mode": "state" }))
+        .await;
+    assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
+    assert_eq!(input.calls.load(Ordering::SeqCst), 0);
+    let text = serde_json::to_string(&record.result).expect("serialize");
+    assert!(text.contains("state-only done"), "结果异常：{text}");
+    let rounds = record.rounds.as_ref().expect("应有 rounds");
+    assert_eq!(rounds.rounds.len(), 2);
+    assert!(rounds.rounds[0].input_requests.is_none());
+
+    h.disconnect().await;
+}
+
+struct DecliningInput;
+
+#[async_trait]
+impl InputHandler for DecliningInput {
+    fn interactive(&self) -> bool {
+        true
+    }
+
+    async fn request(
+        &self,
+        _context: InputContext,
+        requests: InputRequests,
+        _timeout: Duration,
+    ) -> Result<InputResponses, InputError> {
+        let mut responses = InputResponses::new();
+        for key in requests.keys() {
+            let result = ElicitResult::new(ElicitationAction::Decline);
+            responses.insert(
+                key.clone(),
+                serde_json::to_value(result).expect("serialize elicit result"),
+            );
+        }
+        Ok(responses)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_mrtr_decline_reaches_server() {
+    let h = mrtr_handle("mock-mrtr-decline", Arc::new(DecliningInput));
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "modern"]))
+        .await
+        .expect("连接失败");
+
+    let record = h
+        .call_tool("input_required", serde_json::json!({ "mode": "decline" }))
+        .await;
+    assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Ok);
+    let text = serde_json::to_string(&record.result).expect("serialize");
+    assert!(text.contains("declined: decline"), "结果异常：{text}");
+
+    h.disconnect().await;
+}
+
+struct TimeoutInput;
+
+#[async_trait]
+impl InputHandler for TimeoutInput {
+    fn interactive(&self) -> bool {
+        true
+    }
+
+    async fn request(
+        &self,
+        _context: InputContext,
+        _requests: InputRequests,
+        _timeout: Duration,
+    ) -> Result<InputResponses, InputError> {
+        Err(InputError::Timeout { timeout_secs: 1 })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_mrtr_input_timeout_maps_to_error() {
+    let h = mrtr_handle("mock-mrtr-timeout", Arc::new(TimeoutInput));
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "modern"]))
+        .await
+        .expect("连接失败");
+
+    let record = h
+        .call_tool("input_required", serde_json::json!({ "mode": "single" }))
+        .await;
+    assert_eq!(record.status, mcptester_lib::mcp::models::CallStatus::Error);
+    assert!(
+        matches!(
+            record.error,
+            Some(mcptester_lib::mcp::error::CallError::InputTimeout { .. })
+        ),
+        "输入超时应映射为 InputTimeout，实际：{:?}",
+        record.error
+    );
+    let rounds = record.rounds.as_ref().expect("应有 rounds");
+    assert_eq!(rounds.rounds.len(), 1);
+    assert!(rounds.rounds[0].input_requests.is_some());
+    assert!(rounds.rounds[0].response.is_some());
+
+    h.disconnect().await;
+}
+
+struct CanceledInput;
+
+#[async_trait]
+impl InputHandler for CanceledInput {
+    fn interactive(&self) -> bool {
+        true
+    }
+
+    async fn request(
+        &self,
+        _context: InputContext,
+        _requests: InputRequests,
+        _timeout: Duration,
+    ) -> Result<InputResponses, InputError> {
+        Err(InputError::Canceled)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_mrtr_input_canceled_marks_canceled() {
+    let h = mrtr_handle("mock-mrtr-canceled", Arc::new(CanceledInput));
+    h.connect_stdio(&stdio_cfg(&["--transport", "stdio", "--era", "modern"]))
+        .await
+        .expect("连接失败");
+
+    let record = h
+        .call_tool("input_required", serde_json::json!({ "mode": "single" }))
+        .await;
+    assert_eq!(
+        record.status,
+        mcptester_lib::mcp::models::CallStatus::Canceled
+    );
+    assert!(record.error.is_none());
+    let rounds = record.rounds.as_ref().expect("应有 rounds");
+    assert_eq!(rounds.rounds.len(), 1);
+    assert!(rounds.rounds[0].input_requests.is_some());
+    assert!(rounds.rounds[0].response.is_some());
+
+    h.disconnect().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn http_connect_list_call() {
     // 启动 mock HTTP 服务（随机高位端口，避免冲突）
@@ -457,7 +738,7 @@ async fn http_connect_list_call() {
     assert_eq!(handshake.server_name, "mock-mcp-server");
 
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
 
     let record = h
         .call_tool("add", serde_json::json!({ "a": 2, "b": 3 }))
@@ -494,7 +775,7 @@ async fn cmd_shell_mode_wraps_command() {
     };
     h.connect_stdio(&cfg).await.expect("cmd_shell 连接失败");
     let snapshot = h.capabilities(true).await.expect("枚举失败");
-    assert_eq!(snapshot.tools.len(), 11);
+    assert_eq!(snapshot.tools.len(), 12);
     h.disconnect().await;
 }
 

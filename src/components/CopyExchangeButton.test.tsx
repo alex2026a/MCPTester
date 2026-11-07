@@ -337,4 +337,79 @@ describe("ResultViewer 复制菜单", () => {
       screen.getByRole("menuitem", { name: "复制 HTTP 请求骨架" }),
     ).toBeDisabled();
   });
+
+  it("MRTR 可复制全部轮次", async () => {
+    render(
+      <ResultViewer
+        record={record({
+          rounds: {
+            rounds: [
+              {
+                round: 1,
+                rpc_id: 1,
+                request: { jsonrpc: "2.0", id: 1, method: "tools/call" },
+                response: {
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: { resultType: "input_required" },
+                },
+                input_requests: { name: {} },
+                input_responses: { name: { action: "accept" } },
+                truncated: false,
+              },
+              {
+                round: 2,
+                rpc_id: 2,
+                request: { jsonrpc: "2.0", id: 2, method: "tools/call" },
+                response: { jsonrpc: "2.0", id: 2, result: {} },
+                truncated: false,
+              },
+            ],
+            truncated: false,
+          },
+        })}
+      />,
+    );
+    await openMenu();
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: "复制全部轮次（JSON）" }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(copiedText()).rounds).toHaveLength(2);
+  });
+
+  it("旧世代服务器输入可单独复制", async () => {
+    render(
+      <ResultViewer
+        record={record({
+          rounds: {
+            rounds: [
+              {
+                round: 1,
+                rpc_id: 1,
+                request: { jsonrpc: "2.0", id: 1, method: "tools/call" },
+                response: { jsonrpc: "2.0", id: 1, result: {} },
+                truncated: false,
+              },
+            ],
+            server_inputs: [
+              {
+                kind: "elicitation",
+                request: { method: "elicitation/create" },
+                response: { action: "accept" },
+                at: "2026-10-29T00:00:00Z",
+              },
+            ],
+            truncated: false,
+          },
+        })}
+      />,
+    );
+    await openMenu();
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: "复制服务器输入" }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(copiedText()).server_inputs).toHaveLength(1);
+  });
 });

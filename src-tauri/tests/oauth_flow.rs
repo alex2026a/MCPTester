@@ -21,7 +21,11 @@ use serial_test::serial;
 const MOCK_BIN: &str = env!("CARGO_BIN_EXE_mock-mcp-server");
 
 fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("端口绑定失败");
+    free_port_on("127.0.0.1")
+}
+
+fn free_port_on(host: &str) -> u16 {
+    let listener = std::net::TcpListener::bind((host, 0)).expect("端口绑定失败");
     listener.local_addr().expect("地址失败").port()
 }
 
@@ -35,9 +39,13 @@ impl Drop for MockProcess {
 }
 
 fn spawn_mock(port: u16, extra: &[&str]) -> MockProcess {
+    spawn_mock_at("127.0.0.1", port, extra)
+}
+
+fn spawn_mock_at(host: &str, port: u16, extra: &[&str]) -> MockProcess {
     let mut command = Command::new(MOCK_BIN);
     command
-        .args(["--transport", "http", "--port", &port.to_string()])
+        .args(["--transport", "http", "--host", host, "--port", &port.to_string()])
         .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -45,11 +53,12 @@ fn spawn_mock(port: u16, extra: &[&str]) -> MockProcess {
 }
 
 async fn wait_ready(port: u16) {
+    wait_ready_at("127.0.0.1", port).await
+}
+
+async fn wait_ready_at(host: &str, port: u16) {
     for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
+        if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -424,4 +433,41 @@ async fn oauth_cimd_login_survives_manager_for() {
     assert!(row.client_secret.is_none());
     assert!(row.client_secret_ref.is_none());
     handle.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn oauth_plain_http_requires_explicit_opt_in() {
+    keyring_core::unset_default_store();
+    keyring_core::set_default_store(keyring_core::mock::Store::new().expect("mock store 创建失败"));
+    let host = "127.0.0.2";
+    let port = free_port_on(host);
+    let redirect_port = free_port();
+    let public_url = format!("http://{host}:{port}");
+    let _mock = spawn_mock_at(
+        host,
+        port,
+        &[
+            "--oauth",
+            "--oauth-token-ttl",
+            "60",
+            "--public-url",
+            public_url.as_str(),
+        ],
+    );
+    wait_ready_at(host, port).await;
+
+    let (_dir, db) = temp_db();
+    let service = OAuthService::new(db, false);
+    let mut http = oauth_http(port, redirect_port);
+    http.url = format!("http://{host}:{port}/mcp");
+
+    let error = service
+        .begin_login("s1", &http, None)
+        .await
+        .expect_err("默认应拒绝非 loopback 明文 HTTP");
+    assert!(error.to_string().contains("https"), "error={error}");
+
+    http.oauth.as_mut().expect("oauth").allow_insecure_http = true;
+    complete_login(&service, &http, "s1").await;
 }

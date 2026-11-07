@@ -200,14 +200,21 @@ async fn run(args: &[String]) -> Result<(), String> {
         let record = handle.call_tool(&tool, tool_args).await;
         println!("== 调用 {} ==", tool);
         println!(
-            "status={:?} duration_ms={} error={:?}",
-            record.status, record.duration_ms, record.error
+            "status={:?} duration_ms={}",
+            record.status, record.duration_ms
         );
+        if let Some(error) = &record.error {
+            println!("error={error}");
+        }
         if let Some(result) = record.result {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).unwrap_or_default()
             );
+        }
+        if let Some(error) = record.error {
+            handle.disconnect().await;
+            return Err(error.to_string());
         }
     }
 

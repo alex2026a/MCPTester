@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::commands::AppState;
 use crate::mcp::connection::{CallOptions, ConnectionHandle};
 use crate::mcp::error::CallError;
+use crate::mcp::input::RejectInputHandler;
 use crate::mcp::models::{CallOrigin, CallRecord, CallStatus, CapabilitySnapshot};
 use crate::storage::{Database, call_repo, server_repo, test_repo};
 
@@ -366,6 +367,7 @@ async fn call_case(
         call_id: Some(call_id),
         timeout_secs: Some(timeout_secs),
         origin: CallOrigin::Test,
+        input_handler: Some(Arc::new(RejectInputHandler::new())),
     };
     match case.method {
         TestMethod::ToolsCall => {

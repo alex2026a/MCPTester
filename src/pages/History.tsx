@@ -499,7 +499,7 @@ export function History() {
                 checked={includeFrames}
                 onChange={(event) => setIncludeFrames(event.target.checked)}
               />
-              包含原始帧（体积会明显增大，上限 50MB）
+              包含原始帧与多轮记录（体积会明显增大，上限 50MB，导出为明文）
             </label>
           }
         />

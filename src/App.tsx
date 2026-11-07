@@ -11,6 +11,7 @@ import { SettingsPage } from "./pages/Settings";
 import { Tests } from "./pages/Tests";
 import { Reports } from "./pages/Reports";
 import { ToastContainer } from "./components/Toast";
+import { InputRequestHost } from "./components/InputRequestHost";
 import { zh } from "./i18n/zh";
 
 /** 监听 Rust 侧事件：连接状态变化驱动服务器列表刷新 */
@@ -95,6 +96,7 @@ function App() {
       <HashRouter>
         <TauriEvents />
         <Layout />
+        <InputRequestHost />
         <ToastContainer />
       </HashRouter>
     </QueryClientProvider>

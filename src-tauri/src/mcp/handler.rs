@@ -12,15 +12,19 @@ use chrono::{DateTime, Utc};
 use rmcp::ClientHandler;
 #[allow(deprecated)] // logging 相关类型在 2026-07-28 已弃用，但服务器仍可能发送
 use rmcp::model::{
-    CancelledNotificationParam, ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult,
-    ElicitationAction, ErrorCode, ErrorData, Implementation, LoggingMessageNotificationParam,
-    ProgressNotificationParam, ResourceUpdatedNotificationParam,
-    SubscriptionsAcknowledgedNotificationParams,
+    CancelledNotificationParam, ClientCapabilities, ClientConfig, ElicitRequest,
+    ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationCapability, ErrorCode,
+    ErrorData, FormElicitationCapability, Implementation, InputRequest, InputRequests,
+    LoggingMessageNotificationParam, ProgressNotificationParam, ResourceUpdatedNotificationParam,
+    SubscriptionsAcknowledgedNotificationParams, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use serde::{Deserialize, Serialize};
 
-use super::models::RuntimeSettings;
+use super::input::{
+    ActiveCalls, InputContext, InputError, InputHandler, INPUT_WAIT_TIMEOUT_SECS,
+};
+use super::models::{RuntimeSettings, ServerInput};
 
 /// 通知缓冲条目（seq 连接内单调递增；连接重建后从 0 重新计数）
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -145,11 +149,24 @@ impl EventHub {
 #[derive(Clone)]
 pub struct AppClientHandler {
     hub: Arc<EventHub>,
+    server_name: String,
+    input: Arc<dyn InputHandler>,
+    active: Arc<ActiveCalls>,
 }
 
 impl AppClientHandler {
-    pub fn new(hub: Arc<EventHub>) -> Self {
-        Self { hub }
+    pub fn new(
+        hub: Arc<EventHub>,
+        server_name: impl Into<String>,
+        input: Arc<dyn InputHandler>,
+        active: Arc<ActiveCalls>,
+    ) -> Self {
+        Self {
+            hub,
+            server_name: server_name.into(),
+            input,
+            active,
+        }
     }
 
     fn record<T: Serialize>(&self, method: &str, params: &T) {
@@ -161,19 +178,107 @@ impl AppClientHandler {
 #[allow(deprecated)] // logging 通知在 2026-07-28 已弃用，但服务器仍可能发送，需展示
 impl ClientHandler for AppClientHandler {
     fn get_info(&self) -> ClientConfig {
-        // v0.1 不声明客户端能力（roots / sampling / elicitation 均不支持）
-        ClientConfig::new(ClientCapabilities::default(), Implementation::new("MCP Tester", env!("CARGO_PKG_VERSION")))
+        // v0.6.0：交互连接声明 elicitation；只声明 elicitation，不声明 sampling/roots
+        let mut capabilities = ClientCapabilities::default();
+        if self.input.interactive() {
+            capabilities.elicitation = Some(
+                ElicitationCapability::new()
+                    .with_form(FormElicitationCapability::new().with_schema_validation(true))
+                    .with_url(UrlElicitationCapability::new()),
+            );
+        }
+        ClientConfig::new(
+            capabilities,
+            Implementation::new("MCP Tester", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     fn create_elicitation(
         &self,
         request: ElicitRequestParams,
-        _context: RequestContext<RoleClient>,
+        context: RequestContext<RoleClient>,
     ) -> impl Future<Output = Result<ElicitResult, ErrorData>> + Send + '_ {
-        // v0.1 不支持交互式输入：记录事件并婉拒（旧世代服务器）。
-        // 现代世代该场景以 MRTR input_required 呈现，见调用管线。
+        // 旧世代 elicitation：记录请求，挂起等待 UI，拒绝/取消/超时都有明确结果
         self.record("elicitation/create", &request);
-        std::future::ready(Ok(ElicitResult::new(ElicitationAction::Decline)))
+        let hub = Arc::clone(&self.hub);
+        let input = Arc::clone(&self.input);
+        let active = Arc::clone(&self.active);
+        let server_name = self.server_name.clone();
+        let request_value = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        async move {
+            let (call_id, active_call) = active.resolve(context.meta.get_progress_token());
+            let context_view = InputContext {
+                server_id: hub.server_id.clone(),
+                server_name,
+                call_id: call_id.clone(),
+                method: active_call.as_ref().map(|call| call.method.clone()),
+                target: active_call.as_ref().map(|call| call.target.clone()),
+                round: 1,
+            };
+            let mut requests = InputRequests::new();
+            requests.insert(
+                "elicitation".to_string(),
+                InputRequest::Elicitation(ElicitRequest::new(request.clone())),
+            );
+            let result = tokio::select! {
+                result = input.request(
+                    context_view,
+                    requests,
+                    std::time::Duration::from_secs(INPUT_WAIT_TIMEOUT_SECS),
+                ) => result,
+                _ = context.ct.cancelled() => Err(InputError::Canceled),
+            };
+            let response = match result {
+                Ok(responses) => {
+                    let value = responses
+                        .get("elicitation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    serde_json::from_value::<ElicitResult>(value).map_err(|error| {
+                        ErrorData::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!("elicitation 应答解析失败：{error}"),
+                            None,
+                        )
+                    })?
+                }
+                Err(InputError::Unsupported { .. } | InputError::Invalid { .. }) => {
+                    return Err(ErrorData::new(
+                        ErrorCode::INVALID_REQUEST,
+                        "当前运行模式不支持或无法处理交互输入",
+                        None,
+                    ));
+                }
+                Err(
+                    InputError::Timeout { .. }
+                    | InputError::Canceled
+                    | InputError::Disconnected,
+                ) => ElicitResult::new(ElicitationAction::Cancel),
+                Err(InputError::NoPending | InputError::InvalidAnswer { .. }) => {
+                    return Err(ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        "交互输入应答不可用",
+                        None,
+                    ));
+                }
+            };
+            if let Some(call) = active_call {
+                call.push_server_input(ServerInput {
+                    kind: "elicitation".to_string(),
+                    request: request_value,
+                    response: Some(
+                        serde_json::to_value(&response).unwrap_or(serde_json::Value::Null),
+                    ),
+                    at: Utc::now(),
+                    truncated: false,
+                });
+            }
+            hub.push_notification(
+                "elicitation/response",
+                serde_json::to_value(&response).unwrap_or(serde_json::Value::Null),
+            );
+            Ok(response)
+        }
     }
 
     fn on_cancelled(

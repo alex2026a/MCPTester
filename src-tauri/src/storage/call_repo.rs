@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::mcp::models::{
-    CallFrames, CallMethod, CallOrigin, CallRecord, CallRecordSummary, CallStatus, TransportKind,
+    CallFrames, CallMethod, CallOrigin, CallRecord, CallRecordSummary, CallRounds, CallStatus,
+    TransportKind,
 };
 use crate::mcp::wire::FRAME_MAX_BYTES;
 
@@ -126,14 +127,20 @@ pub fn insert(
     let frames_truncated = frames.is_some_and(|item| item.truncated)
         || request_frame_truncated
         || response_frame_truncated;
+    let rounds_text = record
+        .rounds
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
 
     conn.execute(
         "INSERT INTO call_records
             (id, server_id, server_name, method, target, params_json, result_json, error_json,
              status, duration_ms, protocol_version, transport, truncated, size_bytes, origin,
-             rpc_id, request_frame_json, response_frame_json, frames_truncated, created_at)
+             rpc_id, request_frame_json, response_frame_json, frames_truncated, rounds_json,
+             created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20)",
+                 ?16, ?17, ?18, ?19, ?20, ?21)",
         rusqlite::params![
             record.id,
             record.server_id,
@@ -154,6 +161,7 @@ pub fn insert(
             request_frame_text,
             response_frame_text,
             if frames_truncated { 1 } else { 0 },
+            rounds_text,
             record.created_at.to_rfc3339(),
         ],
     )?;
@@ -439,7 +447,7 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<CallRecord>> {
             "SELECT id, server_id, server_name, method, target, params_json, result_json,
                     error_json, status, duration_ms, protocol_version, transport, truncated,
                     size_bytes, origin, rpc_id, request_frame_json, response_frame_json,
-                    frames_truncated, created_at
+                    frames_truncated, rounds_json, created_at
              FROM call_records WHERE id = ?1",
             [id],
             |row| {
@@ -463,7 +471,8 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<CallRecord>> {
                     request_frame_json: row.get(16)?,
                     response_frame_json: row.get(17)?,
                     frames_truncated: row.get::<_, i64>(18)? != 0,
-                    created_at: row.get(19)?,
+                    rounds_json: row.get(19)?,
+                    created_at: row.get(20)?,
                 })
             },
         )
@@ -616,13 +625,16 @@ pub fn export_text(
         };
         let mut value = serde_json::to_value(&record)?;
         if include_frames {
-            if let Some(frames) = value.get("frames") {
-                frame_bytes += serde_json::to_string(frames)
-                    .map(|text| text.len())
-                    .unwrap_or(0);
+            for key in ["frames", "rounds"] {
+                if let Some(item) = value.get(key) {
+                    frame_bytes += serde_json::to_string(item)
+                        .map(|text| text.len())
+                        .unwrap_or(0);
+                }
             }
         } else if let Some(object) = value.as_object_mut() {
             object.remove("frames");
+            object.remove("rounds");
         }
         records.push(value);
         if include_frames && frame_bytes > EXPORT_FRAMES_MAX_BYTES {
@@ -691,6 +703,7 @@ struct FullRow {
     request_frame_json: Option<String>,
     response_frame_json: Option<String>,
     frames_truncated: bool,
+    rounds_json: Option<String>,
     created_at: String,
 }
 
@@ -719,6 +732,10 @@ impl FullRow {
         } else {
             None
         };
+        let rounds = self
+            .rounds_json
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<CallRounds>(text).ok());
         Ok(CallRecord {
             id: self.id,
             server_id: self.server_id,
@@ -740,6 +757,7 @@ impl FullRow {
             size_bytes: self.size_bytes,
             origin: parse_origin(&self.origin)?,
             frames,
+            rounds,
             created_at: parse_time(&self.created_at)?,
         })
     }
@@ -799,6 +817,7 @@ fn parse_time(value: &str) -> anyhow::Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::mcp::error::CallError;
+    use crate::mcp::models::{CallRound, ServerInput};
 
     fn temp_conn() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().expect("临时目录创建失败");
@@ -833,8 +852,57 @@ mod tests {
             size_bytes: 0,
             origin: CallOrigin::Manual,
             frames: None,
+            rounds: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn rounds_roundtrip_and_export_switch() {
+        let (dir, conn) = temp_conn();
+        let results = dir.path().join("results");
+        let mut record = sample("rounds-1", CallMethod::ToolsCall, CallStatus::Ok);
+        record.rounds = Some(CallRounds {
+            rounds: vec![
+                CallRound {
+                    round: 1,
+                    rpc_id: Some(serde_json::json!(1)),
+                    request: Some(serde_json::json!({ "method": "tools/call", "id": 1 })),
+                    response: Some(serde_json::json!({ "resultType": "input_required", "id": 1 })),
+                    input_requests: Some(serde_json::json!({ "name": {} })),
+                    input_responses: Some(serde_json::json!({ "name": { "action": "accept" } })),
+                    truncated: false,
+                },
+                CallRound {
+                    round: 2,
+                    rpc_id: Some(serde_json::json!(2)),
+                    request: Some(serde_json::json!({ "method": "tools/call", "id": 2 })),
+                    response: Some(serde_json::json!({ "result": {}, "id": 2 })),
+                    input_requests: None,
+                    input_responses: None,
+                    truncated: false,
+                },
+            ],
+            server_inputs: vec![ServerInput {
+                kind: "elicitation".to_string(),
+                request: serde_json::json!({ "method": "elicitation/create" }),
+                response: Some(serde_json::json!({ "action": "accept" })),
+                at: Utc::now(),
+                truncated: false,
+            }],
+            truncated: false,
+        });
+        insert(&conn, &results, &record).expect("插入失败");
+        let loaded = get(&conn, "rounds-1").expect("查询失败").expect("记录丢失");
+        let rounds = loaded.rounds.expect("rounds 丢失");
+        assert_eq!(rounds.rounds.len(), 2);
+        assert_eq!(rounds.rounds[1].round, 2);
+        assert_eq!(rounds.server_inputs.len(), 1);
+
+        let (json, _) = export_text(&conn, &CallFilter::default(), false).expect("导出失败");
+        assert!(!json.contains("\"rounds\""));
+        let (json, _) = export_text(&conn, &CallFilter::default(), true).expect("导出失败");
+        assert!(json.contains("\"rounds\""));
     }
 
     #[test]

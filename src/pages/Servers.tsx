@@ -459,6 +459,14 @@ export function Servers() {
                                 : "OAuth 未登录"}
                         </span>
                       ) : null}
+                      {server.oauth?.allow_insecure_http ? (
+                        <span
+                          className="rounded bg-red-50 px-1.5 py-0.5 text-[11px] text-red-600"
+                          title="OAuth 允许明文 HTTP：授权码与 token 可能被同网段截获"
+                        >
+                          明文 HTTP
+                        </span>
+                      ) : null}
                     </div>
                     <StatusBadge state={server.state} />
                     {oauthStepUp ? (

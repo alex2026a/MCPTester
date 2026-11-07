@@ -116,6 +116,7 @@ async fn test_call_options_keep_call_id_timeout_and_origin() {
                 call_id: Some("case-call-1".to_string()),
                 timeout_secs: Some(5),
                 origin: CallOrigin::Test,
+                input_handler: None,
             },
         )
         .await;
@@ -131,6 +132,7 @@ async fn test_call_options_keep_call_id_timeout_and_origin() {
                 call_id: Some("case-call-2".to_string()),
                 timeout_secs: Some(5),
                 origin: CallOrigin::Test,
+                input_handler: None,
             },
         )
         .await;
@@ -153,6 +155,7 @@ async fn test_call_options_keep_call_id_timeout_and_origin() {
                 call_id: Some("case-call-3".to_string()),
                 timeout_secs: Some(5),
                 origin: CallOrigin::Test,
+                input_handler: None,
             },
         )
         .await;

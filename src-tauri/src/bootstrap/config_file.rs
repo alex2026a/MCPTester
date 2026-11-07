@@ -540,12 +540,15 @@ mod tests {
         let db = Database::open(&dir.path().join("test.db")).expect("数据库打开失败");
         db.migrate().expect("迁移失败");
         let oauth = crate::mcp::oauth::OAuthService::new(db.clone(), true);
+        let manager = Arc::new(ConnectionManager::new(
+            RuntimeSettings::default(),
+            Some(oauth.clone()),
+        ));
+        let input = manager.input().clone();
         let state = AppState {
             db,
-            manager: Arc::new(ConnectionManager::new(
-                RuntimeSettings::default(),
-                Some(oauth.clone()),
-            )),
+            manager,
+            input,
             oauth,
             data_dir: dir.path().to_path_buf(),
             log_dir: dir.path().join("logs"),

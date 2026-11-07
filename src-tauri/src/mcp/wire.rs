@@ -101,8 +101,8 @@ pub struct CapturedExchange {
 struct CaptureState {
     entries: HashMap<String, CapturedExchange>,
     order: VecDeque<String>,
-    /// call_id → rpc_key
-    links: HashMap<String, String>,
+    /// call_id → 按轮次顺序的 rpc_key
+    links: HashMap<String, Vec<String>>,
 }
 
 impl CaptureState {
@@ -112,6 +112,10 @@ impl CaptureState {
                 break;
             };
             self.entries.remove(&oldest);
+            for keys in self.links.values_mut() {
+                keys.retain(|key| key != &oldest);
+            }
+            self.links.retain(|_, keys| !keys.is_empty());
         }
     }
 
@@ -254,7 +258,7 @@ impl WireLog {
         }
     }
 
-    /// 把 rpc_id 归属到 call_id；请求帧可能已采集，也可能稍后才到
+    /// 把 rpc_id 归属到 call_id；多轮调用会追加而不是覆盖
     pub fn link_capture(&self, rpc_id: &RequestId, call_id: &str) {
         let Ok(value) = serde_json::to_value(rpc_id) else {
             return;
@@ -263,16 +267,29 @@ impl WireLog {
             return;
         };
         let mut state = self.captures.lock().expect("原始帧采集锁异常");
-        state.links.insert(call_id.to_string(), key);
+        let keys = state.links.entry(call_id.to_string()).or_default();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
 
-    /// 取出并删除一次调用的原始帧
-    pub fn take_capture(&self, call_id: &str) -> Option<CapturedExchange> {
+    /// 取出并删除一次调用的全部原始帧（按轮次顺序）
+    pub fn take_captures(&self, call_id: &str) -> Vec<CapturedExchange> {
         let mut state = self.captures.lock().expect("原始帧采集锁异常");
-        let key = state.links.remove(call_id)?;
-        let entry = state.entries.remove(&key);
-        state.order.retain(|item| item != &key);
-        entry
+        let keys = state.links.remove(call_id).unwrap_or_default();
+        let mut captures = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(entry) = state.entries.remove(&key) {
+                state.order.retain(|item| item != &key);
+                captures.push(entry);
+            }
+        }
+        captures
+    }
+
+    /// 单轮兼容入口：返回第一轮（并删除全部轮次）
+    pub fn take_capture(&self, call_id: &str) -> Option<CapturedExchange> {
+        self.take_captures(call_id).into_iter().next()
     }
 
     /// 全量快照（按 seq 升序）

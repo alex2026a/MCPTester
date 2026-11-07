@@ -119,6 +119,11 @@ pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerSummar
                     .map(|status| status.scopes.clone())
                     .unwrap_or_default(),
                 expires_at: status.and_then(|status| status.expires_at),
+                allow_insecure_http: config
+                    .http
+                    .as_ref()
+                    .and_then(|http| http.oauth.as_ref())
+                    .is_some_and(|oauth| oauth.allow_insecure_http),
                 required_scope: challenge
                     .as_ref()
                     .and_then(|challenge| challenge.required_scope.clone()),
@@ -1036,7 +1041,7 @@ fn validate_oauth(
             return Err(format!("OAuth 模式下请求头「{key}」重复"));
         }
     }
-    ensure_oauth_url(&http.url, "MCP 端点")?;
+    ensure_oauth_url(&http.url, "MCP 端点", oauth.allow_insecure_http)?;
     validate_authorize_params(oauth)?;
     if oauth.client_secret.is_some() && oauth.client_id.is_none() {
         return Err("client_secret 必须与 client_id 同时填写".to_string());
@@ -1075,7 +1080,7 @@ fn validate_oauth(
     .into_iter()
     .flatten()
     {
-        ensure_oauth_url(endpoint, "OAuth 端点")?;
+        ensure_oauth_url(endpoint, "OAuth 端点", oauth.allow_insecure_http)?;
     }
     if let Some(value) = oauth.revocation_endpoint.as_deref() {
         let url = url::Url::parse(value).map_err(|e| format!("撤销端点 URL 非法：{e}"))?;
@@ -1161,7 +1166,7 @@ fn validate_client_metadata_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_oauth_url(value: &str, label: &str) -> Result<(), String> {
+fn ensure_oauth_url(value: &str, label: &str, allow_insecure_http: bool) -> Result<(), String> {
     let url = url::Url::parse(value).map_err(|e| format!("{label} URL 非法：{e}"))?;
     let loopback = url
         .host_str()
@@ -1172,8 +1177,12 @@ fn ensure_oauth_url(value: &str, label: &str) -> Result<(), String> {
                 || host == "::1"
         })
         .unwrap_or(false);
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        return Err(format!("{label} 必须使用 https（loopback 除外）：{value}"));
+    if url.scheme() != "https"
+        && !(url.scheme() == "http" && (loopback || allow_insecure_http))
+    {
+        return Err(format!(
+            "{label} 必须使用 https（loopback 或显式允许明文 HTTP 除外）：{value}"
+        ));
     }
     Ok(())
 }
@@ -1688,6 +1697,46 @@ mod tests {
     }
 
     #[test]
+    fn oauth_validation_allows_insecure_http_only_when_opted_in() {
+        // loopback http 不需要开关
+        let mut draft = oauth_draft();
+        draft.http.as_mut().unwrap().url = "http://127.0.0.1:8000/mcp".to_string();
+        assert!(validate_draft(&draft).is_ok(), "loopback http 应允许");
+
+        // 非 loopback http 默认拒绝
+        let mut draft = oauth_draft();
+        draft.http.as_mut().unwrap().url = "http://example.com/mcp".to_string();
+        assert!(
+            validate_draft(&draft).is_err(),
+            "非 loopback http 默认应拒绝"
+        );
+
+        // 显式允许后，资源与端点都可为 http
+        let mut draft = oauth_draft();
+        let http = draft.http.as_mut().unwrap();
+        http.url = "http://example.com/mcp".to_string();
+        let oauth = http.oauth.as_mut().unwrap();
+        oauth.allow_insecure_http = true;
+        oauth.authorization_endpoint = Some("http://auth.example.com/authorize".to_string());
+        oauth.token_endpoint = Some("http://auth.example.com/token".to_string());
+        oauth.registration_endpoint = Some("http://auth.example.com/register".to_string());
+        assert!(validate_draft(&draft).is_ok(), "显式允许后 http 应通过");
+
+        // CIMD 是授权服务器拉取的文档地址，仍必须 HTTPS
+        let mut draft = oauth_draft();
+        let oauth = draft
+            .http
+            .as_mut()
+            .unwrap()
+            .oauth
+            .as_mut()
+            .unwrap();
+        oauth.allow_insecure_http = true;
+        oauth.client_metadata_url = Some("http://client.example.com/metadata.json".to_string());
+        assert!(validate_draft(&draft).is_err(), "CIMD 仍必须 HTTPS");
+    }
+
+    #[test]
     fn oauth_validation_rejects_duplicate_headers_and_reserved_params() {
         let mut draft = oauth_draft();
         draft.http.as_mut().unwrap().headers = vec![
@@ -1836,12 +1885,15 @@ mod tests {
         let db = Database::open(&dir.path().join("test.db")).expect("数据库打开失败");
         db.migrate().expect("迁移失败");
         let oauth = crate::mcp::oauth::OAuthService::new(db.clone(), true);
+        let manager = Arc::new(ConnectionManager::new(
+            RuntimeSettings::default(),
+            Some(oauth.clone()),
+        ));
+        let input = manager.input().clone();
         let state = AppState {
             db,
-            manager: Arc::new(ConnectionManager::new(
-                RuntimeSettings::default(),
-                Some(oauth.clone()),
-            )),
+            manager,
+            input,
             oauth,
             data_dir: dir.path().to_path_buf(),
             log_dir: dir.path().join("logs"),

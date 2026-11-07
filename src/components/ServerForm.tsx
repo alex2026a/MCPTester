@@ -86,6 +86,26 @@ function needsPortHint(url: string): boolean {
   return !hostPort.includes(":");
 }
 
+/** 与后端 OAuth URL 校验保持一致：loopback 可用 http */
+function isLoopbackHost(host: string): boolean {
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "[::1]" ||
+    host === "::1"
+  );
+}
+
+/** 非 loopback 的明文 HTTP URL（OAuth 默认不允许） */
+function isInsecureHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && !isLoopbackHost(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** 键值行编辑器（env / headers 共用；可标记敏感）
  *
  * v0.1.2：敏感值若为掩码形态（`****`），输入框显示为空并以占位符提示
@@ -236,6 +256,9 @@ export function ServerForm({
   const [allowMissingIssuer, setAllowMissingIssuer] = useState(
     initial?.http?.oauth?.allow_missing_issuer ?? false,
   );
+  const [allowInsecureHttp, setAllowInsecureHttp] = useState(
+    initial?.http?.oauth?.allow_insecure_http ?? false,
+  );
   const [authorizeParamsText, setAuthorizeParamsText] = useState(
     formatAuthorizeParams(initial?.http?.oauth?.authorize_params),
   );
@@ -344,6 +367,7 @@ export function ServerForm({
           registration_endpoint: registrationEndpoint.trim() || null,
           issuer: oauthIssuer.trim() || null,
           allow_missing_issuer: allowMissingIssuer,
+          allow_insecure_http: allowInsecureHttp,
           authorize_params: authorizeParams.params,
           forward_headers_to_auth_server: forwardHeadersToAuthServer,
           client_metadata_url: clientMetadataUrl.trim() || null,
@@ -397,6 +421,7 @@ export function ServerForm({
   }
 
   const isStdio = transport === "stdio";
+  const oauthSelected = !isStdio && authMode === "oauth";
 
   return (
     <div className="space-y-4 rounded-lg border border-slate-200 bg-white p-4">
@@ -519,6 +544,12 @@ export function ServerForm({
               服务通常带自定义端口， 如 http://127.0.0.1:8000/mcp
             </div>
           ) : null}
+          {oauthSelected && isInsecureHttpUrl(http.url) && !allowInsecureHttp ? (
+            <div className="text-[11px] text-amber-600">
+              OAuth 模式默认要求 https（loopback 除外）；如确需在私有网络使用明文测试，
+              请在下方「高级：手工端点 / issuer」勾选「允许明文 HTTP」。
+            </div>
+          ) : null}
           <label className="block space-y-1 text-xs text-slate-600">
             认证方式
             <select
@@ -611,6 +642,12 @@ export function ServerForm({
                   清除客户端密钥
                 </label>
               ) : null}
+              {allowInsecureHttp ? (
+                <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                  已允许明文 HTTP：授权码、access token 与 refresh token
+                  可能被同网段截获，仅限隔离测试网。
+                </div>
+              ) : null}
               <details className="rounded border border-slate-200 bg-white/70 px-2 py-1">
                 <summary className="cursor-pointer text-xs text-slate-500">
                   高级：手工端点 / issuer
@@ -657,6 +694,22 @@ export function ServerForm({
                   />
                   容忍元数据缺少 issuer（仅不规范服务器）
                 </label>
+                <label className="mt-2 flex items-start gap-2 text-xs text-slate-600">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={allowInsecureHttp}
+                    onChange={(e) => setAllowInsecureHttp(e.target.checked)}
+                  />
+                  <span>
+                    允许明文 HTTP（资源与授权服务器端点；token
+                    会明文传输，仅限隔离测试网）
+                  </span>
+                </label>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  使用私有 IP 的授权服务器可能被自动发现的安全策略拦截；此时请手工填写上方的
+                  authorization/token 端点与 issuer。
+                </p>
               </details>
               <details className="rounded border border-slate-200 bg-white/70 px-2 py-1">
                 <summary className="cursor-pointer text-xs text-slate-500">

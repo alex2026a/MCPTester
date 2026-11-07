@@ -115,6 +115,36 @@ describe("Servers OAuth", () => {
     ).toBeInTheDocument();
   });
 
+  it("允许明文 HTTP 时显示警示标签", async () => {
+    const oauthServer: ServerSummary = {
+      ...alpha,
+      id: "plain",
+      name: "Plain",
+      transport: "streamable_http",
+      oauth: {
+        configured: true,
+        authorized: true,
+        refreshable: true,
+        scopes: ["read"],
+        expires_at: null,
+        allow_insecure_http: true,
+      },
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([oauthServer]);
+        case "get_app_info":
+          return Promise.resolve(null);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+
+    renderServers();
+    expect(await screen.findByText("明文 HTTP")).toBeInTheDocument();
+  });
+
   it("Ready + step-up 显示缺少权限和补充授权", async () => {
     const oauthServer: ServerSummary = {
       ...alpha,

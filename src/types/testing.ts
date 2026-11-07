@@ -38,6 +38,7 @@ export type FailureKind =
   | "timeout"
   | "server_unhealthy"
   | "case_invalid"
+  | "input_required"
   | "unknown";
 
 export interface TestExpect {

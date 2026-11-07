@@ -20,13 +20,14 @@ use std::time::Duration;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
-    GetPromptResponse, GetPromptResult, Implementation, InputRequiredResult, JsonObject,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerConfig, SubscriptionFilter,
-    Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CreateTaskResult,
+    ElicitRequest, ElicitRequestParams, ElicitationSchema, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, Implementation, InputRequest, InputRequests,
+    InputRequiredResult, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
+    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+    ServerConfig, SubscriptionFilter, Task, TaskStatus, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
@@ -120,8 +121,14 @@ fn tool_add() -> Tool {
 fn tool_structured() -> Tool {
     let mut tool = Tool::new(
         "structured",
-        "返回结构化内容 + 文本内容",
-        schema(json!({ "type": "object", "properties": {}, "required": [] })),
+        "返回结构化内容 + 文本内容；mode=task 时返回 SEP-2663 任务",
+        schema(json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["task"] }
+            },
+            "required": []
+        })),
     );
     tool.title = Some("结构化输出".to_string());
     tool.annotations = Some(read_only());
@@ -157,12 +164,49 @@ fn tool_slow_echo() -> Tool {
 fn tool_input_required() -> Tool {
     let mut tool = Tool::new(
         "input_required",
-        "返回 resultType=input_required，用于验证 v0.1 的 MRTR 处理",
-        schema(json!({ "type": "object", "properties": {}, "required": [] })),
+        "MRTR：single / two / state / decline 四种交互场景",
+        schema(json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["single", "two", "state", "decline"] }
+            },
+            "required": []
+        })),
     );
     tool.title = Some("需要交互输入（MRTR）".to_string());
     tool.annotations = Some(read_only());
     tool
+}
+
+fn tool_elicit_legacy() -> Tool {
+    let mut tool = Tool::new(
+        "elicit_legacy",
+        "旧世代 elicitation：向客户端请求一个测试值",
+        schema(json!({ "type": "object", "properties": {}, "required": [] })),
+    );
+    tool.title = Some("旧世代交互输入".to_string());
+    tool.annotations = Some(read_only());
+    tool
+}
+
+fn input_form_requests(key: &str, field: &str) -> InputRequests {
+    let schema: ElicitationSchema = serde_json::from_value(json!({
+        "type": "object",
+        "properties": { field: { "type": "string", "minLength": 1 } },
+        "required": [field]
+    }))
+    .expect("mock elicitation schema");
+    let params = ElicitRequestParams::FormElicitationParams {
+        meta: None,
+        message: format!("请输入 {field}"),
+        requested_schema: schema,
+    };
+    let mut requests = InputRequests::new();
+    requests.insert(
+        key.to_string(),
+        InputRequest::Elicitation(ElicitRequest::new(params)),
+    );
+    requests
 }
 
 fn tool_bounded() -> Tool {
@@ -306,6 +350,7 @@ impl ServerHandler for MockServer {
             tool_structured(),
             tool_slow_echo(),
             tool_input_required(),
+            tool_elicit_legacy(),
             tool_bounded(),
             tool_strict(),
             tool_destroy(),
@@ -318,7 +363,7 @@ impl ServerHandler for MockServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
@@ -339,6 +384,14 @@ impl ServerHandler for MockServer {
                 Ok(result.into())
             }
             "structured" => {
+                if args.get("mode").and_then(Value::as_str) == Some("task") {
+                    return Ok(CallToolResponse::Task(CreateTaskResult::new(Task::new(
+                        "mock-task",
+                        TaskStatus::Working,
+                        "2026-10-29T00:00:00Z",
+                        "2026-10-29T00:00:00Z",
+                    ))));
+                }
                 let mut result =
                     CallToolResult::structured(json!({ "ok": true, "items": [1, 2, 3] }));
                 result.content = vec![ContentBlock::text("结构化结果：3 项")];
@@ -358,10 +411,111 @@ impl ServerHandler for MockServer {
                 )
             }
             "input_required" => {
-                // MRTR：要求客户端提供交互输入（v0.1 期望：明确报错，不自动重试）
-                Ok(CallToolResponse::InputRequired(
-                    InputRequiredResult::from_request_state("mock-state"),
-                ))
+                let mode = args.get("mode").and_then(Value::as_str).unwrap_or("single");
+                let has_responses = request.input_responses.is_some();
+                let state = request.request_state.as_deref();
+                match mode {
+                    "state" => {
+                        if state == Some("state-only") {
+                            Ok(CallToolResult::success(vec![ContentBlock::text(
+                                "state-only done",
+                            )])
+                            .into())
+                        } else {
+                            Ok(CallToolResponse::InputRequired(
+                                InputRequiredResult::from_request_state("state-only"),
+                            ))
+                        }
+                    }
+                    "two" => match state {
+                        Some("two-1") => Ok(CallToolResponse::InputRequired(
+                            InputRequiredResult::new(
+                                Some(input_form_requests("city", "city")),
+                                Some("two-2".to_string()),
+                            ),
+                        )),
+                        Some("two-2") => Ok(CallToolResult::success(vec![ContentBlock::text(
+                            "two rounds done",
+                        )])
+                        .into()),
+                        _ => Ok(CallToolResponse::InputRequired(
+                            InputRequiredResult::new(
+                                Some(input_form_requests("name", "name")),
+                                Some("two-1".to_string()),
+                            ),
+                        )),
+                    },
+                    "decline" => {
+                        if has_responses {
+                            let action = request
+                                .input_responses
+                                .as_ref()
+                                .and_then(|responses| responses.get("name"))
+                                .and_then(|value| value.get("action"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                "declined: {action}"
+                            ))])
+                            .into())
+                        } else {
+                            Ok(CallToolResponse::InputRequired(
+                                InputRequiredResult::new(
+                                    Some(input_form_requests("name", "name")),
+                                    Some("decline".to_string()),
+                                ),
+                            ))
+                        }
+                    }
+                    _ => {
+                        if has_responses {
+                            let name = request
+                                .input_responses
+                                .as_ref()
+                                .and_then(|responses| responses.get("name"))
+                                .and_then(|value| value.get("content"))
+                                .and_then(|content| content.get("name"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("?");
+                            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                "hello {name}"
+                            ))])
+                            .into())
+                        } else {
+                            Ok(CallToolResponse::InputRequired(
+                                InputRequiredResult::new(
+                                    Some(input_form_requests("name", "name")),
+                                    Some("single".to_string()),
+                                ),
+                            ))
+                        }
+                    }
+                }
+            }
+            "elicit_legacy" => {
+                let schema: ElicitationSchema = serde_json::from_value(json!({
+                    "type": "object",
+                    "properties": { "value": { "type": "string", "minLength": 1 } },
+                    "required": ["value"]
+                }))
+                .expect("mock elicitation schema");
+                let params = ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: "请输入测试值".to_string(),
+                    requested_schema: schema,
+                };
+                let result = context
+                    .peer
+                    .create_elicitation_with_timeout(params, Some(Duration::from_secs(10)))
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(format!("elicitation 失败：{error}"), None)
+                    })?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "elicitation: {:?}",
+                    result.action
+                ))])
+                .into())
             }
             "bounded" => {
                 let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -569,6 +723,8 @@ async fn async_main() {
     let mut era = Era::Both;
     let mut caps = CapsMode::All;
     let mut port: u16 = 18080;
+    let mut host = "127.0.0.1".to_string();
+    let mut public_url: Option<String> = None;
     let mut exit_after_ms: u64 = 0;
     let mut fastmcp_compat: Option<String> = None;
     let mut oauth = false;
@@ -607,6 +763,14 @@ async fn async_main() {
                 i += 1;
                 port = args.get(i).and_then(|p| p.parse().ok()).unwrap_or(port);
             }
+            "--host" => {
+                i += 1;
+                host = args.get(i).cloned().unwrap_or(host);
+            }
+            "--public-url" => {
+                i += 1;
+                public_url = args.get(i).cloned();
+            }
             "--exit-after-ms" => {
                 // 测试用：指定毫秒后进程自行退出（验证客户端 lost 检测）
                 i += 1;
@@ -642,7 +806,7 @@ async fn async_main() {
             "--oauth-cimd" => oauth_cimd = true,
             "--help" | "-h" => {
                 println!(
-                    "用法：mock-mcp-server --transport stdio|http|sse [--era both|modern|legacy] [--caps all|tools-only|no-templates|none] [--port N] [--exit-after-ms N] [--fastmcp-compat] [--token T] [--oauth] [--oauth-no-refresh] [--oauth-dcr-secret] [--oauth-token-ttl N] [--oauth-require-authorize-param key=value] [--oauth-cimd]"
+                    "用法：mock-mcp-server --transport stdio|http|sse [--era both|modern|legacy] [--caps all|tools-only|no-templates|none] [--port N] [--host ADDR] [--public-url URL] [--exit-after-ms N] [--fastmcp-compat] [--token T] [--oauth] [--oauth-no-refresh] [--oauth-dcr-secret] [--oauth-token-ttl N] [--oauth-require-authorize-param key=value] [--oauth-cimd]"
                 );
                 return;
             }
@@ -658,12 +822,19 @@ async fn async_main() {
         });
     }
 
+    let public_url = public_url
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}"))
+        .trim_end_matches('/')
+        .to_string();
+
     match transport.as_str() {
         "stdio" => run_stdio(era, caps).await,
         "http" => {
             run_http(
                 era,
                 port,
+                &host,
+                &public_url,
                 fastmcp_compat,
                 caps,
                 oauth.then_some(OAuthMockConfig {
@@ -676,7 +847,7 @@ async fn async_main() {
             )
             .await
         }
-        "sse" => run_sse(port).await,
+        "sse" => run_sse(port, &host).await,
         other => {
             eprintln!("不支持的传输：{other}");
             std::process::exit(2);
@@ -706,7 +877,7 @@ struct SseState {
     >,
 }
 
-async fn run_sse(port: u16) {
+async fn run_sse(port: u16, host: &str) {
     use axum::routing::{get, post};
 
     let state = SseState {
@@ -717,10 +888,10 @@ async fn run_sse(port: u16) {
         .route("/messages", post(sse_messages_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .expect("mock SSE 端口绑定失败");
-    println!("mock-mcp-server (sse) listening on http://127.0.0.1:{port}/sse");
+    println!("mock-mcp-server (sse) listening on http://{host}:{port}/sse");
     axum::serve(listener, app).await.expect("mock SSE 服务失败");
 }
 
@@ -901,8 +1072,8 @@ struct MockCode {
 }
 
 impl OAuthMockState {
-    fn new(port: u16, config: OAuthMockConfig) -> Self {
-        let issuer = format!("http://127.0.0.1:{port}");
+    fn new(base_url: &str, config: OAuthMockConfig) -> Self {
+        let issuer = base_url.trim_end_matches('/').to_string();
         Self {
             resource: format!("{issuer}/mcp"),
             issuer,
@@ -1174,6 +1345,8 @@ async fn oauth_revoke_form(
 async fn run_http(
     era: Era,
     port: u16,
+    host: &str,
+    public_url: &str,
     fastmcp_compat: Option<String>,
     caps: CapsMode,
     oauth: Option<OAuthMockConfig>,
@@ -1190,7 +1363,7 @@ async fn run_http(
 
     let app = if let Some(oauth_config) = oauth {
         use axum::routing::{get, post};
-        let state = OAuthMockState::new(port, oauth_config);
+        let state = OAuthMockState::new(public_url, oauth_config);
         let mcp = axum::Router::new().nest_service("/mcp", service).layer(
             axum::middleware::from_fn_with_state(state.clone(), oauth_guard),
         );
@@ -1207,11 +1380,13 @@ async fn run_http(
             .route("/revoke", post(oauth_revoke_form))
             .route("/test/revoke", post(oauth_revoke))
             .with_state(state);
-        println!("mock-mcp-server (http, oauth) listening on http://127.0.0.1:{port}/mcp");
+        println!(
+            "mock-mcp-server (http, oauth) listening on {public_url}/mcp (bind {host}:{port})"
+        );
         mcp.merge(routes)
     } else if let Some(token) = fastmcp_compat {
         // v0.1.1：FastMCP 兼容层（鉴权 + 无会话 400），用于客户端回归测试
-        println!("mock-mcp-server (http, fastmcp-compat) listening on http://127.0.0.1:{port}/mcp");
+        println!("mock-mcp-server (http, fastmcp-compat) listening on http://{host}:{port}/mcp");
         axum::Router::new().nest_service("/mcp", service).layer(
             axum::middleware::from_fn_with_state(
                 FastmcpCompat {
@@ -1221,11 +1396,11 @@ async fn run_http(
             ),
         )
     } else {
-        println!("mock-mcp-server (http) listening on http://127.0.0.1:{port}/mcp");
+        println!("mock-mcp-server (http) listening on http://{host}:{port}/mcp");
         axum::Router::new().nest_service("/mcp", service)
     };
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .expect("mock HTTP 端口绑定失败");
     axum::serve(listener, app)

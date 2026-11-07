@@ -1,6 +1,6 @@
 [package]
 name = "mcptester"
-version = "0.5.0"
+version = "0.6.0"
 description = "MCP Tester - MCP 服务接口测试桌面工具"
 authors = ["Wxl"]
 edition = "2024"
@@ -19,6 +19,7 @@ mock-server = [
     "rmcp/transport-io",
     "rmcp/transport-streamable-http-server",
     "rmcp/server-side-http",
+    "rmcp/elicitation",
     "dep:axum",
 ]
 # 开发期工具（probe）的显式开关。

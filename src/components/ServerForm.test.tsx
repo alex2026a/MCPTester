@@ -110,6 +110,45 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
     expect(secret?.value).toBe("new-secret");
   });
 
+  it("允许明文 HTTP 开关写入草稿并展示风险提示", async () => {
+    const onSubmit = vi.fn();
+    const oauthInitial: ServerConfig = {
+      ...initial,
+      http: {
+        url: "http://203.0.113.10:8000/mcp",
+        headers: [],
+        timeout_secs: null,
+        allow_insecure_tls: false,
+        oauth: { scopes: [], allow_insecure_http: true },
+      },
+    };
+    render(
+      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
+    expect(screen.getByText(/已允许明文 HTTP/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+    const draft = onSubmit.mock.calls[0][0] as ServerDraft;
+    expect(draft.http?.oauth?.allow_insecure_http).toBe(true);
+  });
+
+  it("非 loopback 明文 HTTP 且未勾选时提示开关位置", () => {
+    const oauthInitial: ServerConfig = {
+      ...initial,
+      http: {
+        url: "http://203.0.113.10:8000/mcp",
+        headers: [],
+        timeout_secs: null,
+        allow_insecure_tls: false,
+        oauth: { scopes: [] },
+      },
+    };
+    render(
+      <ServerForm initial={oauthInitial} onSubmit={() => {}} onCancel={() => {}} />,
+    );
+    expect(screen.getByText(/OAuth 模式默认要求 https/)).toBeInTheDocument();
+  });
+
   it("授权参数格式错误时阻止保存", async () => {
     const onSubmit = vi.fn();
     const oauthInitial: ServerConfig = {

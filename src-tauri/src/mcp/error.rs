@@ -214,9 +214,29 @@ pub enum CallError {
     #[error("OAuth 临时认证失败：{detail}")]
     AuthTransient { detail: String },
 
-    /// MRTR：结果 `resultType:"input_required"`（v0.1 不支持交互式输入）
-    #[error("需要交互式输入（MRTR input_required，v0.1 不支持）")]
+    /// MRTR：结果 `resultType:"input_required"`
+    #[error("需要交互式输入（当前运行模式不支持）")]
     InputRequired,
+
+    /// MRTR：等待用户输入超时
+    #[error("等待交互输入超时（{timeout_secs}s）")]
+    InputTimeout { timeout_secs: u64 },
+
+    /// MRTR：服务器要求了本版不支持的输入类型（sampling/roots）
+    #[error("不支持的交互输入：{input_kind}")]
+    InputUnsupported { input_kind: String },
+
+    /// MRTR：输入请求/应答不符合协议
+    #[error("交互输入不符合协议：{message}")]
+    InputInvalid { message: String },
+
+    /// MRTR：超过最大轮数
+    #[error("交互输入超过 10 轮")]
+    InputRoundsExceeded,
+
+    /// SEP-2663 Tasks：本版不支持
+    #[error("服务器返回了任务（SEP-2663，task_id={task_id:?}），本版不支持")]
+    TaskUnsupported { task_id: Option<String> },
 
     /// 服务器未声明该能力
     #[error("服务器未声明该能力：{capability}")]

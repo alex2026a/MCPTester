@@ -67,6 +67,7 @@ export const FAILURE_KIND_LABEL: Record<FailureKind, string> = {
   timeout: "超时",
   server_unhealthy: "服务不健康",
   case_invalid: "用例无效",
+  input_required: "需要交互输入",
   unknown: "未知",
 };
 
@@ -102,6 +103,16 @@ export function callErrorLabel(error: CallError): string {
       return "服务器未声明该能力";
     case "input_required":
       return "需要交互式输入";
+    case "input_timeout":
+      return "等待交互输入超时";
+    case "input_unsupported":
+      return "不支持的交互输入";
+    case "input_invalid":
+      return "交互输入不符合协议";
+    case "input_rounds_exceeded":
+      return "交互输入超过 10 轮";
+    case "task_unsupported":
+      return "服务器返回了任务（本版不支持）";
     case "internal":
       return "内部错误";
     default:

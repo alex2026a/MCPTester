@@ -179,6 +179,7 @@ pub enum FailureKind {
     Timeout,
     ServerUnhealthy,
     CaseInvalid,
+    InputRequired,
     Unknown,
 }
 
@@ -193,6 +194,7 @@ impl FailureKind {
             FailureKind::Timeout => "timeout",
             FailureKind::ServerUnhealthy => "server_unhealthy",
             FailureKind::CaseInvalid => "case_invalid",
+            FailureKind::InputRequired => "input_required",
             FailureKind::Unknown => "unknown",
         }
     }

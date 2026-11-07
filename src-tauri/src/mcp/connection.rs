@@ -8,11 +8,12 @@ use chrono::Utc;
 use rmcp::ClientServiceExt;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, ClientRequest, GetPromptRequest,
-    GetPromptRequestParams, PingRequest, ProgressToken, ReadResourceRequest,
-    ReadResourceRequestParams, RequestMetaObject, ServerPeerInfo, ServerResult, SubscriptionFilter,
+    GetPromptRequestParams, InputResponses, JsonObject, PingRequest, ProgressToken,
+    ReadResourceRequest, ReadResourceRequestParams, RequestId, RequestMetaObject, ServerPeerInfo,
+    ServerResult, SubscriptionFilter,
 };
 use rmcp::service::{
-    ClientLifecycleMode, PeerRequestOptions, RoleClient, RunningService, ServiceError,
+    ClientLifecycleMode, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
 };
 use rmcp::transport::IntoTransport;
 use rmcp::transport::auth::{AuthError, AuthorizationManager, WWWAuthenticateParams};
@@ -22,19 +23,27 @@ use url::Url;
 
 use super::error::{CallError, McpError};
 use super::handler::{AppClientHandler, EventHub};
+use super::input::{
+    ActiveCall, ActiveCalls, CallInputGuard, InputContext, InputError, InputHandler,
+    RejectInputHandler, INPUT_WAIT_TIMEOUT_SECS,
+};
 use super::models::{
-    CallFrames, CallMethod, CallOrigin, CallRecord, CallStatus, CapabilitySnapshot,
-    ConnectionState, Handshake, HttpConfig, LEGACY_FALLBACK_VERSION, LifecycleEra,
-    PREFERRED_PROTOCOL_VERSIONS, ProbeResult, PromptArgument, PromptInfo, ResourceInfo,
-    ResourceTemplateInfo, RuntimeSettings, StdioConfig, ToolInfo, TransportKind,
+    CallFrames, CallMethod, CallOrigin, CallRecord, CallRound, CallRounds, CallStatus,
+    CapabilitySnapshot, ConnectionState, Handshake, HttpConfig, LEGACY_FALLBACK_VERSION,
+    LifecycleEra, PREFERRED_PROTOCOL_VERSIONS, ProbeResult, PromptArgument, PromptInfo,
+    ResourceInfo, ResourceTemplateInfo, RuntimeSettings, ServerInput, StdioConfig, ToolInfo,
+    TransportKind,
 };
 use super::oauth::AuthStateSink;
 use super::transport;
-use super::wire::{WireLog, WireTransport};
+use super::wire::{CapturedExchange, WireLog, WireTransport};
 
 /// 在途调用条目（取消 = 中止本地等待 + 发送取消通知）
 struct InFlight {
-    abort: tokio::task::AbortHandle,
+    /// 等待网络响应时有值；等待用户输入时为 None
+    abort: Option<tokio::task::AbortHandle>,
+    /// 本轮 JSON-RPC id；等待输入时保留上一轮 id，用于取消通知
+    rpc_id: Option<RequestId>,
     canceled: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -65,11 +74,99 @@ impl OAuthChallenge {
 }
 
 /// 单次调用选项（测试运行器使用独立 call_id / timeout / 来源）。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct CallOptions {
     pub call_id: Option<String>,
     pub timeout_secs: Option<u64>,
     pub origin: CallOrigin,
+    /// 覆盖连接级输入处理器（测试运行器/probe 用拒绝型）
+    pub input_handler: Option<Arc<dyn InputHandler>>,
+}
+
+impl std::fmt::Debug for CallOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallOptions")
+            .field("call_id", &self.call_id)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("origin", &self.origin)
+            .field("input_handler", &self.input_handler.is_some())
+            .finish()
+    }
+}
+
+/// MRTR 最大轮数（与 rmcp DEFAULT_MRTR_MAX_ROUNDS 一致）
+const MAX_MRTR_ROUNDS: u32 = 10;
+/// 多轮记录总量预算（rounds + server_inputs）
+const ROUNDS_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 单条旧世代服务器输入上限
+const SERVER_INPUT_MAX_BYTES: usize = 256 * 1024;
+
+/// 可重复构造的调用请求（每轮带 inputResponses / requestState）
+#[derive(Clone)]
+enum InvocationSpec {
+    Tool {
+        name: String,
+        arguments: Option<JsonObject>,
+    },
+    Prompt {
+        name: String,
+        arguments: Option<JsonObject>,
+    },
+    Resource {
+        uri: String,
+    },
+}
+
+impl InvocationSpec {
+    fn build(
+        &self,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+    ) -> ClientRequest {
+        match self {
+            InvocationSpec::Tool { name, arguments } => {
+                let mut params = CallToolRequestParams::new(name.clone());
+                params.arguments = arguments.clone();
+                params.input_responses = input_responses;
+                params.request_state = request_state;
+                ClientRequest::CallToolRequest(CallToolRequest::new(params))
+            }
+            InvocationSpec::Prompt { name, arguments } => {
+                let mut params = GetPromptRequestParams::new(name.clone());
+                params.arguments = arguments.clone();
+                params.input_responses = input_responses;
+                params.request_state = request_state;
+                ClientRequest::GetPromptRequest(GetPromptRequest::new(params))
+            }
+            InvocationSpec::Resource { uri } => {
+                let mut params = ReadResourceRequestParams::new(uri.clone());
+                params.input_responses = input_responses;
+                params.request_state = request_state;
+                ClientRequest::ReadResourceRequest(ReadResourceRequest::new(params))
+            }
+        }
+    }
+}
+
+/// 一轮的归属信息（用于组装 CallRound）
+struct RoundTrace {
+    rpc_id: Option<RequestId>,
+    input_requests: Option<Value>,
+    input_responses: Option<Value>,
+}
+
+enum RoundOutcome {
+    Response {
+        result: Box<ServerResult>,
+        rpc_id: Option<RequestId>,
+    },
+    Canceled {
+        rpc_id: Option<RequestId>,
+    },
+    Error {
+        error: CallError,
+        rpc_id: Option<RequestId>,
+    },
 }
 
 /// 连接句柄（每个服务器一个；内部状态并发安全）
@@ -81,6 +178,10 @@ pub struct ConnectionHandle {
     hub: Arc<EventHub>,
     /// 线上报文日志（v0.1.1；所有传输统一在 Transport 层采集）
     wire: Arc<WireLog>,
+    /// 交互输入处理器（v0.6.0；默认拒绝，manager/UI 用 UiInputHandler）
+    input: Arc<dyn InputHandler>,
+    /// 进行中的调用（旧世代 elicitation 归属）
+    active_calls: Arc<ActiveCalls>,
     settings: RuntimeSettings,
     state: RwLock<ConnectionState>,
     service: Mutex<Option<RunningService<RoleClient, AppClientHandler>>>,
@@ -108,6 +209,25 @@ impl ConnectionHandle {
         transport_kind: TransportKind,
         settings: RuntimeSettings,
     ) -> Arc<Self> {
+        Self::new_with_input(
+            server_id,
+            server_name,
+            protocol_version_pin,
+            transport_kind,
+            settings,
+            Arc::new(RejectInputHandler::new()),
+        )
+    }
+
+    /// 带输入处理器创建（manager 注入 UiInputHandler；测试可注入脚本 handler）
+    pub fn new_with_input(
+        server_id: impl Into<String>,
+        server_name: impl Into<String>,
+        protocol_version_pin: Option<String>,
+        transport_kind: TransportKind,
+        settings: RuntimeSettings,
+        input: Arc<dyn InputHandler>,
+    ) -> Arc<Self> {
         let server_id = server_id.into();
         let hub = EventHub::new(server_id.clone(), &settings);
         let wire = WireLog::new(settings.wire_buffer_lines, 16 * 1024);
@@ -118,6 +238,8 @@ impl ConnectionHandle {
             transport_kind: RwLock::new(transport_kind),
             hub,
             wire,
+            input,
+            active_calls: Arc::new(ActiveCalls::new()),
             settings,
             state: RwLock::new(ConnectionState::Disconnected),
             service: Mutex::new(None),
@@ -251,7 +373,12 @@ impl ConnectionHandle {
     {
         self.set_state(ConnectionState::Connecting).await;
 
-        let handler = AppClientHandler::new(Arc::clone(&self.hub));
+        let handler = AppClientHandler::new(
+            Arc::clone(&self.hub),
+            self.server_name.clone(),
+            Arc::clone(&self.input),
+            Arc::clone(&self.active_calls),
+        );
         let mode = self.lifecycle_mode();
         // v0.1.1：统一在 Transport 层采集线上报文（三传输全覆盖）
         let inner = transport.into_transport();
@@ -337,8 +464,13 @@ impl ConnectionHandle {
         // 1. 取消在途调用（中止本地等待；协议层取消通知尽力而为）
         let entries: Vec<InFlight> = self.inflight.lock().await.drain().map(|(_, e)| e).collect();
         for entry in entries {
-            entry.abort.abort();
+            entry.canceled.store(true, Ordering::SeqCst);
+            if let Some(abort) = entry.abort {
+                abort.abort();
+            }
         }
+        self.input.connection_closed(&self.server_id);
+        self.active_calls.clear();
 
         // 2. 中止订阅任务
         if let Some(task) = self.subscription_task.lock().await.take() {
@@ -390,7 +522,21 @@ impl ConnectionHandle {
                     );
                     let mut guard = this.service.lock().await;
                     if guard.take().is_some() {
-                        this.inflight.lock().await.clear();
+                        let entries: Vec<InFlight> = this
+                            .inflight
+                            .lock()
+                            .await
+                            .drain()
+                            .map(|(_, entry)| entry)
+                            .collect();
+                        for entry in entries {
+                            entry.canceled.store(true, Ordering::SeqCst);
+                            if let Some(abort) = entry.abort {
+                                abort.abort();
+                            }
+                        }
+                        this.input.connection_closed(&this.server_id);
+                        this.active_calls.clear();
                         *this.capabilities.write().await = None;
                         if !already_oauth_required {
                             this.set_state(ConnectionState::Lost {
@@ -745,9 +891,9 @@ impl ConnectionHandle {
         options: CallOptions,
     ) -> CallRecord {
         let record_params = serde_json::json!({ "name": name, "arguments": arguments.clone() });
-        let params = match arguments {
-            Value::Object(map) => CallToolRequestParams::new(name.to_string()).with_arguments(map),
-            Value::Null => CallToolRequestParams::new(name.to_string()),
+        let arguments = match arguments {
+            Value::Object(map) => Some(map),
+            Value::Null => None,
             other => {
                 let mut record = self
                     .failed_record(
@@ -766,11 +912,14 @@ impl ConnectionHandle {
                 return record;
             }
         };
-        let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        let spec = InvocationSpec::Tool {
+            name: name.to_string(),
+            arguments,
+        };
         self.invoke(
             CallMethod::ToolsCall,
             name.to_string(),
-            request,
+            spec,
             record_params,
             options,
         )
@@ -784,13 +933,13 @@ impl ConnectionHandle {
     }
 
     pub async fn read_resource_with_options(&self, uri: &str, options: CallOptions) -> CallRecord {
-        let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
-            ReadResourceRequestParams::new(uri.to_string()),
-        ));
+        let spec = InvocationSpec::Resource {
+            uri: uri.to_string(),
+        };
         self.invoke(
             CallMethod::ResourcesRead,
             uri.to_string(),
-            request,
+            spec,
             serde_json::json!({ "uri": uri }),
             options,
         )
@@ -809,15 +958,17 @@ impl ConnectionHandle {
         arguments: Value,
         options: CallOptions,
     ) -> CallRecord {
-        let mut params = GetPromptRequestParams::new(name.to_string());
-        if let Value::Object(map) = arguments.clone() {
-            params.arguments = Some(map);
-        }
-        let request = ClientRequest::GetPromptRequest(GetPromptRequest::new(params));
+        let spec = InvocationSpec::Prompt {
+            name: name.to_string(),
+            arguments: match &arguments {
+                Value::Object(map) => Some(map.clone()),
+                _ => None,
+            },
+        };
         self.invoke(
             CallMethod::PromptsGet,
             name.to_string(),
-            request,
+            spec,
             serde_json::json!({ "name": name, "arguments": arguments }),
             options,
         )
@@ -829,7 +980,7 @@ impl ConnectionHandle {
         &self,
         method: CallMethod,
         target: String,
-        request: ClientRequest,
+        spec: InvocationSpec,
         params: Value,
         options: CallOptions,
     ) -> CallRecord {
@@ -837,28 +988,55 @@ impl ConnectionHandle {
             .call_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let origin = options.origin.clone();
+        let input = options
+            .input_handler
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.input));
+        let active = Arc::new(ActiveCall::new(
+            Arc::clone(&input),
+            method.clone(),
+            target.clone(),
+        ));
+        let _active_guard = self.active_calls.insert(call_id.clone(), Arc::clone(&active));
+        let _input_guard = CallInputGuard::new(Arc::clone(&input), call_id.clone());
         let mut options = options;
         options.call_id = Some(call_id.clone());
-        let origin = options.origin.clone();
-        let mut record = self
-            .invoke_inner(method, target, request, params, options)
+        options.input_handler = None;
+        let (mut record, traces) = self
+            .invoke_inner(method, target, spec, params, options, Arc::clone(&input))
             .await;
         record.id = call_id.clone();
+        record.origin = origin;
 
-        let mut frames = self.wire.take_capture(&call_id).map(|capture| CallFrames {
-            rpc_id: capture.rpc_id,
-            request: capture.request,
-            response: capture.response,
-            truncated: capture.truncated,
-        });
-        if let Some(frames) = frames.as_mut() {
-            let drop_response = record.status == CallStatus::Canceled
-                || (record.result.is_none()
-                    && matches!(
-                        record.error.as_ref(),
-                        Some(CallError::Timeout { .. } | CallError::TransportClosed { .. })
-                    ));
-            if drop_response && frames.response.is_some() {
+        let server_inputs = active.take_server_inputs();
+        let captures = self.wire.take_captures(&call_id);
+        let (mut frames, mut rounds) =
+            build_call_rounds(&captures, &traces, server_inputs);
+        let drop_last_response = (record.status == CallStatus::Canceled
+            || (record.result.is_none()
+                && matches!(
+                    record.error.as_ref(),
+                    Some(CallError::Timeout { .. } | CallError::TransportClosed { .. })
+                )))
+            && traces
+                .last()
+                .is_some_and(|trace| trace.input_requests.is_none());
+        if drop_last_response {
+            if let Some(rounds) = rounds.as_mut()
+                && let Some(last) = rounds.rounds.last_mut()
+                && last.response.is_some()
+            {
+                last.response = None;
+                last.truncated = true;
+                rounds.truncated = true;
+            }
+            if let Some(frames) = frames.as_mut()
+                && frames.response.is_some()
+                && rounds
+                    .as_ref()
+                    .is_none_or(|rounds| rounds.rounds.len() <= 1)
+            {
                 frames.response = None;
                 frames.truncated = true;
             }
@@ -870,18 +1048,100 @@ impl ConnectionHandle {
             frames = None;
         }
         record.frames = frames;
-        record.origin = origin;
+        record.rounds = rounds;
         record
+    }
+
+    /// 发送一轮请求；返回结果或取消/错误，不写记录
+    async fn send_once(
+        &self,
+        peer: &Peer<RoleClient>,
+        request: ClientRequest,
+        call_id: &str,
+        timeout_secs: u64,
+    ) -> RoundOutcome {
+        let options = PeerRequestOptions::with_timeout(Duration::from_secs(timeout_secs))
+            .with_meta(RequestMetaObject::with_progress_token(ProgressToken(
+                rmcp::model::NumberOrString::String(std::sync::Arc::from(call_id)),
+            )));
+        let handle = match peer.send_cancellable_request(request, options).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.maybe_mark_oauth_required(&error).await;
+                let base_url = self.http_url.lock().await.clone();
+                return RoundOutcome::Error {
+                    error: CallError::from_service_error(
+                        &error,
+                        timeout_secs,
+                        self.oauth_enabled(),
+                        base_url.as_ref(),
+                    ),
+                    rpc_id: None,
+                };
+            }
+        };
+        self.wire.link_capture(&handle.id, call_id);
+        let rpc_id = handle.id.clone();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let result = handle.await_response().await;
+            let _ = response_tx.send(result);
+        });
+        let canceled = Arc::new(AtomicBool::new(false));
+        self.inflight.lock().await.insert(
+            call_id.to_string(),
+            InFlight {
+                abort: Some(responder.abort_handle()),
+                rpc_id: Some(rpc_id.clone()),
+                canceled: Arc::clone(&canceled),
+            },
+        );
+        let response = response_rx.await;
+        self.inflight.lock().await.remove(call_id);
+        match response {
+            Ok(Ok(result)) => RoundOutcome::Response {
+                result: Box::new(result),
+                rpc_id: Some(rpc_id),
+            },
+            Ok(Err(error)) => {
+                self.maybe_mark_oauth_required(&error).await;
+                let base_url = self.http_url.lock().await.clone();
+                RoundOutcome::Error {
+                    error: CallError::from_service_error(
+                        &error,
+                        timeout_secs,
+                        self.oauth_enabled(),
+                        base_url.as_ref(),
+                    ),
+                    rpc_id: Some(rpc_id),
+                }
+            }
+            Err(_) => {
+                if canceled.load(Ordering::SeqCst) {
+                    RoundOutcome::Canceled {
+                        rpc_id: Some(rpc_id),
+                    }
+                } else {
+                    RoundOutcome::Error {
+                        error: CallError::TransportClosed {
+                            reason: "请求已取消".to_string(),
+                        },
+                        rpc_id: Some(rpc_id),
+                    }
+                }
+            }
+        }
     }
 
     async fn invoke_inner(
         &self,
         method: CallMethod,
         target: String,
-        request: ClientRequest,
+        spec: InvocationSpec,
         params: Value,
         options: CallOptions,
-    ) -> CallRecord {
+        input: Arc<dyn InputHandler>,
+    ) -> (CallRecord, Vec<RoundTrace>) {
         let started = Instant::now();
         let call_id = options
             .call_id
@@ -894,8 +1154,8 @@ impl ConnectionHandle {
 
         let peer = match self.peer().await {
             Ok(peer) => peer,
-            Err(e) => {
-                return self
+            Err(error) => {
+                let record = self
                     .record_with_error(
                         method,
                         target,
@@ -903,10 +1163,11 @@ impl ConnectionHandle {
                         started,
                         None,
                         CallError::TransportClosed {
-                            reason: e.message(),
+                            reason: error.message(),
                         },
                     )
                     .await;
+                return (record, Vec::new());
             }
         };
         let protocol_version = match self.state().await {
@@ -914,54 +1175,257 @@ impl ConnectionHandle {
             _ => "unknown".to_string(),
         };
 
-        let options = PeerRequestOptions::with_timeout(Duration::from_secs(timeout_secs))
-            .with_meta(RequestMetaObject::with_progress_token(ProgressToken(
-                rmcp::model::NumberOrString::String(std::sync::Arc::from(call_id.as_str())),
-            )));
+        let mut traces = Vec::new();
+        let mut input_responses: Option<InputResponses> = None;
+        let mut request_state: Option<String> = None;
+        let mut round_no = 0u32;
 
-        let handle = match peer.send_cancellable_request(request, options).await {
-            Ok(handle) => handle,
-            Err(e) => {
-                self.maybe_mark_oauth_required(&e).await;
-                let base_url = self.http_url.lock().await.clone();
-                let err = CallError::from_service_error(
-                    &e,
-                    timeout_secs,
-                    self.oauth_enabled(),
-                    base_url.as_ref(),
-                );
-                return self
-                    .record_with_error(method, target, params, started, Some(protocol_version), err)
+        loop {
+            round_no += 1;
+            if round_no > MAX_MRTR_ROUNDS {
+                let record = self
+                    .record_with_error(
+                        method,
+                        target,
+                        params,
+                        started,
+                        Some(protocol_version),
+                        CallError::InputRoundsExceeded,
+                    )
                     .await;
+                return (record, traces);
             }
-        };
-
-        // 按 rpc_id 把原始帧归属到本次 call_id
-        self.wire.link_capture(&handle.id, &call_id);
-
-        // 响应等待在独立任务中进行：句柄所有权归该任务，取消通过"中止等待 + 发送取消通知"实现
-        // （rmcp 3.5.1 的 RequestHandle::cancel 需要句柄所有权，跨任务取消无法直接调用；
-        //  精确 requestId 关联待 rmcp 提供跨任务取消句柄后补齐，见 05 文档 M2 遗留项）
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let responder = tokio::spawn(async move {
-            let result = handle.await_response().await;
-            let _ = response_tx.send(result);
-        });
-        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.inflight.lock().await.insert(
-            call_id.clone(),
-            InFlight {
-                abort: responder.abort_handle(),
-                canceled: Arc::clone(&canceled),
-            },
-        );
-
-        let response = match response_rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                // 等待任务被中止（取消）或异常结束
-                if canceled.load(std::sync::atomic::Ordering::SeqCst) {
-                    return self
+            let request = spec.build(input_responses.clone(), request_state.clone());
+            let outcome = self
+                .send_once(&peer, request, &call_id, timeout_secs)
+                .await;
+            match outcome {
+                RoundOutcome::Response { result, rpc_id } => match *result {
+                    ServerResult::InputRequiredResult(result) => {
+                        // 非交互模式（测试运行器/probe）遇到任意 input_required 立即失败
+                        if !input.interactive() {
+                            traces.push(RoundTrace {
+                                rpc_id,
+                                input_requests: result
+                                    .input_requests
+                                    .as_ref()
+                                    .map(|requests| {
+                                        serde_json::to_value(requests)
+                                            .unwrap_or(Value::Null)
+                                    }),
+                                input_responses: None,
+                            });
+                            let record = self
+                                .record_with_error(
+                                    method,
+                                    target,
+                                    params,
+                                    started,
+                                    Some(protocol_version),
+                                    CallError::InputRequired,
+                                )
+                                .await;
+                            return (record, traces);
+                        }
+                        let has_input_requests = result
+                            .input_requests
+                            .as_ref()
+                            .is_some_and(|requests| !requests.is_empty());
+                        let input_requests_value = result.input_requests.as_ref().map(|requests| {
+                            serde_json::to_value(requests).unwrap_or(Value::Null)
+                        });
+                        traces.push(RoundTrace {
+                            rpc_id,
+                            input_requests: input_requests_value,
+                            input_responses: None,
+                        });
+                        if !has_input_requests {
+                            if result.request_state.is_none() {
+                                let record = self
+                                    .record_with_error(
+                                        method,
+                                        target,
+                                        params,
+                                        started,
+                                        Some(protocol_version),
+                                        CallError::InputInvalid {
+                                            message:
+                                                "input_required 既无输入请求也无 requestState"
+                                                    .to_string(),
+                                        },
+                                    )
+                                    .await;
+                                return (record, traces);
+                            }
+                            input_responses = None;
+                            request_state = result.request_state;
+                            mrtr_backoff(round_no).await;
+                            continue;
+                        }
+                        let requests = result.input_requests.unwrap_or_default();
+                        let context = InputContext {
+                            server_id: self.server_id.clone(),
+                            server_name: self.server_name.clone(),
+                            call_id: Some(call_id.clone()),
+                            method: Some(method.clone()),
+                            target: Some(target.clone()),
+                            round: round_no,
+                        };
+                        match input
+                            .request(
+                                context,
+                                requests,
+                                Duration::from_secs(INPUT_WAIT_TIMEOUT_SECS),
+                            )
+                            .await
+                        {
+                            Ok(answers) => {
+                                let answers_value =
+                                    serde_json::to_value(&answers).unwrap_or(Value::Null);
+                                if let Some(trace) = traces.last_mut() {
+                                    trace.input_responses = Some(answers_value);
+                                }
+                                input_responses = Some(answers);
+                                request_state = result.request_state;
+                                continue;
+                            }
+                            Err(error) => {
+                                let record = self
+                                    .input_error_record(
+                                        method,
+                                        target,
+                                        params,
+                                        started,
+                                        Some(protocol_version),
+                                        error,
+                                    )
+                                    .await;
+                                return (record, traces);
+                            }
+                        }
+                    }
+                    ServerResult::CallToolResult(result) => {
+                        traces.push(RoundTrace {
+                            rpc_id,
+                            input_requests: None,
+                            input_responses: None,
+                        });
+                        let is_error = result.is_error.unwrap_or(false);
+                        let value = serde_json::to_value(&result).unwrap_or(Value::Null);
+                        let error = if is_error {
+                            Some(CallError::RpcError {
+                                code: 0,
+                                message: "工具返回 isError=true".to_string(),
+                                data: Some(value.clone()),
+                            })
+                        } else {
+                            None
+                        };
+                        let record = self
+                            .finish_record(
+                                method,
+                                target,
+                                params,
+                                started,
+                                Some(protocol_version),
+                                Some(value),
+                                error,
+                                None,
+                            )
+                            .await;
+                        return (record, traces);
+                    }
+                    ServerResult::ReadResourceResult(result) => {
+                        traces.push(RoundTrace {
+                            rpc_id,
+                            input_requests: None,
+                            input_responses: None,
+                        });
+                        let value = serde_json::to_value(&result).unwrap_or(Value::Null);
+                        let record = self
+                            .finish_record(
+                                method,
+                                target,
+                                params,
+                                started,
+                                Some(protocol_version),
+                                Some(value),
+                                None,
+                                None,
+                            )
+                            .await;
+                        return (record, traces);
+                    }
+                    ServerResult::GetPromptResult(result) => {
+                        traces.push(RoundTrace {
+                            rpc_id,
+                            input_requests: None,
+                            input_responses: None,
+                        });
+                        let value = serde_json::to_value(&result).unwrap_or(Value::Null);
+                        let record = self
+                            .finish_record(
+                                method,
+                                target,
+                                params,
+                                started,
+                                Some(protocol_version),
+                                Some(value),
+                                None,
+                                None,
+                            )
+                            .await;
+                        return (record, traces);
+                    }
+                    ServerResult::CreateTaskResult(result) => {
+                        traces.push(RoundTrace {
+                            rpc_id,
+                            input_requests: None,
+                            input_responses: None,
+                        });
+                        let record = self
+                            .record_with_error(
+                                method,
+                                target,
+                                params,
+                                started,
+                                Some(protocol_version),
+                                CallError::TaskUnsupported {
+                                    task_id: Some(result.task.task_id.clone()),
+                                },
+                            )
+                            .await;
+                        return (record, traces);
+                    }
+                    other => {
+                        traces.push(RoundTrace {
+                            rpc_id,
+                            input_requests: None,
+                            input_responses: None,
+                        });
+                        let value = serde_json::to_value(&other).unwrap_or(Value::Null);
+                        let record = self
+                            .finish_record(
+                                method,
+                                target,
+                                params,
+                                started,
+                                Some(protocol_version),
+                                Some(value),
+                                None,
+                                None,
+                            )
+                            .await;
+                        return (record, traces);
+                    }
+                },
+                RoundOutcome::Canceled { rpc_id } => {
+                    traces.push(RoundTrace {
+                        rpc_id,
+                        input_requests: None,
+                        input_responses: None,
+                    });
+                    let record = self
                         .finish_record(
                             method,
                             target,
@@ -973,112 +1437,99 @@ impl ConnectionHandle {
                             Some(CallStatus::Canceled),
                         )
                         .await;
+                    return (record, traces);
                 }
-                return self
-                    .record_with_error(
-                        method,
-                        target,
-                        params,
-                        started,
-                        Some(protocol_version),
-                        CallError::TransportClosed {
-                            reason: "请求已取消".to_string(),
-                        },
-                    )
-                    .await;
+                RoundOutcome::Error { error, rpc_id } => {
+                    traces.push(RoundTrace {
+                        rpc_id,
+                        input_requests: None,
+                        input_responses: None,
+                    });
+                    let record = self
+                        .record_with_error(
+                            method,
+                            target,
+                            params,
+                            started,
+                            Some(protocol_version),
+                            error,
+                        )
+                        .await;
+                    return (record, traces);
+                }
             }
-        };
-        self.inflight.lock().await.remove(&call_id);
+        }
+    }
 
-        match response {
-            Ok(ServerResult::CallToolResult(result)) => {
-                let is_error = result.is_error.unwrap_or(false);
-                let value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                let error = if is_error {
-                    Some(CallError::RpcError {
-                        code: 0,
-                        message: "工具返回 isError=true".to_string(),
-                        data: Some(value.clone()),
-                    })
-                } else {
-                    None
-                };
+    async fn input_error_record(
+        &self,
+        method: CallMethod,
+        target: String,
+        params: Value,
+        started: Instant,
+        protocol_version: Option<String>,
+        error: InputError,
+    ) -> CallRecord {
+        match error {
+            InputError::Canceled => {
                 self.finish_record(
                     method,
                     target,
                     params,
                     started,
-                    Some(protocol_version),
-                    Some(value),
-                    error,
+                    protocol_version,
                     None,
+                    None,
+                    Some(CallStatus::Canceled),
                 )
                 .await
             }
-            Ok(ServerResult::ReadResourceResult(result)) => {
-                let value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                self.finish_record(
-                    method,
-                    target,
-                    params,
-                    started,
-                    Some(protocol_version),
-                    Some(value),
-                    None,
-                    None,
-                )
-                .await
-            }
-            Ok(ServerResult::GetPromptResult(result)) => {
-                let value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                self.finish_record(
-                    method,
-                    target,
-                    params,
-                    started,
-                    Some(protocol_version),
-                    Some(value),
-                    None,
-                    None,
-                )
-                .await
-            }
-            Ok(ServerResult::InputRequiredResult(_)) => {
+            InputError::Timeout { timeout_secs } => {
                 self.record_with_error(
                     method,
                     target,
                     params,
                     started,
-                    Some(protocol_version),
-                    CallError::InputRequired,
+                    protocol_version,
+                    CallError::InputTimeout { timeout_secs },
                 )
                 .await
             }
-            Ok(other) => {
-                let value = serde_json::to_value(&other).unwrap_or(Value::Null);
-                self.finish_record(
+            InputError::Unsupported { kind } => {
+                self.record_with_error(
                     method,
                     target,
                     params,
                     started,
-                    Some(protocol_version),
-                    Some(value),
-                    None,
-                    None,
+                    protocol_version,
+                    CallError::InputUnsupported { input_kind: kind },
                 )
                 .await
             }
-            Err(e) => {
-                self.maybe_mark_oauth_required(&e).await;
-                let base_url = self.http_url.lock().await.clone();
-                let err = CallError::from_service_error(
-                    &e,
-                    timeout_secs,
-                    self.oauth_enabled(),
-                    base_url.as_ref(),
-                );
-                self.record_with_error(method, target, params, started, Some(protocol_version), err)
-                    .await
+            InputError::Disconnected => {
+                self.record_with_error(
+                    method,
+                    target,
+                    params,
+                    started,
+                    protocol_version,
+                    CallError::TransportClosed {
+                        reason: "连接已断开".to_string(),
+                    },
+                )
+                .await
+            }
+            InputError::NoPending | InputError::InvalidAnswer { .. } | InputError::Invalid { .. } => {
+                let message = error.to_string();
+                self.record_with_error(
+                    method,
+                    target,
+                    params,
+                    started,
+                    protocol_version,
+                    CallError::InputInvalid { message },
+                )
+                .await
             }
         }
     }
@@ -1124,18 +1575,24 @@ impl ConnectionHandle {
         }
     }
 
-    /// 取消在途调用：中止本地等待 + 发送 `notifications/cancelled`（尽力而为）
+    /// 取消在途调用：中止本地等待 + 取消待输入 + 发送 `notifications/cancelled`（尽力而为）
     pub async fn cancel_call(&self, call_id: &str) -> bool {
         let entry = self.inflight.lock().await.remove(call_id);
         let Some(entry) = entry else { return false };
-        entry
-            .canceled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        entry.abort.abort();
+        entry.canceled.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(abort) = entry.abort {
+            abort.abort();
+        }
+        let input = self
+            .active_calls
+            .get(call_id)
+            .map(|call| Arc::clone(&call.input))
+            .unwrap_or_else(|| Arc::clone(&self.input));
+        input.cancel_call(call_id);
         if let Ok(peer) = self.peer().await {
             let _ = peer
                 .notify_cancelled(rmcp::model::CancelledNotificationParam::new(
-                    None,
+                    entry.rpc_id,
                     Some(format!("用户取消（call_id={call_id}）")),
                 ))
                 .await;
@@ -1245,9 +1702,129 @@ impl ConnectionHandle {
             size_bytes,
             origin: CallOrigin::Manual,
             frames: None,
+            rounds: None,
             created_at: Utc::now(),
         }
     }
+}
+
+
+fn serialized_rounds_len(rounds: &CallRounds) -> usize {
+    serde_json::to_vec(rounds)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// 组装 frames + rounds；预算裁剪在落库前完成
+fn build_call_rounds(
+    captures: &[CapturedExchange],
+    traces: &[RoundTrace],
+    mut server_inputs: Vec<ServerInput>,
+) -> (Option<CallFrames>, Option<CallRounds>) {
+    let mut by_key = std::collections::HashMap::new();
+    for capture in captures {
+        if let Some(rpc_id) = &capture.rpc_id {
+            by_key.insert(rpc_id.to_string(), capture.clone());
+        }
+    }
+    let mut rounds = Vec::with_capacity(traces.len());
+    for (index, trace) in traces.iter().enumerate() {
+        let key = trace
+            .rpc_id
+            .as_ref()
+            .and_then(|id| serde_json::to_value(id).ok())
+            .map(|value| value.to_string());
+        let capture = key.and_then(|key| by_key.remove(&key));
+        let rpc_id = capture
+            .as_ref()
+            .and_then(|capture| capture.rpc_id.clone())
+            .or_else(|| {
+                trace
+                    .rpc_id
+                    .as_ref()
+                    .and_then(|id| serde_json::to_value(id).ok())
+            });
+        let truncated = capture
+            .as_ref()
+            .map(|capture| capture.truncated)
+            .unwrap_or(true);
+        rounds.push(CallRound {
+            round: index as u32 + 1,
+            rpc_id,
+            request: capture.as_ref().and_then(|capture| capture.request.clone()),
+            response: capture
+                .as_ref()
+                .and_then(|capture| capture.response.clone()),
+            input_requests: trace.input_requests.clone(),
+            input_responses: trace.input_responses.clone(),
+            truncated,
+        });
+    }
+    let frames = rounds.first().map(|round| CallFrames {
+        rpc_id: round.rpc_id.clone(),
+        request: round.request.clone(),
+        response: round.response.clone(),
+        truncated: round.truncated,
+    });
+    let needs_rounds = traces.len() > 1
+        || traces
+            .iter()
+            .any(|trace| trace.input_requests.is_some() || trace.input_responses.is_some())
+        || !server_inputs.is_empty();
+    if !needs_rounds {
+        return (frames, None);
+    }
+
+    let mut truncated = false;
+    for input in &mut server_inputs {
+        let bytes = serde_json::to_vec(input)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if bytes > SERVER_INPUT_MAX_BYTES {
+            input.request = Value::String("[truncated]".to_string());
+            input.response = None;
+            input.truncated = true;
+            truncated = true;
+        }
+    }
+    let mut rounds = CallRounds {
+        rounds,
+        server_inputs,
+        truncated,
+    };
+    if serialized_rounds_len(&rounds) > ROUNDS_MAX_BYTES {
+        rounds.truncated = true;
+        let len = rounds.rounds.len();
+        for (index, round) in rounds.rounds.iter_mut().enumerate() {
+            if index > 0 && index + 1 < len {
+                round.request = None;
+                round.response = None;
+                round.truncated = true;
+            }
+        }
+    }
+    if serialized_rounds_len(&rounds) > ROUNDS_MAX_BYTES {
+        rounds.server_inputs.clear();
+    }
+    if serialized_rounds_len(&rounds) > ROUNDS_MAX_BYTES {
+        let len = rounds.rounds.len();
+        for (index, round) in rounds.rounds.iter_mut().enumerate() {
+            if index + 1 < len {
+                round.request = None;
+                round.response = None;
+                round.input_requests = None;
+                round.input_responses = None;
+                round.truncated = true;
+            }
+        }
+    }
+    (frames, Some(rounds))
+}
+
+async fn mrtr_backoff(round: u32) {
+    let shift = round.saturating_sub(1).min(3);
+    let millis = (50u64.saturating_mul(1u64 << shift)).min(250);
+    tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
 /// 处理单个列表枚举结果：

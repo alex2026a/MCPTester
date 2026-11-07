@@ -21,6 +21,7 @@ pub enum ActualOutcome {
     Timeout,
     TransportError,
     Canceled,
+    InputRequired,
 }
 
 /// 断言求值结果。
@@ -62,6 +63,14 @@ pub fn evaluate(
             failure_kind: None,
             assertions: Vec::new(),
             message: Some("用例已取消".to_string()),
+        };
+    }
+    if matches!(actual, ActualOutcome::InputRequired) {
+        return Evaluation {
+            status: TestRunCaseStatus::Error,
+            failure_kind: Some(FailureKind::InputRequired),
+            assertions: Vec::new(),
+            message: Some("测试运行不支持交互式输入".to_string()),
         };
     }
 
@@ -252,6 +261,14 @@ fn classify(record: &CallRecord) -> ActualOutcome {
     match &record.error {
         Some(CallError::Timeout { .. }) => ActualOutcome::Timeout,
         Some(CallError::TransportClosed { .. }) => ActualOutcome::TransportError,
+        Some(
+            CallError::InputRequired
+            | CallError::InputTimeout { .. }
+            | CallError::InputUnsupported { .. }
+            | CallError::InputInvalid { .. }
+            | CallError::InputRoundsExceeded,
+        ) => ActualOutcome::InputRequired,
+        Some(CallError::TaskUnsupported { .. }) => ActualOutcome::RpcError,
         Some(CallError::RpcError { code, .. }) => {
             if *code == 0 && result_is_error(record.result.as_ref()) {
                 ActualOutcome::ToolError
@@ -846,6 +863,7 @@ mod tests {
             size_bytes: 0,
             origin: CallOrigin::Test,
             frames: None,
+            rounds: None,
             created_at: Utc::now(),
         }
     }
@@ -873,6 +891,19 @@ mod tests {
             outcome,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn input_required_classifies_as_input_failure() {
+        let record = record(
+            CallStatus::Error,
+            Some(CallError::InputRequired),
+            None,
+            CallMethod::ToolsCall,
+        );
+        let evaluation = evaluate(&expect(TestOutcome::Success), &[], &record, None);
+        assert_eq!(evaluation.status, TestRunCaseStatus::Error);
+        assert_eq!(evaluation.failure_kind, Some(FailureKind::InputRequired));
     }
 
     #[test]

@@ -12,7 +12,9 @@ import type {
   CallError,
   CallFrames,
   CallRecord,
+  CallRound,
   CallStatus,
+  ServerInput,
 } from "../types/models";
 
 const STATUS_LABEL: Record<CallStatus, string> = {
@@ -412,6 +414,45 @@ export function buildPairJson(
       redact,
     ),
   );
+}
+
+/** 复制某一轮的原始响应 body（中间轮为 input_required） */
+export function buildRawResponseBodyText(
+  frames: CallFrames | null | undefined,
+  redact = false,
+): string | null {
+  if (!frames?.response) return null;
+  return stringifyJson(maybeRedact(frames.response, redact));
+}
+
+/** 复制全部 MRTR 轮次 */
+export function buildAllRoundsText(
+  record: CallRecord,
+  rounds: CallRound[] | null,
+  redact = false,
+): string | null {
+  if (!rounds || rounds.length === 0) return null;
+  return stringifyJson(
+    maybeRedact(
+      {
+        record_id: record.id,
+        server: record.server_name,
+        method: record.method,
+        target: record.target,
+        rounds,
+      },
+      redact,
+    ),
+  );
+}
+
+/** 复制旧世代服务器输入 */
+export function buildServerInputsText(
+  inputs: ServerInput[] | null | undefined,
+  redact = false,
+): string | null {
+  if (!inputs || inputs.length === 0) return null;
+  return stringifyJson(maybeRedact({ server_inputs: inputs }, redact));
 }
 
 function rpcErrorOf(error: CallError): JsonRpcErrorPayload | null {
