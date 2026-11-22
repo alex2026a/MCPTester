@@ -38,7 +38,7 @@
 MCP Tester 是一个面向 **Model Context Protocol（MCP）** 的桌面调试工具。它把服务器管理、接口枚举、Schema 表单调用、JSON-RPC 报文观察、调用历史重放和回归测试放在同一个界面里，适合调试本地 `stdio` 服务、远程 `Streamable HTTP` 服务以及遗留 `HTTP + SSE` 服务。
 
 > [!NOTE]
-> 当前版本为 **v0.5.0**，以 Windows 为主要发布平台；项目仍在快速迭代中。
+> 当前版本为 **v0.7.2**，以 Windows 为主要发布平台；项目仍在快速迭代中。
 
 ## 核心功能
 
