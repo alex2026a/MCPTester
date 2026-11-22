@@ -4,11 +4,13 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { EventPanel } from "../components/EventPanel";
+import { ExportPreviewDialog } from "../components/ExportPreviewDialog";
 import { JsonViewer } from "../components/JsonViewer";
 import {
   RecentParamsButton,
@@ -26,6 +28,9 @@ import {
   getCapabilities,
   listServers,
   refreshCapabilities,
+  exportCapabilityExport,
+  previewCapabilityExport,
+  type CapabilityExportFormat,
 } from "../api/servers";
 import { getAppInfo } from "../api/app";
 import { callTool, cancelCall, getPrompt, readResource } from "../api/calls";
@@ -36,6 +41,13 @@ import {
   replayArguments,
   replayTab,
 } from "../lib/replay";
+import { supportsHeaderParams, toolHeaderParams } from "../lib/headerParams";
+import {
+  buildInterfaceEntries,
+  searchInterfaceEntries,
+  type InterfaceSearchHit,
+  type SearchScope,
+} from "../lib/interfaceSearch";
 import { filterKnownTopLevel } from "../lib/schema";
 import { pickDefaultServerId } from "../lib/serverOrder";
 import { draftKey, useDraftStore } from "../stores/drafts";
@@ -87,6 +99,39 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "prompts", label: "Prompts" },
 ];
 
+/** 在文本中高亮所有大小写不敏感的关键词命中 */
+function HighlightText({ text, keyword }: { text: string; keyword: string }) {
+  const needle = keyword.trim();
+  if (!needle) return <>{text}</>;
+
+  const lowerText = text.toLowerCase();
+  const lowerNeedle = needle.toLowerCase();
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let index = lowerText.indexOf(lowerNeedle);
+
+  while (index >= 0) {
+    if (index > cursor) parts.push(text.slice(cursor, index));
+    parts.push(
+      <mark key={index} className="rounded-sm bg-amber-100 px-0.5 text-inherit">
+        {text.slice(index, index + needle.length)}
+      </mark>,
+    );
+    cursor = index + needle.length;
+    index = lowerText.indexOf(lowerNeedle, Math.max(cursor, index + 1));
+  }
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return <>{parts}</>;
+}
+
+function SearchGroupHeader({ label }: { label: string }) {
+  return (
+    <div className="sticky top-0 z-10 border-b border-slate-100 bg-slate-50 px-3 py-1 text-[11px] font-medium text-slate-500">
+      {label}
+    </div>
+  );
+}
+
 /** 参数是否为空（用于模板变量必填提示） */
 function isBlank(value: string | undefined): boolean {
   return !(value ?? "").trim();
@@ -103,6 +148,23 @@ function viewLabel(view: Tab): string {
     default:
       return "资源";
   }
+}
+
+/** 导出文件名 slug：过滤 Windows 非法字符，截断 40 字符 */
+function exportSlug(name: string): string {
+  const slug = name
+    .replace(/[\\/:*?"<>|\s]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return slug || "server";
+}
+
+function exportTimestamp(): string {
+  return new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace("T", "-")
+    .slice(0, 15);
 }
 
 /** 接口页：枚举 + 调用台（Tools / Resources / 模板 / Prompts） */
@@ -123,14 +185,21 @@ export function Explorer() {
     replay ? (replayTab(replay.method) ?? "tools") : "tools",
   );
   const [filter, setFilter] = useState("");
+  const [searchScope, setSearchScope] = useState<SearchScope>("name");
   const [selected, setSelected] = useState<string>(() => replay?.target ?? "");
   const [result, setResult] = useState<CallRecord | null>(null);
-  const [resultContext, setResultContext] = useState<ResultContext | null>(null);
+  const [resultContext, setResultContext] = useState<ResultContext | null>(
+    null,
+  );
   const [resultCollapsed, setResultCollapsed] = useState(false);
   const [eventPanelServerId, setEventPanelServerId] = useState<string | null>(
     null,
   );
   const [inFlightId, setInFlightId] = useState<string | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportFormat, setExportFormat] =
+    useState<CapabilityExportFormat>("csv");
+  const [includeSchema, setIncludeSchema] = useState(false);
   const [promptArgs, setPromptArgs] = useState<Record<string, unknown>>(() =>
     replay?.method === "prompts_get" ? replayArguments(replay.params) : {},
   );
@@ -147,11 +216,14 @@ export function Explorer() {
       ? `已载入历史重放：${CALL_METHOD_LABEL[replay.method]} · ${replay.target}`
       : null,
   );
-  const [historyNotice, setHistoryNotice] = useState<HistoryNotice | null>(null);
+  const [historyNotice, setHistoryNotice] = useState<HistoryNotice | null>(
+    null,
+  );
   const [pendingResource, setPendingResource] = useState<string | null>(() =>
     replay?.method === "resources_read" ? replay.target : null,
   );
   const selectedItemRef = useRef<HTMLButtonElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const toolFormRef = useRef<SchemaFormHandle | null>(null);
 
   const currentServer = serverId
@@ -167,6 +239,17 @@ export function Explorer() {
   const missingServer =
     Boolean(serverId) && servers.isSuccess && !currentServer;
   const ready = currentServer?.state.state === "ready";
+  const readyHandshake =
+    currentServer?.state.state === "ready"
+      ? currentServer.state.handshake
+      : null;
+  const headerParamsEnabled = Boolean(
+    currentServer &&
+    supportsHeaderParams(
+      currentServer.transport,
+      readyHandshake?.protocol_version ?? null,
+    ),
+  );
 
   const capabilities = useQuery<CapabilitySnapshot>({
     queryKey: ["capabilities", currentServer?.id],
@@ -232,6 +315,26 @@ export function Explorer() {
     selectedItemRef.current?.scrollIntoView?.({ block: "nearest" });
   }, [viewSelected, viewTab, capabilities.data]);
 
+  // Ctrl/Cmd+F 聚焦接口搜索框
+  useEffect(() => {
+    function handleFindShortcut(event: globalThis.KeyboardEvent) {
+      if (
+        !(event.ctrlKey || event.metaKey) ||
+        event.shiftKey ||
+        event.altKey ||
+        event.key.toLowerCase() !== "f"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }
+
+    window.addEventListener("keydown", handleFindShortcut);
+    return () => window.removeEventListener("keydown", handleFindShortcut);
+  }, []);
+
   function acceptResult(record: CallRecord, context: ResultContext) {
     setResult(record);
     setResultContext(context);
@@ -282,55 +385,41 @@ export function Explorer() {
       name: string;
       args: Record<string, unknown>;
       context: ResultContext;
-    }) =>
-      getPrompt(payload.context.serverId, payload.name, payload.args),
+    }) => getPrompt(payload.context.serverId, payload.name, payload.args),
     onSuccess: (record, payload) => acceptResult(record, payload.context),
     onError: (error) => toast.fromError(error, "获取提示词失败"),
   });
 
-  const items = useMemo(() => {
-    const snapshot = capabilities.data;
-    if (!snapshot)
-      return [] as { key: string; title: string; subtitle: string }[];
-    const keyword = filter.trim().toLowerCase();
-    const match = (text: string) =>
-      !keyword || text.toLowerCase().includes(keyword);
-    switch (viewTab) {
-      case "tools":
-        return snapshot.tools
-          .filter((tool) => match(tool.name) || match(tool.description ?? ""))
-          .map((tool) => ({
-            key: tool.name,
-            title: tool.name,
-            subtitle: tool.description ?? "",
-          }));
-      case "resources":
-        return snapshot.resources
-          .filter((res) => match(res.uri) || match(res.name))
-          .map((res) => ({ key: res.uri, title: res.name, subtitle: res.uri }));
-      case "templates":
-        return snapshot.resource_templates
-          .filter((tpl) => match(tpl.name) || match(tpl.uri_template))
-          .map((tpl) => ({
-            key: tpl.uri_template,
-            title: tpl.name,
-            subtitle: tpl.uri_template,
-          }));
-      case "prompts":
-        return snapshot.prompts
-          .filter((prompt) => match(prompt.name))
-          .map((prompt) => ({
-            key: prompt.name,
-            title: prompt.name,
-            subtitle: prompt.description ?? "",
-          }));
-      default:
-        return [];
-    }
-  }, [capabilities.data, filter, viewTab]);
+  const interfaceEntries = useMemo(
+    () =>
+      capabilities.data
+        ? buildInterfaceEntries(capabilities.data, viewTab)
+        : [],
+    [capabilities.data, viewTab],
+  );
+  const search = useMemo(
+    () => searchInterfaceEntries(interfaceEntries, filter, searchScope),
+    [interfaceEntries, filter, searchScope],
+  );
+  const hasKeyword = Boolean(filter.trim());
+  const selectedFilteredOut = Boolean(
+    viewSelected &&
+    hasKeyword &&
+    interfaceEntries.some((entry) => entry.key === viewSelected) &&
+    ![...search.nameHits, ...search.contentHits].some(
+      (entry) => entry.key === viewSelected,
+    ),
+  );
 
   const currentTool = (capabilities.data?.tools ?? []).find(
     (t) => t.name === viewSelected,
+  );
+  const toolHeaderParamList = useMemo(
+    () =>
+      headerParamsEnabled && currentTool
+        ? toolHeaderParams(currentTool.input_schema)
+        : [],
+    [headerParamsEnabled, currentTool],
   );
   const currentPrompt = (capabilities.data?.prompts ?? []).find(
     (p) => p.name === viewSelected,
@@ -343,8 +432,7 @@ export function Explorer() {
     : [];
   const resolvedTemplateUri = currentTemplate
     ? templateNames.reduce(
-        (uri, name) =>
-          uri.replace(`{${name}}`, viewTemplateVars[name] ?? ""),
+        (uri, name) => uri.replace(`{${name}}`, viewTemplateVars[name] ?? ""),
         currentTemplate.uri_template,
       )
     : "";
@@ -362,25 +450,25 @@ export function Explorer() {
 
   const resultMatches = Boolean(
     result &&
-      resultContext &&
-      currentServerId &&
-      resultContext.serverId === currentServerId &&
-      resultContext.view === viewTab &&
-      ((viewTab === "tools" &&
-        resultContext.method === "tools_call" &&
-        currentTool &&
-        resultContext.target === currentTool.name) ||
-        (viewTab === "prompts" &&
-          resultContext.method === "prompts_get" &&
-          currentPrompt &&
-          resultContext.target === currentPrompt.name) ||
-        (viewTab === "resources" &&
-          resultContext.method === "resources_read" &&
-          resultContext.target === viewSelected) ||
-        (viewTab === "templates" &&
-          resultContext.method === "resources_read" &&
-          currentTemplate &&
-          resultContext.target === currentTemplate.uri_template)),
+    resultContext &&
+    currentServerId &&
+    resultContext.serverId === currentServerId &&
+    resultContext.view === viewTab &&
+    ((viewTab === "tools" &&
+      resultContext.method === "tools_call" &&
+      currentTool &&
+      resultContext.target === currentTool.name) ||
+      (viewTab === "prompts" &&
+        resultContext.method === "prompts_get" &&
+        currentPrompt &&
+        resultContext.target === currentPrompt.name) ||
+      (viewTab === "resources" &&
+        resultContext.method === "resources_read" &&
+        resultContext.target === viewSelected) ||
+      (viewTab === "templates" &&
+        resultContext.method === "resources_read" &&
+        currentTemplate &&
+        resultContext.target === currentTemplate.uri_template)),
   );
 
   function clearSelectionState() {
@@ -428,7 +516,11 @@ export function Explorer() {
       useDraftStore
         .getState()
         .save(
-          draftKey(currentServer.id, "resources_read", currentTemplate.uri_template),
+          draftKey(
+            currentServer.id,
+            "resources_read",
+            currentTemplate.uri_template,
+          ),
           next,
         );
     }
@@ -562,10 +654,7 @@ export function Explorer() {
     });
   }
 
-  function handleShortcut(
-    event: KeyboardEvent,
-    action: () => void,
-  ) {
+  function handleShortcut(event: KeyboardEvent, action: () => void) {
     if (event.repeat) return;
     if (!(event.ctrlKey || event.metaKey) || event.key !== "Enter") return;
     if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) {
@@ -666,7 +755,9 @@ export function Explorer() {
   }
 
   function historyNoticeMatches(): boolean {
-    return Boolean(historyNotice && historyContextMatches(historyNotice.context));
+    return Boolean(
+      historyNotice && historyContextMatches(historyNotice.context),
+    );
   }
 
   function historyNoticeDetail(notice: HistoryNotice): string | null {
@@ -681,6 +772,39 @@ export function Explorer() {
       return `有 ${notice.unknown} 个字段未在当前 Schema 声明，已按历史原样保留；可切换 JSON 模式查看`;
     }
     return null;
+  }
+
+  function renderSearchItem(item: InterfaceSearchHit) {
+    const isContent = item.matchedIn === "content";
+    return (
+      <button
+        key={item.key}
+        type="button"
+        ref={viewSelected === item.key ? selectedItemRef : undefined}
+        className={`block w-full border-b border-slate-100 px-3 py-2 text-left text-sm last:border-b-0 ${
+          viewSelected === item.key ? "bg-slate-100" : "hover:bg-slate-50"
+        }`}
+        onClick={() => selectItem(item.key)}
+      >
+        <div className="truncate text-slate-800">
+          <HighlightText text={item.title} keyword={filter} />
+        </div>
+        {isContent && item.snippet ? (
+          <div className="mt-0.5 flex items-start gap-1 text-xs text-slate-400">
+            <span className="mt-px shrink-0 rounded bg-slate-100 px-1 text-[10px] leading-4 text-slate-500">
+              {item.contentLabel ?? "内容"}
+            </span>
+            <span className="line-clamp-2 min-w-0 break-words">
+              <HighlightText text={item.snippet} keyword={filter} />
+            </span>
+          </div>
+        ) : item.subtitle ? (
+          <div className="truncate text-xs text-slate-400">
+            <HighlightText text={item.subtitle} keyword={filter} />
+          </div>
+        ) : null}
+      </button>
+    );
   }
 
   return (
@@ -705,6 +829,14 @@ export function Explorer() {
           onClick={() => refresh.mutate()}
         >
           {refresh.isPending ? "刷新中…" : "刷新接口"}
+        </button>
+        <button
+          type="button"
+          className="rounded border border-slate-200 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
+          disabled={!ready || !capabilities.data || !currentServerId}
+          onClick={() => setExportOpen(true)}
+        >
+          导出接口
         </button>
         {capabilities.data?.stale ? (
           <span className="text-xs text-amber-600">
@@ -765,12 +897,6 @@ export function Explorer() {
             </span>
           </button>
         ))}
-        <input
-          className="ml-auto w-56 rounded border border-slate-200 px-2 py-1 text-xs"
-          placeholder="搜索接口…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-        />
       </div>
 
       {servers.isLoading ? (
@@ -823,31 +949,123 @@ export function Explorer() {
         </div>
       ) : (
         <div className="flex min-h-0 flex-1 gap-4">
-          <div className="w-72 shrink-0 overflow-y-auto rounded-lg border border-slate-200 bg-white">
-            {items.length === 0 ? (
-              <div className="p-3 text-xs text-slate-400">该分类为空</div>
-            ) : (
-              items.map((item) => (
-                <button
-                  key={item.key}
-                  type="button"
-                  ref={viewSelected === item.key ? selectedItemRef : undefined}
-                  className={`block w-full border-b border-slate-100 px-3 py-2 text-left text-sm last:border-b-0 ${
-                    viewSelected === item.key
-                      ? "bg-slate-100"
-                      : "hover:bg-slate-50"
-                  }`}
-                  onClick={() => selectItem(item.key)}
+          <div className="flex w-72 shrink-0 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
+            <div className="space-y-2 border-b border-slate-100 p-2">
+              <div className="relative">
+                <input
+                  ref={searchInputRef}
+                  aria-label="搜索接口"
+                  className="w-full rounded border border-slate-200 px-2 py-1 pr-7 text-xs"
+                  placeholder={
+                    searchScope === "name"
+                      ? "搜索接口名称或 URI…"
+                      : "搜索名称、描述、参数…"
+                  }
+                  value={filter}
+                  onChange={(event) => setFilter(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Escape" || !filter) return;
+                    event.preventDefault();
+                    setFilter("");
+                  }}
+                />
+                {filter ? (
+                  <button
+                    type="button"
+                    aria-label="清除搜索"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 rounded px-1 text-sm leading-none text-slate-400 hover:text-slate-600"
+                    onClick={() => {
+                      setFilter("");
+                      searchInputRef.current?.focus();
+                    }}
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex overflow-hidden rounded border border-slate-200 text-[11px]">
+                  <button
+                    type="button"
+                    aria-pressed={searchScope === "name"}
+                    className={`px-2 py-0.5 ${
+                      searchScope === "name"
+                        ? "bg-slate-800 text-white"
+                        : "text-slate-600 hover:bg-slate-50"
+                    }`}
+                    onClick={() => setSearchScope("name")}
+                  >
+                    名称
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={searchScope === "all"}
+                    title="同时搜索描述、参数和字段名"
+                    className={`border-l border-slate-200 px-2 py-0.5 ${
+                      searchScope === "all"
+                        ? "bg-slate-800 text-white"
+                        : "text-slate-600 hover:bg-slate-50"
+                    }`}
+                    onClick={() => setSearchScope("all")}
+                  >
+                    名称+内容
+                  </button>
+                </div>
+                <span
+                  aria-live="polite"
+                  className="text-[11px] tabular-nums text-slate-400"
                 >
-                  <div className="truncate text-slate-800">{item.title}</div>
-                  {item.subtitle ? (
-                    <div className="truncate text-xs text-slate-400">
-                      {item.subtitle}
-                    </div>
+                  {hasKeyword
+                    ? `${search.total} / ${interfaceEntries.length}`
+                    : `${interfaceEntries.length} 个`}
+                </span>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {interfaceEntries.length === 0 ? (
+                <div className="p-3 text-xs text-slate-400">该分类为空</div>
+              ) : search.total === 0 ? (
+                <div className="space-y-2 p-3 text-xs text-slate-400">
+                  <div>没有匹配的接口</div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                      onClick={() => setFilter("")}
+                    >
+                      清空搜索
+                    </button>
+                    {searchScope === "name" ? (
+                      <button
+                        type="button"
+                        className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                        onClick={() => setSearchScope("all")}
+                      >
+                        搜索全部内容
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {hasKeyword &&
+                  search.nameHits.length > 0 &&
+                  search.contentHits.length > 0 ? (
+                    <SearchGroupHeader label="名称匹配" />
                   ) : null}
-                </button>
-              ))
-            )}
+                  {search.nameHits.map(renderSearchItem)}
+                  {search.contentHits.length > 0 ? (
+                    <SearchGroupHeader label="内容匹配" />
+                  ) : null}
+                  {search.contentHits.map(renderSearchItem)}
+                </>
+              )}
+              {selectedFilteredOut ? (
+                <div className="sticky bottom-0 border-t border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
+                  当前选中项不在筛选结果中
+                </div>
+              ) : null}
+            </div>
           </div>
 
           <div className="flex min-w-0 flex-1 flex-col gap-2">
@@ -858,360 +1076,373 @@ export function Explorer() {
                   : "min-h-0 flex-1 space-y-3 overflow-y-auto pr-1"
               }
             >
-            {!viewSelected ? (
-              <EmptyState
-                title="选择一个接口"
-                description="左侧列表选择后在此发起调用。"
-              />
-            ) : viewTab === "tools" && currentTool ? (
-              <div
-                className="space-y-3 rounded-lg border border-slate-200 bg-white p-4"
-                onKeyDown={(event) =>
-                  handleShortcut(event, () => submitTool(false))
-                }
-              >
-                <div>
-                  <div className="flex items-center gap-2">
-                    <div className="text-sm font-medium text-slate-800">
-                      {currentTool.name}
+              {!viewSelected ? (
+                <EmptyState
+                  title="选择一个接口"
+                  description="左侧列表选择后在此发起调用。"
+                />
+              ) : viewTab === "tools" && currentTool ? (
+                <div
+                  className="space-y-3 rounded-lg border border-slate-200 bg-white p-4"
+                  onKeyDown={(event) =>
+                    handleShortcut(event, () => submitTool(false))
+                  }
+                >
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-sm font-medium text-slate-800">
+                        {currentTool.name}
+                      </div>
+                      <button
+                        type="button"
+                        className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                        onClick={() =>
+                          navigate(
+                            `/tests?target=${encodeURIComponent(currentTool.name)}`,
+                          )
+                        }
+                      >
+                        生成用例
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
-                      onClick={() =>
-                        navigate(
-                          `/tests?target=${encodeURIComponent(currentTool.name)}`,
-                        )
-                      }
-                    >
-                      生成用例
-                    </button>
+                    {currentTool.description ? (
+                      <div className="mt-1 text-xs text-slate-500">
+                        {currentTool.description}
+                      </div>
+                    ) : null}
+                    {toolHeaderParamList.length > 0 ? (
+                      <div className="mt-1 text-[11px] text-sky-700">
+                        该工具会将 {toolHeaderParamList.length} 个参数作为
+                        Mcp-Param-* 请求头发送：
+                        {toolHeaderParamList
+                          .map((item) => `${item.argument} -> ${item.header}`)
+                          .join("；")}
+                      </div>
+                    ) : null}
                   </div>
-                  {currentTool.description ? (
-                    <div className="mt-1 text-xs text-slate-500">
-                      {currentTool.description}
+                  <details>
+                    <summary className="cursor-pointer text-xs text-slate-400">
+                      原始 JSON Schema
+                    </summary>
+                    <div className="mt-2">
+                      <JsonViewer
+                        value={currentTool.input_schema}
+                        defaultMode="text"
+                        contentClassName="max-h-48 overflow-auto"
+                      />
+                    </div>
+                  </details>
+                  <SchemaForm
+                    key={`${currentTool.name}:${formNonce}`}
+                    ref={toolFormRef}
+                    schema={currentTool.input_schema}
+                    initial={toolArgs}
+                    onChange={handleToolArgsChange}
+                    onDirty={() => setHistoryNotice(null)}
+                    showHeaderParams={headerParamsEnabled}
+                  />
+                  {historyNoticeMatches() && historyNotice ? (
+                    <div className="flex flex-wrap items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
+                      <span>
+                        已载入 {historyNotice.label} 的参数
+                        {historyNoticeDetail(historyNotice)
+                          ? `（${historyNoticeDetail(historyNotice)}）`
+                          : ""}
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded border border-sky-200 bg-white px-2 py-0.5 text-[11px] hover:bg-sky-100 disabled:opacity-40"
+                        disabled={
+                          historyNotice.kind === "tool" &&
+                          !historyNotice.previousSnapshot
+                        }
+                        onClick={undoHistory}
+                      >
+                        撤销
+                      </button>
                     </div>
                   ) : null}
-                </div>
-                <details>
-                  <summary className="cursor-pointer text-xs text-slate-400">
-                    原始 JSON Schema
-                  </summary>
-                  <div className="mt-2">
-                    <JsonViewer
-                      value={currentTool.input_schema}
-                      defaultMode="text"
-                      contentClassName="max-h-48 overflow-auto"
-                    />
-                  </div>
-                </details>
-                <SchemaForm
-                  key={`${currentTool.name}:${formNonce}`}
-                  ref={toolFormRef}
-                  schema={currentTool.input_schema}
-                  initial={toolArgs}
-                  onChange={handleToolArgsChange}
-                  onDirty={() => setHistoryNotice(null)}
-                />
-                {historyNoticeMatches() && historyNotice ? (
-                  <div className="flex flex-wrap items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
-                    <span>
-                      已载入 {historyNotice.label} 的参数
-                      {historyNoticeDetail(historyNotice)
-                        ? `（${historyNoticeDetail(historyNotice)}）`
-                        : ""}
-                    </span>
+                  <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-t border-slate-100 bg-white/95 px-4 py-2 backdrop-blur">
                     <button
                       type="button"
-                      className="rounded border border-sky-200 bg-white px-2 py-0.5 text-[11px] hover:bg-sky-100 disabled:opacity-40"
-                      disabled={
-                        historyNotice.kind === "tool" &&
-                        !historyNotice.previousSnapshot
-                      }
-                      onClick={undoHistory}
+                      className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
+                      disabled={sendTool.isPending}
+                      aria-keyshortcuts="Control+Enter Meta+Enter"
+                      title="发送调用（Ctrl+Enter）"
+                      onClick={() => submitTool(false)}
                     >
-                      撤销
+                      {sendTool.isPending ? "调用中…" : "发送调用"}
                     </button>
+                    <RecentParamsButton
+                      key={`${currentServer.id}:tools_call:${currentTool.name}`}
+                      context={{
+                        serverId: currentServer.id,
+                        method: "tools_call",
+                        target: currentTool.name,
+                      }}
+                      onApply={applyToolHistory}
+                    />
+                    {toolForceSend ? (
+                      <button
+                        type="button"
+                        className="rounded border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                        disabled={sendTool.isPending}
+                        title="跳过前端校验直接发送，服务端可能返回参数错误"
+                        onClick={() => submitTool(true)}
+                      >
+                        仍要发送
+                      </button>
+                    ) : null}
+                    {inFlightId ? (
+                      <button
+                        type="button"
+                        className="rounded border border-slate-200 px-3 py-1.5 text-sm hover:bg-slate-50"
+                        onClick={() => {
+                          void cancelCall(currentServer.id, inFlightId).catch(
+                            (error) => toast.fromError(error, "取消失败"),
+                          );
+                        }}
+                      >
+                        取消
+                      </button>
+                    ) : null}
                   </div>
-                ) : null}
-                <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-t border-slate-100 bg-white/95 px-4 py-2 backdrop-blur">
+                </div>
+              ) : viewTab === "resources" ? (
+                <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+                  <div className="break-all font-mono text-xs text-slate-600">
+                    {viewSelected}
+                  </div>
+                  {!resourceKnown ? (
+                    <div className="text-[11px] text-amber-600">
+                      该资源不在当前枚举列表中，可直接按 URI 读取。
+                    </div>
+                  ) : null}
                   <button
                     type="button"
                     className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
-                    disabled={sendTool.isPending}
-                    aria-keyshortcuts="Control+Enter Meta+Enter"
-                    title="发送调用（Ctrl+Enter）"
-                    onClick={() => submitTool(false)}
+                    disabled={readRes.isPending}
+                    onClick={() =>
+                      readRes.mutate({
+                        uri: viewSelected,
+                        context: {
+                          serverId: currentServer.id,
+                          method: "resources_read",
+                          view: "resources",
+                          target: viewSelected,
+                        },
+                      })
+                    }
                   >
-                    {sendTool.isPending ? "调用中…" : "发送调用"}
+                    {readRes.isPending ? "读取中…" : "读取资源"}
                   </button>
-                  <RecentParamsButton
-                    key={`${currentServer.id}:tools_call:${currentTool.name}`}
-                    context={{
-                      serverId: currentServer.id,
-                      method: "tools_call",
-                      target: currentTool.name,
-                    }}
-                    onApply={applyToolHistory}
-                  />
-                  {toolForceSend ? (
-                    <button
-                      type="button"
-                      className="rounded border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm text-amber-800 hover:bg-amber-100 disabled:opacity-50"
-                      disabled={sendTool.isPending}
-                      title="跳过前端校验直接发送，服务端可能返回参数错误"
-                      onClick={() => submitTool(true)}
-                    >
-                      仍要发送
-                    </button>
-                  ) : null}
-                  {inFlightId ? (
-                    <button
-                      type="button"
-                      className="rounded border border-slate-200 px-3 py-1.5 text-sm hover:bg-slate-50"
-                      onClick={() => {
-                        void cancelCall(currentServer.id, inFlightId).catch(
-                          (error) => toast.fromError(error, "取消失败"),
-                        );
-                      }}
-                    >
-                      取消
-                    </button>
-                  ) : null}
                 </div>
-              </div>
-            ) : viewTab === "resources" ? (
-              <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
-                <div className="break-all font-mono text-xs text-slate-600">
-                  {viewSelected}
-                </div>
-                {!resourceKnown ? (
-                  <div className="text-[11px] text-amber-600">
-                    该资源不在当前枚举列表中，可直接按 URI 读取。
+              ) : viewTab === "templates" && currentTemplate ? (
+                <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+                  <div className="break-all font-mono text-xs text-slate-600">
+                    {currentTemplate.uri_template}
                   </div>
-                ) : null}
-                <button
-                  type="button"
-                  className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
-                  disabled={readRes.isPending}
-                  onClick={() =>
-                    readRes.mutate({
-                      uri: viewSelected,
-                      context: {
-                        serverId: currentServer.id,
-                        method: "resources_read",
-                        view: "resources",
-                        target: viewSelected,
-                      },
-                    })
-                  }
-                >
-                  {readRes.isPending ? "读取中…" : "读取资源"}
-                </button>
-              </div>
-            ) : viewTab === "templates" && currentTemplate ? (
-              <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
-                <div className="break-all font-mono text-xs text-slate-600">
-                  {currentTemplate.uri_template}
-                </div>
-                {templateNames.map((name) => {
-                  const missing = isBlank(viewTemplateVars[name]);
-                  return (
-                    <label
-                      key={name}
-                      className="block space-y-1 text-xs text-slate-600"
-                    >
-                      <span className="flex flex-wrap items-center gap-1">
-                        <span className="text-red-500" aria-hidden="true">
-                          *
-                        </span>
-                        {name}
-                        <span className="rounded bg-red-50 px-1 py-0.5 text-[10px] font-medium text-red-600">
-                          必填
-                        </span>
-                      </span>
-                      <input
-                        aria-label={name}
-                        aria-required="true"
-                        aria-invalid={missing || undefined}
-                        className={`w-full rounded border px-2 py-1 text-sm ${
-                          missing
-                            ? "border-red-300 bg-red-50/40"
-                            : "border-slate-200"
-                        }`}
-                        value={viewTemplateVars[name] ?? ""}
-                        onChange={(e) =>
-                          updateTemplateVars({
-                            ...viewTemplateVars,
-                            [name]: e.target.value,
-                          })
-                        }
-                      />
-                    </label>
-                  );
-                })}
-                {missingTemplateVars.length > 0 ? (
-                  <div className="text-[11px] text-red-500">
-                    请填写全部模板变量：{missingTemplateVars.join("、")}
-                  </div>
-                ) : null}
-                <button
-                  type="button"
-                  className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
-                  disabled={readRes.isPending || missingTemplateVars.length > 0}
-                  onClick={readTemplate}
-                >
-                  {readRes.isPending ? "读取中…" : "生成 URI 并读取"}
-                </button>
-                {resolvedTemplateUri ? (
-                  <div className="break-all text-[11px] text-slate-400">
-                    即将读取：{resolvedTemplateUri}
-                  </div>
-                ) : null}
-              </div>
-            ) : viewTab === "prompts" && currentPrompt ? (
-              <div
-                className="space-y-3 rounded-lg border border-slate-200 bg-white p-4"
-                onKeyDown={(event) =>
-                  handleShortcut(event, () => submitPrompt(false))
-                }
-              >
-                <div className="text-sm font-medium text-slate-800">
-                  {currentPrompt.name}
-                </div>
-                {currentPrompt.arguments.map((arg) => {
-                  const missing =
-                    arg.required && isBlank(String(promptArgs[arg.name] ?? ""));
-                  const showMissing = promptSubmitted && missing;
-                  return (
-                    <label
-                      key={arg.name}
-                      className="block space-y-1 text-xs text-slate-600"
-                    >
-                      <span className="flex flex-wrap items-center gap-1">
-                        {arg.required ? (
+                  {templateNames.map((name) => {
+                    const missing = isBlank(viewTemplateVars[name]);
+                    return (
+                      <label
+                        key={name}
+                        className="block space-y-1 text-xs text-slate-600"
+                      >
+                        <span className="flex flex-wrap items-center gap-1">
                           <span className="text-red-500" aria-hidden="true">
                             *
                           </span>
-                        ) : null}
-                        {arg.name}
-                        {arg.required ? (
+                          {name}
                           <span className="rounded bg-red-50 px-1 py-0.5 text-[10px] font-medium text-red-600">
                             必填
                           </span>
-                        ) : null}
-                      </span>
-                      <input
-                        aria-label={arg.name}
-                        aria-required={arg.required || undefined}
-                        aria-invalid={showMissing || undefined}
-                        className={`w-full rounded border px-2 py-1 text-sm ${
-                          showMissing
-                            ? "border-red-300 bg-red-50/40"
-                            : "border-slate-200"
-                        }`}
-                        value={String(promptArgs[arg.name] ?? "")}
-                        onChange={(e) =>
-                          updatePromptArgs({
-                            ...promptArgs,
-                            [arg.name]: e.target.value,
-                          })
-                        }
-                      />
-                    </label>
-                  );
-                })}
-                {promptSubmitted && missingPromptArgs.length > 0 ? (
-                  <div className="text-[11px] text-red-500">
-                    缺少必填参数：{missingPromptArgs.join("、")}
-                  </div>
-                ) : null}
-                {historyNoticeMatches() && historyNotice ? (
-                  <div className="flex flex-wrap items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
-                    <span>
-                      已载入 {historyNotice.label} 的参数
-                      {historyNoticeDetail(historyNotice)
-                        ? `（${historyNoticeDetail(historyNotice)}）`
-                        : ""}
-                    </span>
-                    <button
-                      type="button"
-                      className="rounded border border-sky-200 bg-white px-2 py-0.5 text-[11px] hover:bg-sky-100"
-                      onClick={undoHistory}
-                    >
-                      撤销
-                    </button>
-                  </div>
-                ) : null}
-                <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-t border-slate-100 bg-white/95 px-4 py-2 backdrop-blur">
+                        </span>
+                        <input
+                          aria-label={name}
+                          aria-required="true"
+                          aria-invalid={missing || undefined}
+                          className={`w-full rounded border px-2 py-1 text-sm ${
+                            missing
+                              ? "border-red-300 bg-red-50/40"
+                              : "border-slate-200"
+                          }`}
+                          value={viewTemplateVars[name] ?? ""}
+                          onChange={(e) =>
+                            updateTemplateVars({
+                              ...viewTemplateVars,
+                              [name]: e.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                    );
+                  })}
+                  {missingTemplateVars.length > 0 ? (
+                    <div className="text-[11px] text-red-500">
+                      请填写全部模板变量：{missingTemplateVars.join("、")}
+                    </div>
+                  ) : null}
                   <button
                     type="button"
                     className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
-                    disabled={fetchPrompt.isPending}
-                    aria-keyshortcuts="Control+Enter Meta+Enter"
-                    title="获取提示词（Ctrl+Enter）"
-                    onClick={() => submitPrompt(false)}
+                    disabled={
+                      readRes.isPending || missingTemplateVars.length > 0
+                    }
+                    onClick={readTemplate}
                   >
-                    {fetchPrompt.isPending ? "获取中…" : "获取提示词"}
+                    {readRes.isPending ? "读取中…" : "生成 URI 并读取"}
                   </button>
-                  <RecentParamsButton
-                    key={`${currentServer.id}:prompts_get:${currentPrompt.name}`}
-                    context={{
-                      serverId: currentServer.id,
-                      method: "prompts_get",
-                      target: currentPrompt.name,
-                    }}
-                    onApply={applyPromptHistory}
-                  />
-                  {promptForceSend ? (
-                    <button
-                      type="button"
-                      className="rounded border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm text-amber-800 hover:bg-amber-100 disabled:opacity-50"
-                      disabled={fetchPrompt.isPending}
-                      title="跳过前端校验直接发送，服务端可能返回参数错误"
-                      onClick={() => submitPrompt(true)}
-                    >
-                      仍要发送
-                    </button>
+                  {resolvedTemplateUri ? (
+                    <div className="break-all text-[11px] text-slate-400">
+                      即将读取：{resolvedTemplateUri}
+                    </div>
                   ) : null}
                 </div>
-              </div>
-            ) : (
-              <div className="space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
-                <div className="break-all text-sm font-medium text-amber-800">
-                  未在当前接口列表中找到「{viewSelected}」
-                </div>
-                <div className="text-xs text-amber-700">
-                  该接口可能已被服务端移除，或当前枚举结果已过期。参数仍可查看，可刷新接口后重试。
-                </div>
-                <button
-                  type="button"
-                  className="rounded border border-amber-300 px-2 py-1 text-xs text-amber-800 hover:bg-amber-100 disabled:opacity-40"
-                  disabled={!ready || refresh.isPending}
-                  onClick={() => refresh.mutate()}
+              ) : viewTab === "prompts" && currentPrompt ? (
+                <div
+                  className="space-y-3 rounded-lg border border-slate-200 bg-white p-4"
+                  onKeyDown={(event) =>
+                    handleShortcut(event, () => submitPrompt(false))
+                  }
                 >
-                  {refresh.isPending ? "刷新中…" : "刷新接口"}
-                </button>
-                {viewTab === "templates" ? (
-                  <div className="break-all font-mono text-xs text-slate-600">
-                    URI：{viewSelected}
+                  <div className="text-sm font-medium text-slate-800">
+                    {currentPrompt.name}
                   </div>
-                ) : (
-                  <JsonViewer
-                    value={viewTab === "tools" ? toolArgs : promptArgs}
-                    defaultMode="tree"
-                    contentClassName="max-h-40 overflow-auto"
-                  />
-                )}
-              </div>
-            )}
-
+                  {currentPrompt.arguments.map((arg) => {
+                    const missing =
+                      arg.required &&
+                      isBlank(String(promptArgs[arg.name] ?? ""));
+                    const showMissing = promptSubmitted && missing;
+                    return (
+                      <label
+                        key={arg.name}
+                        className="block space-y-1 text-xs text-slate-600"
+                      >
+                        <span className="flex flex-wrap items-center gap-1">
+                          {arg.required ? (
+                            <span className="text-red-500" aria-hidden="true">
+                              *
+                            </span>
+                          ) : null}
+                          {arg.name}
+                          {arg.required ? (
+                            <span className="rounded bg-red-50 px-1 py-0.5 text-[10px] font-medium text-red-600">
+                              必填
+                            </span>
+                          ) : null}
+                        </span>
+                        <input
+                          aria-label={arg.name}
+                          aria-required={arg.required || undefined}
+                          aria-invalid={showMissing || undefined}
+                          className={`w-full rounded border px-2 py-1 text-sm ${
+                            showMissing
+                              ? "border-red-300 bg-red-50/40"
+                              : "border-slate-200"
+                          }`}
+                          value={String(promptArgs[arg.name] ?? "")}
+                          onChange={(e) =>
+                            updatePromptArgs({
+                              ...promptArgs,
+                              [arg.name]: e.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                    );
+                  })}
+                  {promptSubmitted && missingPromptArgs.length > 0 ? (
+                    <div className="text-[11px] text-red-500">
+                      缺少必填参数：{missingPromptArgs.join("、")}
+                    </div>
+                  ) : null}
+                  {historyNoticeMatches() && historyNotice ? (
+                    <div className="flex flex-wrap items-center gap-2 rounded border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
+                      <span>
+                        已载入 {historyNotice.label} 的参数
+                        {historyNoticeDetail(historyNotice)
+                          ? `（${historyNoticeDetail(historyNotice)}）`
+                          : ""}
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded border border-sky-200 bg-white px-2 py-0.5 text-[11px] hover:bg-sky-100"
+                        onClick={undoHistory}
+                      >
+                        撤销
+                      </button>
+                    </div>
+                  ) : null}
+                  <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-t border-slate-100 bg-white/95 px-4 py-2 backdrop-blur">
+                    <button
+                      type="button"
+                      className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
+                      disabled={fetchPrompt.isPending}
+                      aria-keyshortcuts="Control+Enter Meta+Enter"
+                      title="获取提示词（Ctrl+Enter）"
+                      onClick={() => submitPrompt(false)}
+                    >
+                      {fetchPrompt.isPending ? "获取中…" : "获取提示词"}
+                    </button>
+                    <RecentParamsButton
+                      key={`${currentServer.id}:prompts_get:${currentPrompt.name}`}
+                      context={{
+                        serverId: currentServer.id,
+                        method: "prompts_get",
+                        target: currentPrompt.name,
+                      }}
+                      onApply={applyPromptHistory}
+                    />
+                    {promptForceSend ? (
+                      <button
+                        type="button"
+                        className="rounded border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                        disabled={fetchPrompt.isPending}
+                        title="跳过前端校验直接发送，服务端可能返回参数错误"
+                        onClick={() => submitPrompt(true)}
+                      >
+                        仍要发送
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
+                  <div className="break-all text-sm font-medium text-amber-800">
+                    未在当前接口列表中找到「{viewSelected}」
+                  </div>
+                  <div className="text-xs text-amber-700">
+                    该接口可能已被服务端移除，或当前枚举结果已过期。参数仍可查看，可刷新接口后重试。
+                  </div>
+                  <button
+                    type="button"
+                    className="rounded border border-amber-300 px-2 py-1 text-xs text-amber-800 hover:bg-amber-100 disabled:opacity-40"
+                    disabled={!ready || refresh.isPending}
+                    onClick={() => refresh.mutate()}
+                  >
+                    {refresh.isPending ? "刷新中…" : "刷新接口"}
+                  </button>
+                  {viewTab === "templates" ? (
+                    <div className="break-all font-mono text-xs text-slate-600">
+                      URI：{viewSelected}
+                    </div>
+                  ) : (
+                    <JsonViewer
+                      value={viewTab === "tools" ? toolArgs : promptArgs}
+                      defaultMode="tree"
+                      contentClassName="max-h-40 overflow-auto"
+                    />
+                  )}
+                </div>
+              )}
             </div>
 
             {result && !resultMatches ? (
               <div className="shrink-0 flex flex-wrap items-center gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
                 <span>
-                  上一次调用结果属于 {viewLabel(resultContext?.view ?? "tools")}「
+                  上一次调用结果属于 {viewLabel(resultContext?.view ?? "tools")}
+                  「
                   {resultContext?.resolvedTarget ??
                     resultContext?.target ??
                     result.target}
@@ -1247,9 +1478,7 @@ export function Explorer() {
                         ? "展开结果"
                         : "收起结果"
                   }
-                  onClick={() =>
-                    setResultCollapsed((current) => !current)
-                  }
+                  onClick={() => setResultCollapsed((current) => !current)}
                 >
                   <span>
                     结果 ·{" "}
@@ -1286,6 +1515,71 @@ export function Explorer() {
             setEventPanelServerId(open ? currentServer.id : null);
             if (open) setResultCollapsed(true);
           }}
+        />
+      ) : null}
+      {exportOpen && currentServerId ? (
+        <ExportPreviewDialog
+          key={`${currentServerId}:${exportFormat}:${includeSchema}`}
+          title="导出接口清单"
+          defaultFilename={`${
+            exportFormat === "csv"
+              ? "mcptester-interfaces"
+              : exportFormat === "csv_params"
+                ? "mcptester-interface-params"
+                : "mcptester-capabilities"
+          }-${exportSlug(currentServer?.name ?? "server")}-${exportTimestamp()}.${
+            exportFormat === "json" ? "json" : "csv"
+          }`}
+          load={() =>
+            previewCapabilityExport(
+              currentServerId,
+              exportFormat,
+              includeSchema,
+            )
+          }
+          onSave={(path) => {
+            if (!currentServerId) {
+              return Promise.reject(new Error("服务器未连接"));
+            }
+            return exportCapabilityExport(
+              currentServerId,
+              exportFormat,
+              path,
+              includeSchema,
+            );
+          }}
+          onClose={() => setExportOpen(false)}
+          filters={
+            exportFormat === "json"
+              ? [{ name: "JSON", extensions: ["json"] }]
+              : [{ name: "CSV", extensions: ["csv"] }]
+          }
+          extra={
+            <div className="flex items-center gap-2 text-xs text-slate-600">
+              <select
+                aria-label="导出格式"
+                className="rounded border border-slate-200 px-2 py-1 text-xs"
+                value={exportFormat}
+                onChange={(event) =>
+                  setExportFormat(event.target.value as CapabilityExportFormat)
+                }
+              >
+                <option value="csv">接口清单（CSV）</option>
+                <option value="csv_params">参数明细（CSV）</option>
+                <option value="json">能力快照（JSON）</option>
+              </select>
+              {exportFormat === "csv" ? (
+                <label className="flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={includeSchema}
+                    onChange={(event) => setIncludeSchema(event.target.checked)}
+                  />
+                  包含完整 Schema
+                </label>
+              ) : null}
+            </div>
+          }
         />
       ) : null}
     </section>

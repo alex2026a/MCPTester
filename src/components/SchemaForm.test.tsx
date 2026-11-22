@@ -1,9 +1,10 @@
 import { createRef } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SchemaForm, type SchemaFormHandle } from "./SchemaForm";
 import { validateAgainstSchema } from "../lib/schema";
+import { usePreferenceStore } from "../stores/preferences";
 
 const schema = {
   type: "object",
@@ -17,12 +18,85 @@ const schema = {
 };
 
 describe("SchemaForm", () => {
+  beforeEach(() => {
+    usePreferenceStore.setState({ requiredFirst: false });
+  });
+
   it("按 Schema 生成基础控件", () => {
     render(<SchemaForm schema={schema} onChange={() => {}} />);
     expect(screen.getByLabelText("text")).toBeInTheDocument();
     expect(screen.getByLabelText("count")).toHaveAttribute("type", "number");
     expect(screen.getByLabelText("flag")).toHaveAttribute("type", "checkbox");
     expect(screen.getByLabelText("mode").tagName).toBe("SELECT");
+  });
+
+  it("默认按 Schema 声明顺序渲染，可切换必填优先", async () => {
+    const { container } = render(
+      <SchemaForm
+        schema={{
+          type: "object",
+          properties: {
+            zeta: { type: "string" },
+            alpha: { type: "string" },
+            middle: { type: "string" },
+          },
+          required: ["alpha"],
+        }}
+        onChange={() => {}}
+      />,
+    );
+    const labels = () =>
+      [...container.querySelectorAll("[aria-label]")].map((node) =>
+        node.getAttribute("aria-label"),
+      );
+    expect(labels()).toEqual(["zeta", "alpha", "middle"]);
+
+    const toggle = screen.getByRole("button", { name: "必填优先" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(toggle);
+    expect(labels()).toEqual(["alpha", "zeta", "middle"]);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(toggle);
+    expect(labels()).toEqual(["zeta", "alpha", "middle"]);
+  });
+
+  it("JSON 模式不展示必填优先开关", async () => {
+    render(<SchemaForm schema={schema} onChange={() => {}} />);
+    await userEvent.click(screen.getByRole("button", { name: "JSON 模式" }));
+    expect(
+      screen.queryByRole("button", { name: "必填优先" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("showHeaderParams 仅对 x-mcp-header 字段显示 HTTP 头徽标", () => {
+    const headerSchema = {
+      type: "object",
+      properties: {
+        region: { type: "string", "x-mcp-header": "Region" },
+        number: { type: "number", "x-mcp-header": "Number" },
+        name: { type: "string" },
+      },
+    };
+    const { rerender } = render(
+      <SchemaForm schema={headerSchema} onChange={() => {}} showHeaderParams />,
+    );
+    const badge = screen.getByText("HTTP 头");
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveAttribute(
+      "title",
+      expect.stringContaining("Mcp-Param-Region"),
+    );
+    expect(screen.getAllByText("HTTP 头")).toHaveLength(1);
+
+    rerender(
+      <SchemaForm
+        schema={headerSchema}
+        onChange={() => {}}
+        showHeaderParams={false}
+      />,
+    );
+    expect(screen.queryByText("HTTP 头")).not.toBeInTheDocument();
   });
 
   it("maskSensitive 把敏感字符串渲染为 password", () => {
@@ -206,7 +280,9 @@ describe("SchemaForm", () => {
 
   it("JSON 非法输入也触发 onDirty", async () => {
     const onDirty = vi.fn();
-    render(<SchemaForm schema={schema} onChange={() => {}} onDirty={onDirty} />);
+    render(
+      <SchemaForm schema={schema} onChange={() => {}} onDirty={onDirty} />,
+    );
 
     await userEvent.click(screen.getByRole("button", { name: "JSON 模式" }));
     const textarea = screen.getByLabelText("参数 JSON");

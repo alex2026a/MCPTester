@@ -402,7 +402,8 @@ export interface GenerationStats {
 export interface GenerationPreview {
   server_id: string;
   capability_hash: string;
-  capability_snapshot: unknown;
+  /** 序列化后的能力快照，保存时原样回传，不要在 JS 里解析。 */
+  capability_snapshot: string;
   cases: TestCaseDraft[];
   warnings: string[];
   stats: GenerationStats;

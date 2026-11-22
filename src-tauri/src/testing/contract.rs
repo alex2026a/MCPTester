@@ -29,6 +29,23 @@ pub fn snapshot_value(snapshot: &CapabilitySnapshot) -> Value {
     serde_json::to_value(snapshot).unwrap_or(Value::Null)
 }
 
+/// 把能力快照编码为不透明 JSON 字符串。
+///
+/// 预览需要经过 Tauri IPC → JavaScript → Tauri IPC 往返；JavaScript 只有
+/// IEEE-754 double，直接传 `Value` 会把 `1.0` 改写成 `1`、`-0.0` 改写成 `0`，
+/// 并丢失超过 2^53 的整数精度，导致保存时重新计算的指纹与预览指纹不一致。
+/// 用字符串承载可以让前端原样回传，避免 JS 解析数字。
+pub fn encode_snapshot(snapshot: &CapabilitySnapshot) -> String {
+    serde_json::to_string(&snapshot_value(snapshot)).unwrap_or_default()
+}
+
+/// 解析预览回传的能力快照字符串，同时返回落库用的原始 `Value`。
+pub fn parse_snapshot(raw: &str) -> Result<(Value, CapabilitySnapshot), serde_json::Error> {
+    let value: Value = serde_json::from_str(raw)?;
+    let snapshot: CapabilitySnapshot = serde_json::from_value(value.clone())?;
+    Ok((value, snapshot))
+}
+
 /// 构造契约快照。
 pub fn build_snapshot(snapshot: &CapabilitySnapshot) -> ContractSnapshot {
     ContractSnapshot {
@@ -273,6 +290,33 @@ mod tests {
         b.warnings.push("临时降级提示".to_string());
         assert_eq!(capability_hash(&a), capability_hash(&b));
         assert_eq!(capability_hash(&a).len(), 32);
+    }
+
+    #[test]
+    fn snapshot_string_roundtrip_preserves_non_js_safe_numbers() {
+        // 旧实现把 Value 直接交给前端，JS 的 JSON.stringify 会把 1.0 变成 1，
+        // 保存时重新计算的指纹就会与预览不一致。字符串通道必须保留原始表示。
+        let mut original = snapshot();
+        original.tools[0].input_schema = Some(json!({
+            "type": "object",
+            "properties": {
+                "ratio": {"type": "number", "default": 1.0},
+                "big": {"type": "integer", "default": 9007199254740993u64}
+            }
+        }));
+        let raw = encode_snapshot(&original);
+        let (value, parsed) = parse_snapshot(&raw).expect("快照字符串应可解析");
+        assert_eq!(capability_hash(&original), capability_hash(&parsed));
+        assert!(raw.contains("\"default\":1.0"));
+        assert!(raw.contains("9007199254740993"));
+        assert_eq!(
+            value["tools"][0]["input_schema"]["properties"]["ratio"]["default"],
+            json!(1.0)
+        );
+        assert_eq!(
+            value["tools"][0]["input_schema"]["properties"]["big"]["default"],
+            json!(9007199254740993u64)
+        );
     }
 
     #[test]

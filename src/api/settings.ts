@@ -13,6 +13,8 @@ export interface Settings {
   test_call_max_rows: number;
   test_run_retention_days: number;
   test_run_max_rows: number;
+  load_run_retention_days: number;
+  load_run_max_rows: number;
 }
 
 export function getSettings(): Promise<Settings> {

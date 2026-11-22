@@ -287,7 +287,7 @@ fn classify(record: &CallRecord) -> ActualOutcome {
     }
 }
 
-fn result_is_error(result: Option<&Value>) -> bool {
+pub(crate) fn result_is_error(result: Option<&Value>) -> bool {
     result
         .and_then(Value::as_object)
         .map(|object| {

@@ -84,73 +84,86 @@ function renderExplorer() {
   );
 }
 
+const defaultInvoke = ((cmd: string) => {
+  switch (cmd) {
+    case "list_servers":
+      return Promise.resolve([server]);
+    case "get_app_info":
+      return Promise.resolve({
+        version: "0.1.3",
+        data_dir: "C:\\data",
+        log_dir: "C:\\logs",
+        supported_protocol_versions: ["2026-07-28", "2025-06-18"],
+        portable: false,
+        data_dir_source: "appdata",
+        config_path: null,
+        config_status: "not_found",
+        config_error: null,
+        config_changed: false,
+        default_server_id: null,
+        auto_connect: false,
+      });
+    case "get_capabilities":
+      return Promise.resolve(snapshot);
+    case "preview_capability_export":
+      return Promise.resolve(
+        "server_name,server_id,category\r\nMock Server,srv-1,tool\r\n",
+      );
+    case "list_recent_call_params":
+      return Promise.resolve([
+        {
+          id: "call-1",
+          created_at: "2026-10-26T10:32:05Z",
+          status: "ok",
+          duration_ms: 320,
+          origin: "manual",
+          preview: 'text="loaded"',
+          param_count: 1,
+          repeat_count: 1,
+          params_bytes: 32,
+        },
+      ]);
+    case "get_call_params":
+      return Promise.resolve({
+        name: "echo",
+        arguments: { text: "loaded" },
+      });
+    case "call_tool":
+      return Promise.resolve({
+        id: "call-1",
+        server_id: "srv-1",
+        server_name: "Mock Server",
+        method: "tools_call",
+        target: "echo",
+        params: {},
+        result: null,
+        error: null,
+        status: "ok",
+        duration_ms: 1,
+        protocol_version: "2026-07-28",
+        transport: "stdio",
+        truncated: false,
+        size_bytes: 0,
+        created_at: "2026-10-20T00:00:00Z",
+      });
+    default:
+      return Promise.reject(new Error(`未 mock 的命令：${cmd}`));
+  }
+}) as typeof invoke;
+
+function mockCapabilities(next: CapabilitySnapshot) {
+  invokeMock.mockImplementation(((cmd: string) => {
+    if (cmd === "get_capabilities") return Promise.resolve(next);
+    return defaultInvoke(cmd);
+  }) as typeof invoke);
+}
+
 beforeEach(() => {
   invokeMock.mockReset();
   useDraftStore.getState().clearAll();
   useReplayStore.getState().setReplay(null);
   useToastStore.setState({ toasts: [] });
-  invokeMock.mockImplementation(((cmd: string) => {
-    switch (cmd) {
-      case "list_servers":
-        return Promise.resolve([server]);
-      case "get_app_info":
-        return Promise.resolve({
-          version: "0.1.3",
-          data_dir: "C:\\data",
-          log_dir: "C:\\logs",
-          supported_protocol_versions: ["2026-07-28", "2025-06-18"],
-          portable: false,
-          data_dir_source: "appdata",
-          config_path: null,
-          config_status: "not_found",
-          config_error: null,
-          config_changed: false,
-          default_server_id: null,
-          auto_connect: false,
-        });
-      case "get_capabilities":
-        return Promise.resolve(snapshot);
-      case "list_recent_call_params":
-        return Promise.resolve([
-          {
-            id: "call-1",
-            created_at: "2026-10-26T10:32:05Z",
-            status: "ok",
-            duration_ms: 320,
-            origin: "manual",
-            preview: 'text="loaded"',
-            param_count: 1,
-            repeat_count: 1,
-            params_bytes: 32,
-          },
-        ]);
-      case "get_call_params":
-        return Promise.resolve({
-          name: "echo",
-          arguments: { text: "loaded" },
-        });
-      case "call_tool":
-        return Promise.resolve({
-          id: "call-1",
-          server_id: "srv-1",
-          server_name: "Mock Server",
-          method: "tools_call",
-          target: "echo",
-          params: {},
-          result: null,
-          error: null,
-          status: "ok",
-          duration_ms: 1,
-          protocol_version: "2026-07-28",
-          transport: "stdio",
-          truncated: false,
-          size_bytes: 0,
-          created_at: "2026-10-20T00:00:00Z",
-        });
-      default:
-        return Promise.reject(new Error(`未 mock 的命令：${cmd}`));
-    }
-  }) as typeof invoke);
+  invokeMock.mockImplementation(defaultInvoke);
 });
 
 describe("Explorer 历史重放", () => {
@@ -297,7 +310,9 @@ describe("Explorer 能力降级与事件面板", () => {
     invokeMock.mockImplementation(((cmd: string) => {
       switch (cmd) {
         case "list_servers":
-          return Promise.resolve([{ ...server, state: { state: "disconnected" } }]);
+          return Promise.resolve([
+            { ...server, state: { state: "disconnected" } },
+          ]);
         case "get_app_info":
           return Promise.resolve({
             version: "0.1.3",
@@ -499,5 +514,263 @@ describe("Explorer 参数校验", () => {
       screen.queryByRole("button", { name: "仍要发送" }),
     ).not.toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalledWith("call_tool", expect.anything());
+  });
+});
+
+describe("Explorer 接口搜索（v0.7.1）", () => {
+  it("默认只搜索名称，切换名称+内容后显示描述命中", async () => {
+    renderExplorer();
+
+    await screen.findByRole("button", { name: /echo/ });
+    const search = screen.getByRole("textbox", { name: "搜索接口" });
+    await userEvent.type(search, "回显");
+
+    expect(screen.getByText("没有匹配的接口")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /echo/ }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "搜索全部内容" }));
+
+    expect(
+      await screen.findByRole("button", { name: /echo/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("描述")).toBeInTheDocument();
+    expect(screen.getByText("1 / 1")).toBeInTheDocument();
+  });
+
+  it("名称+内容可命中 Tool Schema 字段名", async () => {
+    renderExplorer();
+
+    await screen.findByRole("button", { name: /echo/ });
+    const search = screen.getByRole("textbox", { name: "搜索接口" });
+    await userEvent.type(search, "text");
+    expect(screen.getByText("没有匹配的接口")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "名称+内容" }));
+
+    expect(
+      await screen.findByRole("button", { name: /echo/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("字段")).toBeInTheDocument();
+  });
+
+  it("名称命中与内容命中分组展示", async () => {
+    mockCapabilities({
+      ...snapshot,
+      tools: [
+        snapshot.tools[0],
+        {
+          name: "search_files",
+          title: null,
+          description: "在项目中搜索文件",
+          input_schema: null,
+          output_schema: null,
+          annotations: null,
+        },
+        {
+          name: "weather",
+          title: null,
+          description: "查询天气。search 关键词只应作为内容命中",
+          input_schema: null,
+          output_schema: null,
+          annotations: null,
+        },
+      ],
+    });
+    renderExplorer();
+
+    const search = await screen.findByRole("textbox", { name: "搜索接口" });
+    await userEvent.type(search, "search");
+    await userEvent.click(screen.getByRole("button", { name: "名称+内容" }));
+
+    expect(screen.getByText("名称匹配")).toBeInTheDocument();
+    expect(screen.getByText("内容匹配")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /search_files/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /weather/ })).toBeInTheDocument();
+    expect(screen.getByText("2 / 3")).toBeInTheDocument();
+  });
+
+  it("Prompts 参数名在名称+内容范围可搜索", async () => {
+    renderExplorer();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Prompts/ }),
+    );
+    const search = screen.getByRole("textbox", { name: "搜索接口" });
+    await userEvent.type(search, "who");
+    expect(screen.getByText("没有匹配的接口")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "名称+内容" }));
+
+    expect(
+      await screen.findByRole("button", { name: /greet/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("参数")).toBeInTheDocument();
+  });
+
+  it("选中项被搜索过滤时保留选择并提示", async () => {
+    renderExplorer();
+
+    await userEvent.click(await screen.findByRole("button", { name: /echo/ }));
+    const search = screen.getByRole("textbox", { name: "搜索接口" });
+    await userEvent.type(search, "greet");
+
+    expect(screen.getByText("当前选中项不在筛选结果中")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "清空搜索" }));
+    expect(
+      screen.queryByText("当前选中项不在筛选结果中"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /echo/ })).toBeInTheDocument();
+  });
+
+  it("Esc 清空搜索，Ctrl+F 聚焦搜索框", async () => {
+    renderExplorer();
+
+    await screen.findByRole("button", { name: /echo/ });
+    const search = screen.getByRole("textbox", { name: "搜索接口" });
+    await userEvent.type(search, "echo");
+    expect(search).toHaveValue("echo");
+
+    await userEvent.keyboard("{Escape}");
+    expect(search).toHaveValue("");
+    expect(screen.getByRole("button", { name: /echo/ })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /echo/ }));
+    await userEvent.keyboard("{Control>}f{/Control}");
+    expect(search).toHaveFocus();
+  });
+});
+
+describe("Explorer 接口导出（v0.6.1）", () => {
+  it("导出接口按钮调用预览命令，并支持切换格式", async () => {
+    renderExplorer();
+
+    const exportButton = await screen.findByRole("button", {
+      name: "导出接口",
+    });
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    await userEvent.click(exportButton);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("preview_capability_export", {
+        id: "srv-1",
+        format: "csv",
+        includeSchema: false,
+      }),
+    );
+
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "导出格式" }),
+      "json",
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("preview_capability_export", {
+        id: "srv-1",
+        format: "json",
+        includeSchema: false,
+      }),
+    );
+
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "导出格式" }),
+      "csv_params",
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("preview_capability_export", {
+        id: "srv-1",
+        format: "csv_params",
+        includeSchema: false,
+      }),
+    );
+  });
+
+  it("未连接时导出按钮禁用", async () => {
+    const disconnected: ServerSummary = {
+      ...server,
+      state: { state: "disconnected" },
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([disconnected]);
+        case "get_app_info":
+          return Promise.resolve(null);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+
+    renderExplorer();
+    const exportButton = await screen.findByRole("button", {
+      name: "导出接口",
+    });
+    expect(exportButton).toBeDisabled();
+  });
+
+  it("现代 Streamable HTTP 工具显示 x-mcp-header 提示", async () => {
+    const baseHandshake =
+      server.state.state === "ready"
+        ? server.state.handshake
+        : {
+            server_name: "mock",
+            server_version: "1.0.0",
+            protocol_version: "2026-07-28",
+            lifecycle: "modern" as const,
+            capabilities: {},
+            instructions: null,
+          };
+    const modernServer: ServerSummary = {
+      ...server,
+      transport: "streamable_http",
+      state: {
+        state: "ready",
+        handshake: {
+          ...baseHandshake,
+          protocol_version: "2026-07-28",
+          lifecycle: "modern",
+        },
+      },
+    };
+    const modernSnapshot: CapabilitySnapshot = {
+      ...snapshot,
+      tools: [
+        {
+          ...snapshot.tools[0],
+          input_schema: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              region: { type: "string", "x-mcp-header": "Region" },
+            },
+            required: ["text"],
+          },
+        },
+      ],
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([modernServer]);
+        case "get_app_info":
+          return Promise.resolve(null);
+        case "get_capabilities":
+          return Promise.resolve(modernSnapshot);
+        case "list_recent_call_params":
+          return Promise.resolve([]);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+
+    renderExplorer();
+    await userEvent.click(await screen.findByRole("button", { name: /echo/ }));
+    expect(
+      await screen.findByText(/该工具会将 1 个参数作为/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("HTTP 头")).toBeInTheDocument();
   });
 });

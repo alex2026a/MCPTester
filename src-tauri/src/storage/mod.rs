@@ -3,6 +3,7 @@
 pub mod app_meta;
 pub mod call_repo;
 pub mod db;
+pub mod load_repo;
 pub mod migrations;
 pub mod oauth_repo;
 pub mod server_repo;

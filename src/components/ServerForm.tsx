@@ -1,7 +1,12 @@
-import { useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { ErrorDetailDialog } from "./ErrorDetailDialog";
 import { JsonViewer } from "./JsonViewer";
 import { toErrorInfo, type ErrorInfo } from "../lib/errors";
+import {
+  COMMON_HEADER_NAMES,
+  mergeHeaders,
+  parseHeaderLines,
+} from "../lib/headers";
 import { toast } from "../stores/toast";
 import type { ConnectionTestReport } from "../api/servers";
 import type {
@@ -110,66 +115,87 @@ function isInsecureHttpUrl(value: string): boolean {
  *
  * v0.1.2：敏感值若为掩码形态（`****`），输入框显示为空并以占位符提示
  * "已配置"——"留空 = 不修改"语义直观化，避免把掩码误当真实值或在其后追加输入。
+ *
+ * v0.6.1：支持常用名称补全与单行禁用（OAuth/none 模式禁用 Authorization）。
  */
 function KeyValueEditor({
   items,
   onChange,
   placeholderKey,
+  suggestions,
+  isItemDisabled,
+  disabledHint,
 }: {
   items: KeyValue[];
   onChange: (items: KeyValue[]) => void;
   placeholderKey: string;
+  suggestions?: string[];
+  isItemDisabled?: (item: KeyValue) => boolean;
+  disabledHint?: string;
 }) {
+  const listId = useId();
   return (
     <div className="space-y-1">
       {items.map((item, index) => {
         const masked = item.secret && (item.value ?? "").includes("****");
+        const disabled = isItemDisabled?.(item) ?? false;
         const placeholder = item.secret
           ? masked
             ? "已配置（留空=不修改；输入即替换）"
             : "敏感值（留空表示不修改）"
           : "值";
         return (
-          <div key={index} className="flex items-center gap-2">
-            <input
-              className="w-40 rounded border border-slate-200 px-2 py-1 text-xs"
-              placeholder={placeholderKey}
-              value={item.key}
-              onChange={(e) => {
-                const next = [...items];
-                next[index] = { ...item, key: e.target.value };
-                onChange(next);
-              }}
-            />
-            <input
-              className="flex-1 rounded border border-slate-200 px-2 py-1 text-xs"
-              placeholder={placeholder}
-              value={masked ? "" : (item.value ?? "")}
-              onChange={(e) => {
-                const next = [...items];
-                next[index] = { ...item, value: e.target.value };
-                onChange(next);
-              }}
-            />
-            <label className="flex items-center gap-1 text-xs text-slate-500">
+          <div key={index} className="space-y-1">
+            <div className="flex items-center gap-2">
               <input
-                type="checkbox"
-                checked={item.secret}
+                className="w-40 rounded border border-slate-200 px-2 py-1 text-xs disabled:bg-slate-100 disabled:text-slate-400"
+                placeholder={placeholderKey}
+                list={suggestions ? listId : undefined}
+                disabled={disabled}
+                value={item.key}
                 onChange={(e) => {
                   const next = [...items];
-                  next[index] = { ...item, secret: e.target.checked };
+                  next[index] = { ...item, key: e.target.value };
                   onChange(next);
                 }}
               />
-              敏感
-            </label>
-            <button
-              type="button"
-              className="text-xs text-slate-400 hover:text-red-500"
-              onClick={() => onChange(items.filter((_, i) => i !== index))}
-            >
-              删除
-            </button>
+              <input
+                className="flex-1 rounded border border-slate-200 px-2 py-1 text-xs disabled:bg-slate-100 disabled:text-slate-400"
+                placeholder={placeholder}
+                disabled={disabled}
+                value={masked ? "" : (item.value ?? "")}
+                onChange={(e) => {
+                  const next = [...items];
+                  next[index] = { ...item, value: e.target.value };
+                  onChange(next);
+                }}
+              />
+              <label className="flex items-center gap-1 text-xs text-slate-500">
+                <input
+                  type="checkbox"
+                  disabled={disabled}
+                  checked={item.secret}
+                  onChange={(e) => {
+                    const next = [...items];
+                    next[index] = { ...item, secret: e.target.checked };
+                    onChange(next);
+                  }}
+                />
+                敏感
+              </label>
+              {disabled ? null : (
+                <button
+                  type="button"
+                  className="text-xs text-slate-400 hover:text-red-500"
+                  onClick={() => onChange(items.filter((_, i) => i !== index))}
+                >
+                  删除
+                </button>
+              )}
+            </div>
+            {disabled && disabledHint ? (
+              <div className="text-[11px] text-amber-600">{disabledHint}</div>
+            ) : null}
           </div>
         );
       })}
@@ -182,6 +208,13 @@ function KeyValueEditor({
       >
         + 添加
       </button>
+      {suggestions ? (
+        <datalist id={listId}>
+          {suggestions.map((name) => (
+            <option key={name} value={name} />
+          ))}
+        </datalist>
+      ) : null}
     </div>
   );
 }
@@ -280,6 +313,28 @@ export function ServerForm({
     null,
   );
   const [testDetail, setTestDetail] = useState<ErrorInfo | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const pasteParsed = useMemo(() => parseHeaderLines(pasteText), [pasteText]);
+
+  function applyPastedHeaders() {
+    if (pasteParsed.items.length === 0) {
+      toast.error("没有可添加的请求头", {
+        message: pasteParsed.errors[0] ?? undefined,
+      });
+      return;
+    }
+    const merged = mergeHeaders(http.headers, pasteParsed.items);
+    setHttp({ ...http, headers: merged.headers });
+    setPasteOpen(false);
+    setPasteText("");
+    toast.success(`已添加 ${merged.added} 项，更新 ${merged.updated} 项`, {
+      message:
+        pasteParsed.errors.length > 0
+          ? `${pasteParsed.errors.length} 行未解析，请检查`
+          : undefined,
+    });
+  }
 
   /** 校验并构建草稿（保存 / 测试连接共用） */
   function buildDraft(): ServerDraft | null {
@@ -306,10 +361,17 @@ export function ServerForm({
       // 允许 DCR；此处仅提示，不强制
     }
 
+    // v0.6.1：secrets 必须基于 effectiveHeaders，避免 none/OAuth 模式提交一个
+    // 配置里不存在的 Authorization secret（否则可能留下孤立 keyring 条目）。
+    const effectiveHeaders =
+      isStdio || authMode === "header"
+        ? http.headers
+        : http.headers.filter((item) => !isAuthorizationHeader(item));
+
     // v0.1.1：掩码值（含 "****"）视为"未修改"，按 keep 提交——
     // 防止把回显掩码误写回凭据库导致真实 token 丢失（见 01 文档根因 B）
     const secrets: SecretInput[] = [
-      ...(isStdio ? stdio.env : http.headers)
+      ...(isStdio ? stdio.env : effectiveHeaders)
         .filter((kv) => kv.secret || kv.value)
         .map((kv) => {
           const value = kv.value ?? "";
@@ -344,11 +406,6 @@ export function ServerForm({
         value: null,
       });
     }
-
-    const effectiveHeaders =
-      authMode === "header"
-        ? http.headers
-        : http.headers.filter((item) => !isAuthorizationHeader(item));
 
     const authorizeParams = parseAuthorizeParams(authorizeParamsText);
     if (isOauth && authorizeParams.error) {
@@ -388,9 +445,7 @@ export function ServerForm({
               .filter((line) => line.length > 0),
           }
         : null,
-      http: isStdio
-        ? null
-        : { ...http, headers: effectiveHeaders, oauth },
+      http: isStdio ? null : { ...http, headers: effectiveHeaders, oauth },
       protocol_version_pin: pin.trim() ? pin.trim() : null,
       enabled: true,
       tags: [],
@@ -544,10 +599,13 @@ export function ServerForm({
               服务通常带自定义端口， 如 http://127.0.0.1:8000/mcp
             </div>
           ) : null}
-          {oauthSelected && isInsecureHttpUrl(http.url) && !allowInsecureHttp ? (
+          {oauthSelected &&
+          isInsecureHttpUrl(http.url) &&
+          !allowInsecureHttp ? (
             <div className="text-[11px] text-amber-600">
-              OAuth 模式默认要求 https（loopback 除外）；如确需在私有网络使用明文测试，
-              请在下方「高级：手工端点 / issuer」勾选「允许明文 HTTP」。
+              OAuth 模式默认要求 https（loopback
+              除外）；如确需在私有网络使用明文测试， 请在下方「高级：手工端点 /
+              issuer」勾选「允许明文 HTTP」。
             </div>
           ) : null}
           <label className="block space-y-1 text-xs text-slate-600">
@@ -558,20 +616,12 @@ export function ServerForm({
               onChange={(e) => {
                 const mode = e.target.value as AuthMode;
                 setAuthMode(mode);
-                if (mode !== "header") {
-                  setHttp((prev) => ({
-                    ...prev,
-                    headers: prev.headers.filter(
-                      (item) => !isAuthorizationHeader(item),
-                    ),
-                  }));
-                }
                 if (mode !== "oauth" && initial?.http?.oauth) {
                   setClearClientSecret(true);
                 }
               }}
             >
-              <option value="none">无认证</option>
+              <option value="none">无 OAuth（可自定义请求头）</option>
               <option value="header">Authorization 请求头</option>
               <option value="oauth" disabled={transport === "sse"}>
                 OAuth 2.1 / OAuth 2.0 登录（授权码 + PKCE，仅 Streamable HTTP）
@@ -707,7 +757,8 @@ export function ServerForm({
                   </span>
                 </label>
                 <p className="mt-1 text-[11px] text-slate-500">
-                  使用私有 IP 的授权服务器可能被自动发现的安全策略拦截；此时请手工填写上方的
+                  使用私有 IP
+                  的授权服务器可能被自动发现的安全策略拦截；此时请手工填写上方的
                   authorization/token 端点与 issuer。
                 </p>
               </details>
@@ -721,7 +772,9 @@ export function ServerForm({
                     className="h-20 w-full resize-y rounded border border-slate-200 px-2 py-1 font-mono text-[11px]"
                     value={authorizeParamsText}
                     onChange={(e) => setAuthorizeParamsText(e.target.value)}
-                    placeholder={"audience=https://api.example.com\naccess_type=offline\nprompt=consent"}
+                    placeholder={
+                      "audience=https://api.example.com\naccess_type=offline\nprompt=consent"
+                    }
                   />
                 </label>
                 <label className="mt-2 flex items-start gap-2 text-xs text-slate-600">
@@ -734,7 +787,8 @@ export function ServerForm({
                     }
                   />
                   <span>
-                    把自定义请求头发往跨源授权服务器（默认只发同源；开启后可能把网关密钥发给第三方 IdP）
+                    把自定义请求头发往跨源授权服务器（默认只发同源；开启后可能把网关密钥发给第三方
+                    IdP）
                   </span>
                 </label>
                 <label className="mt-2 block space-y-1 text-xs text-slate-600">
@@ -754,8 +808,12 @@ export function ServerForm({
                     onChange={(e) => setTokenEndpointAuthMethod(e.target.value)}
                   >
                     <option value="">默认（client_secret_basic）</option>
-                    <option value="client_secret_basic">client_secret_basic</option>
-                    <option value="client_secret_post">client_secret_post</option>
+                    <option value="client_secret_basic">
+                      client_secret_basic
+                    </option>
+                    <option value="client_secret_post">
+                      client_secret_post
+                    </option>
                     <option value="none">none（公共客户端）</option>
                   </select>
                 </label>
@@ -769,37 +827,116 @@ export function ServerForm({
                   />
                 </label>
                 <p className="mt-1 text-[11px] text-slate-500">
-                  已用 DCR/CIMD 登录时，切换注册方式请先在服务器卡片点“清除注册”。
+                  已用 DCR/CIMD
+                  登录时，切换注册方式请先在服务器卡片点“清除注册”。
                 </p>
               </details>
               <p className="text-[11px] text-slate-500">
-                OAuth 模式会忽略 Authorization 请求头；其他自定义请求头默认只发往 MCP 服务器同源地址。
+                OAuth 模式会禁用 Authorization
+                行；保存时不会提交该头。其他自定义请求头默认只发往 MCP
+                服务器同源地址。
               </p>
             </div>
-          ) : (
-            <div className="space-y-1 text-xs text-slate-600">
-              请求头（Authorization 填「Bearer xxx」或仅 token
-              均可，建议勾选"敏感"入凭据库）
-              <KeyValueEditor
-                items={http.headers}
-                onChange={(headers) => setHttp({ ...http, headers })}
-                placeholderKey="如 Authorization"
-              />
-            </div>
-          )}
-
-          {authMode === "oauth" ? (
-            <div className="space-y-1 text-xs text-slate-600">
-              其他请求头
-              <KeyValueEditor
-                items={http.headers.filter(
-                  (item) => !isAuthorizationHeader(item),
-                )}
-                onChange={(headers) => setHttp({ ...http, headers })}
-                placeholderKey="如 X-Trace"
-              />
-            </div>
           ) : null}
+
+          <div className="space-y-2 text-xs text-slate-600">
+            <div className="flex flex-wrap items-center gap-2">
+              <span>请求头</span>
+              <button
+                type="button"
+                className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-50"
+                onClick={() => setPasteOpen((value) => !value)}
+              >
+                {pasteOpen ? "收起批量粘贴" : "批量粘贴"}
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              请求头作用于该服务器下全部接口；保存后需重连生效。Authorization
+              填「Bearer xxx」或仅 token 均可。
+            </p>
+            {authMode !== "header" ? (
+              <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                当前认证方式不会发送 Authorization；切回「Authorization
+                请求头」后可编辑并生效。
+              </div>
+            ) : null}
+            {pasteOpen ? (
+              <div className="space-y-1 rounded border border-slate-200 bg-slate-50 p-2">
+                <textarea
+                  aria-label="批量粘贴请求头"
+                  className="h-28 w-full rounded border border-slate-200 p-2 font-mono text-xs"
+                  value={pasteText}
+                  onChange={(e) => setPasteText(e.target.value)}
+                  placeholder={
+                    "Authorization: Bearer xxx\nX-Api-Key: abc\n-H 'X-Trace: 1'"
+                  }
+                />
+                <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                  <span>解析：{pasteParsed.items.length} 项</span>
+                  {pasteParsed.errors.length > 0 ? (
+                    <span className="text-red-500">
+                      {pasteParsed.errors.length} 个错误
+                    </span>
+                  ) : null}
+                  {pasteParsed.warnings.length > 0 ? (
+                    <span className="text-amber-600">
+                      {pasteParsed.warnings.length} 个提示
+                    </span>
+                  ) : null}
+                  {pasteParsed.ignored > 0 ? (
+                    <span>忽略 {pasteParsed.ignored} 行</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="ml-auto rounded bg-slate-800 px-2 py-1 text-[11px] text-white hover:bg-slate-700 disabled:opacity-50"
+                    disabled={pasteParsed.items.length === 0}
+                    onClick={applyPastedHeaders}
+                  >
+                    解析并添加
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded border border-slate-200 px-2 py-1 text-[11px] hover:bg-slate-50"
+                    onClick={() => {
+                      setPasteOpen(false);
+                      setPasteText("");
+                    }}
+                  >
+                    取消
+                  </button>
+                </div>
+                {pasteParsed.errors.length > 0 ? (
+                  <ul className="space-y-0.5 text-[11px] text-red-500">
+                    {pasteParsed.errors.map((error) => (
+                      <li key={error}>{error}</li>
+                    ))}
+                  </ul>
+                ) : null}
+                {pasteParsed.warnings.length > 0 ? (
+                  <ul className="space-y-0.5 text-[11px] text-amber-600">
+                    {pasteParsed.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
+            <KeyValueEditor
+              items={http.headers}
+              onChange={(headers) => setHttp({ ...http, headers })}
+              placeholderKey="如 Authorization / X-Api-Key"
+              suggestions={COMMON_HEADER_NAMES}
+              isItemDisabled={(item) =>
+                authMode !== "header" && isAuthorizationHeader(item)
+              }
+              disabledHint="当前认证方式不会发送此头；切回「Authorization 请求头」后可编辑。"
+            />
+            <p className="text-[11px] text-slate-500">
+              {authMode === "oauth"
+                ? "OAuth 模式会禁用 Authorization 行；保存时不会提交该头。其他自定义请求头默认只发往 MCP 服务器同源地址。"
+                : "建议勾选「敏感」入凭据库；编辑时留空表示不修改。"}
+            </p>
+          </div>
           <div className="grid grid-cols-2 gap-4">
             <label className="space-y-1 text-xs text-slate-600">
               超时覆盖（秒，留空=全局）

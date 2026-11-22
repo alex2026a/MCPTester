@@ -230,7 +230,11 @@ impl ConnectionHandle {
     ) -> Arc<Self> {
         let server_id = server_id.into();
         let hub = EventHub::new(server_id.clone(), &settings);
-        let wire = WireLog::new(settings.wire_buffer_lines, 16 * 1024);
+        let wire = if settings.wire_enabled {
+            WireLog::new(settings.wire_buffer_lines, 16 * 1024)
+        } else {
+            WireLog::disabled()
+        };
         Arc::new(Self {
             server_id,
             server_name: server_name.into(),
@@ -1009,10 +1013,13 @@ impl ConnectionHandle {
         record.id = call_id.clone();
         record.origin = origin;
 
-        let server_inputs = active.take_server_inputs();
-        let captures = self.wire.take_captures(&call_id);
-        let (mut frames, mut rounds) =
-            build_call_rounds(&captures, &traces, server_inputs);
+        let (mut frames, mut rounds) = if self.settings.capture_enabled {
+            let server_inputs = active.take_server_inputs();
+            let captures = self.wire.take_captures(&call_id);
+            build_call_rounds(&captures, &traces, server_inputs)
+        } else {
+            (None, None)
+        };
         let drop_last_response = (record.status == CallStatus::Canceled
             || (record.result.is_none()
                 && matches!(
@@ -2476,5 +2483,33 @@ mod tests {
             Some("http://127.0.0.1/mcp".to_string())
         );
         assert_eq!(extract_send_error_url("no url here"), None);
+    }
+
+    #[test]
+    fn convert_tool_preserves_schema_property_order() {
+        // tools/list 反序列化依赖 serde_json 的 preserve_order，否则 BTreeMap 会按字母序重排。
+        let tool: rmcp::model::Tool = serde_json::from_value(serde_json::json!({
+            "name": "ordered",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "zeta": { "type": "string" },
+                    "alpha": { "type": "string" },
+                    "middle": { "type": "string" }
+                },
+                "required": ["alpha"]
+            }
+        }))
+        .expect("构造工具定义");
+
+        let info = convert_tool(&tool);
+        let keys: Vec<String> = info
+            .input_schema
+            .as_ref()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.as_object())
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(keys, vec!["zeta", "alpha", "middle"]);
     }
 }

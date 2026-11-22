@@ -93,12 +93,12 @@ export function generateTestCases(
   });
 }
 
-/** 保存生成预览：原子写入用例 + 能力快照/指纹。 */
+/** 保存生成预览：原子写入用例 + 能力快照/指纹；快照是不透明 JSON 字符串。 */
 export function saveGeneratedCases(
   suiteId: string,
   cases: TestCaseDraft[],
   capabilityHash: string,
-  capabilitySnapshot: unknown,
+  capabilitySnapshot: string,
 ): Promise<TestCase[]> {
   return invoke<TestCase[]>("save_generated_cases", {
     suiteId,

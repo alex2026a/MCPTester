@@ -142,6 +142,20 @@ export function SettingsPage() {
                   setDraft({ ...effective, test_run_max_rows: value })
                 }
               />
+              <NumberField
+                label="压测记录保留天数"
+                value={effective.load_run_retention_days}
+                onChange={(value) =>
+                  setDraft({ ...effective, load_run_retention_days: value })
+                }
+              />
+              <NumberField
+                label="压测记录最大运行数"
+                value={effective.load_run_max_rows}
+                onChange={(value) =>
+                  setDraft({ ...effective, load_run_max_rows: value })
+                }
+              />
             </div>
           ) : (
             <div className="text-xs text-slate-400">加载中…</div>

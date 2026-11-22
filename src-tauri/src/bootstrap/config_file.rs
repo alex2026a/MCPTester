@@ -555,6 +555,8 @@ mod tests {
             portable: true,
             data_dir_source: "portable".to_string(),
             test_run: Arc::new(tokio::sync::Mutex::new(None)),
+            load_run: Arc::new(tokio::sync::Mutex::new(None)),
+            run_slot: Arc::new(std::sync::Mutex::new(None)),
         };
         (dir, state)
     }

@@ -124,8 +124,12 @@ impl CaptureState {
     }
 }
 
+/// 在途请求配对表上限（防止超时/取消后无界增长）
+const PENDING_MAX_ENTRIES: usize = 4096;
+
 /// 单连接报文日志（环形缓冲）
 pub struct WireLog {
+    enabled: bool,
     seq: AtomicU64,
     capacity: usize,
     max_payload_bytes: usize,
@@ -139,6 +143,7 @@ pub struct WireLog {
 impl WireLog {
     pub fn new(capacity: usize, max_payload_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
+            enabled: true,
             seq: AtomicU64::new(0),
             capacity: capacity.max(10),
             max_payload_bytes: max_payload_bytes.max(1024),
@@ -148,8 +153,28 @@ impl WireLog {
         })
     }
 
+    /// 压测用静默日志：不序列化、不采集、不维护在途表。
+    pub fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            enabled: false,
+            seq: AtomicU64::new(0),
+            capacity: 10,
+            max_payload_bytes: 1024,
+            entries: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(HashMap::new()),
+            captures: Mutex::new(CaptureState::default()),
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// 记录一条报文（payload 会被脱敏并限长）
     pub fn push(&self, direction: WireDirection, summary: impl Into<String>, mut payload: Value) {
+        if !self.enabled {
+            return;
+        }
         let mut meta = frame_meta(&payload);
         if matches!(direction, WireDirection::System) {
             meta.kind = WireKind::System;
@@ -201,6 +226,9 @@ impl WireLog {
         let mut pending = self.pending.lock().expect("报文配对表锁异常");
         match meta.kind {
             WireKind::Request => {
+                if pending.len() >= PENDING_MAX_ENTRIES {
+                    pending.clear();
+                }
                 pending.insert((from_client as u8, id.clone()), at);
                 None
             }
@@ -215,6 +243,9 @@ impl WireLog {
 
     /// 采集原始帧：只处理调用方法；请求按 rpc_id 建条目，响应按 rpc_id 回填
     fn capture(&self, direction: &WireDirection, meta: &FrameMeta, payload: &Value) {
+        if !self.enabled {
+            return;
+        }
         let Some(id) = payload.get("id").filter(|value| !value.is_null()) else {
             return;
         };
@@ -260,6 +291,9 @@ impl WireLog {
 
     /// 把 rpc_id 归属到 call_id；多轮调用会追加而不是覆盖
     pub fn link_capture(&self, rpc_id: &RequestId, call_id: &str) {
+        if !self.enabled {
+            return;
+        }
         let Ok(value) = serde_json::to_value(rpc_id) else {
             return;
         };
@@ -275,6 +309,9 @@ impl WireLog {
 
     /// 取出并删除一次调用的全部原始帧（按轮次顺序）
     pub fn take_captures(&self, call_id: &str) -> Vec<CapturedExchange> {
+        if !self.enabled {
+            return Vec::new();
+        }
         let mut state = self.captures.lock().expect("原始帧采集锁异常");
         let keys = state.links.remove(call_id).unwrap_or_default();
         let mut captures = Vec::with_capacity(keys.len());
@@ -293,6 +330,14 @@ impl WireLog {
     }
 
     /// 全量快照（按 seq 升序）
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().expect("报文配对表锁异常").len()
+    }
+
+    pub fn capture_count(&self) -> usize {
+        self.captures.lock().expect("原始帧采集锁异常").entries.len()
+    }
+
     pub fn buffer(&self) -> Vec<WireEntry> {
         let buf = self.entries.lock().expect("报文缓冲锁异常");
         buf.iter().cloned().collect()
@@ -434,20 +479,23 @@ where
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let value = serde_json::to_value(&item).unwrap_or(Value::Null);
-        self.wire.push(
-            WireDirection::ClientToServer,
-            summarize_message(&value),
-            value,
-        );
+        if self.wire.enabled() {
+            let value = serde_json::to_value(&item).unwrap_or(Value::Null);
+            self.wire.push(
+                WireDirection::ClientToServer,
+                summarize_message(&value),
+                value,
+            );
+        }
         self.inner.send(item)
     }
 
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
         let wire = Arc::clone(&self.wire);
+        let enabled = self.wire.enabled();
         async move {
             let item = self.inner.receive().await;
-            if let Some(message) = &item {
+            if enabled && let Some(message) = &item {
                 let value = serde_json::to_value(message).unwrap_or(Value::Null);
                 wire.push(WireDirection::ServerToClient, summarize_message(&value), value);
             }
@@ -541,6 +589,26 @@ fn bounded(value: Value, max_bytes: usize) -> (Value, bool) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn disabled_log_does_not_retain_frames_or_pending() {
+        let wire = WireLog::disabled();
+        assert!(!wire.enabled());
+        wire.push(
+            WireDirection::ClientToServer,
+            "request tools/call #1",
+            json!({"id": 1, "method": "tools/call", "params": {}}),
+        );
+        wire.push(
+            WireDirection::ServerToClient,
+            "response #1",
+            json!({"id": 1, "result": {"content": []}}),
+        );
+        assert!(wire.buffer().is_empty());
+        assert_eq!(wire.pending_len(), 0);
+        assert_eq!(wire.capture_count(), 0);
+        assert!(wire.take_captures("call-1").is_empty());
+    }
 
     #[test]
     fn summary_from_json_rpc() {

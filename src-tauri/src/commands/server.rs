@@ -964,6 +964,16 @@ pub async fn update_server_meta(
     Ok(config)
 }
 
+/// 复制服务器（敏感值由后端复制；OAuth 登录状态/密钥/注册身份不复制）
+#[tauri::command]
+pub async fn duplicate_server(
+    state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+) -> Result<ServerConfig, String> {
+    duplicate_server_inner(&state, &id, name).await
+}
+
 /// 保存服务器自定义排序（要求提交当前全部服务器 ID）
 #[tauri::command]
 pub async fn reorder_servers(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
@@ -1401,6 +1411,210 @@ fn apply_old_mask(
         if !has_new {
             // keep 场景：值不落库，仅标记为已配置
             item.value = Some("****（已配置）".to_string());
+        }
+    }
+}
+
+/// 复制服务器内部实现（命令与测试共用）
+pub(crate) async fn duplicate_server_inner(
+    state: &AppState,
+    id: &str,
+    name: Option<String>,
+) -> Result<ServerConfig, String> {
+    let source = state
+        .db
+        .with_read_blocking(|conn| server_repo::get(conn, id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "服务器不存在".to_string())?;
+
+    let resolved = load_config_for_duplicate(state, source)?;
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let mut config = build_duplicate_config(resolved, new_id.clone(), name, Utc::now());
+
+    // 便携模式：敏感值继续明文保存在本地数据库。
+    if state.portable {
+        let config_for_db = config.clone();
+        state
+            .db
+            .with_write_blocking(move |conn| server_repo::upsert(conn, &config_for_db))
+            .map_err(|e| format!("复制服务器失败：{e}"))?;
+        return Ok(config);
+    }
+
+    // 安装版：敏感值写入新 keyring，DB 只保存掩码。
+    let mut written: Vec<CredentialRef> = Vec::new();
+    if let Some(stdio) = config.stdio.as_mut()
+        && let Err(error) = write_duplicate_secrets(
+            &new_id,
+            SecretKind::Env,
+            &mut stdio.env,
+            &mut written,
+        )
+    {
+        cleanup_duplicate_secrets(state, &written);
+        return Err(error);
+    }
+    if let Some(http) = config.http.as_mut()
+        && let Err(error) = write_duplicate_secrets(
+            &new_id,
+            SecretKind::Header,
+            &mut http.headers,
+            &mut written,
+        )
+    {
+        cleanup_duplicate_secrets(state, &written);
+        return Err(error);
+    }
+
+    let config_for_db = config.clone();
+    let refs = written.clone();
+    let result = state.db.with_write_blocking(move |conn| {
+        let tx = conn.transaction()?;
+        server_repo::upsert(&tx, &config_for_db)?;
+        for item in &refs {
+            server_repo::upsert_credential(&tx, item)?;
+        }
+        tx.commit()?;
+        Ok(())
+    });
+    if let Err(e) = result {
+        cleanup_duplicate_secrets(state, &written);
+        return Err(format!("复制服务器失败：{e}"));
+    }
+    Ok(config)
+}
+
+/// 读取可复制的配置：origin/portable 直接用配置中的明文；安装版 best-effort 读 keyring。
+fn load_config_for_duplicate(
+    state: &AppState,
+    mut config: ServerConfig,
+) -> Result<ServerConfig, String> {
+    if state.portable || config.origin.is_some() {
+        normalize_pending_secrets(&mut config);
+        return Ok(config);
+    }
+
+    let refs = state
+        .db
+        .with_read_blocking(|conn| server_repo::list_credentials(conn, &config.id))
+        .map_err(|e| e.to_string())?;
+    for item in refs {
+        let target = match item.kind.as_str() {
+            "env" => config
+                .stdio
+                .as_mut()
+                .and_then(|stdio| stdio.env.iter_mut().find(|kv| kv.key == item.name)),
+            "header" => config
+                .http
+                .as_mut()
+                .and_then(|http| http.headers.iter_mut().find(|kv| kv.key == item.name)),
+            _ => None,
+        };
+        if let Some(slot) = target {
+            slot.secret = true;
+            slot.value = credentials::get_secret(&item.reference).ok();
+        }
+    }
+    normalize_pending_secrets(&mut config);
+    Ok(config)
+}
+
+/// 构造复制品：新 ID、名称、清空 origin/运行期时间/OAuth 密钥。
+fn build_duplicate_config(
+    mut source: ServerConfig,
+    new_id: String,
+    name: Option<String>,
+    now: chrono::DateTime<Utc>,
+) -> ServerConfig {
+    let trimmed = name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    source.id = new_id;
+    source.name = trimmed.unwrap_or_else(|| format!("{} 副本", source.name));
+    source.origin = None;
+    source.created_at = now;
+    source.updated_at = now;
+    source.last_connected_at = None;
+    if let Some(oauth) = source.http.as_mut().and_then(|http| http.oauth.as_mut()) {
+        oauth.client_secret = None;
+    }
+    source
+}
+
+/// 待配置判定：空、导入占位符、掩码形态都不应写入新 keyring。
+fn is_pending_secret_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed == SECRET_PLACEHOLDER
+        || looks_like_masked_secret(trimmed)
+}
+
+fn normalize_pending_secrets(config: &mut ServerConfig) {
+    if let Some(stdio) = config.stdio.as_mut() {
+        normalize_pending_items(&mut stdio.env);
+    }
+    if let Some(http) = config.http.as_mut() {
+        normalize_pending_items(&mut http.headers);
+    }
+}
+
+fn normalize_pending_items(items: &mut [KeyValue]) {
+    for item in items {
+        if !item.secret {
+            continue;
+        }
+        if item
+            .value
+            .as_deref()
+            .is_none_or(is_pending_secret_value)
+        {
+            item.value = None;
+        }
+    }
+}
+
+/// 安装版复制：敏感值写新 keyring，配置值替换为掩码。
+fn write_duplicate_secrets(
+    new_id: &str,
+    kind: SecretKind,
+    items: &mut [KeyValue],
+    written: &mut Vec<CredentialRef>,
+) -> Result<(), String> {
+    for item in items {
+        if !item.secret {
+            continue;
+        }
+        let Some(value) = item.value.clone() else {
+            continue;
+        };
+        if is_pending_secret_value(&value) {
+            item.value = None;
+            continue;
+        }
+        let nonce = credentials::new_nonce();
+        let reference = credentials::secret_ref(new_id, kind, &item.key, &nonce);
+        credentials::set_secret(&reference, &value)
+            .map_err(|e| format!("敏感值「{}」写入失败：{e}", item.key))?;
+        written.push(CredentialRef {
+            server_id: new_id.to_string(),
+            kind: kind.path_segment().to_string(),
+            name: item.key.clone(),
+            reference,
+        });
+        item.value = Some(credentials::mask(&value));
+    }
+    Ok(())
+}
+
+fn cleanup_duplicate_secrets(state: &AppState, written: &[CredentialRef]) {
+    for item in written {
+        if credentials::delete_secret(&item.reference).is_err() {
+            let reference = item.reference.clone();
+            let _ = state
+                .db
+                .with_write_blocking(move |conn| {
+                    server_repo::add_secret_cleanup(conn, &reference)
+                });
         }
     }
 }
@@ -1900,6 +2114,34 @@ mod tests {
             portable: true,
             data_dir_source: "portable".to_string(),
             test_run: Arc::new(tokio::sync::Mutex::new(None)),
+            load_run: Arc::new(tokio::sync::Mutex::new(None)),
+            run_slot: Arc::new(std::sync::Mutex::new(None)),
+        };
+        (dir, state)
+    }
+
+    fn installed_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("临时目录创建失败");
+        let db = Database::open(&dir.path().join("test.db")).expect("数据库打开失败");
+        db.migrate().expect("迁移失败");
+        let oauth = crate::mcp::oauth::OAuthService::new(db.clone(), false);
+        let manager = Arc::new(ConnectionManager::new(
+            RuntimeSettings::default(),
+            Some(oauth.clone()),
+        ));
+        let input = manager.input().clone();
+        let state = AppState {
+            db,
+            manager,
+            input,
+            oauth,
+            data_dir: dir.path().to_path_buf(),
+            log_dir: dir.path().join("logs"),
+            portable: false,
+            data_dir_source: "env".to_string(),
+            test_run: Arc::new(tokio::sync::Mutex::new(None)),
+            load_run: Arc::new(tokio::sync::Mutex::new(None)),
+            run_slot: Arc::new(std::sync::Mutex::new(None)),
         };
         (dir, state)
     }
@@ -1977,5 +2219,161 @@ mod tests {
                 .expect("读取凭据索引失败")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn duplicate_config_clears_runtime_and_oauth_secret() {
+        let now = Utc::now();
+        let source = ServerConfig {
+            id: "source".to_string(),
+            name: "source".to_string(),
+            transport: TransportKind::StreamableHttp,
+            stdio: None,
+            http: Some(HttpConfig {
+                url: "https://example.com/mcp".to_string(),
+                headers: vec![KeyValue {
+                    key: "Authorization".to_string(),
+                    value: Some("Beare****w0aO".to_string()),
+                    secret: true,
+                }],
+                timeout_secs: None,
+                allow_insecure_tls: false,
+                oauth: Some(crate::mcp::models::OAuthConfig {
+                    client_secret: Some("****".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            protocol_version_pin: None,
+            enabled: true,
+            tags: vec!["prod".to_string()],
+            origin: Some(crate::mcp::models::ServerOrigin {
+                source: "config".to_string(),
+                key: "source".to_string(),
+            }),
+            created_at: now,
+            updated_at: now,
+            last_connected_at: Some(now),
+        };
+
+        let copy = build_duplicate_config(source, "copy".to_string(), None, now);
+        assert_eq!(copy.id, "copy");
+        assert_eq!(copy.name, "source 副本");
+        assert!(copy.origin.is_none());
+        assert!(copy.last_connected_at.is_none());
+        assert_eq!(copy.created_at, now);
+        assert_eq!(copy.updated_at, now);
+        assert_eq!(copy.tags, vec!["prod".to_string()]);
+        assert!(copy.http.as_ref().unwrap().oauth.as_ref().unwrap().client_secret.is_none());
+    }
+
+    #[test]
+    fn duplicate_pending_secret_normalization() {
+        let mut config = ServerConfig {
+            id: "source".to_string(),
+            name: "source".to_string(),
+            transport: TransportKind::StreamableHttp,
+            stdio: None,
+            http: Some(HttpConfig {
+                url: "https://example.com/mcp".to_string(),
+                headers: vec![
+                    KeyValue {
+                        key: "A".to_string(),
+                        value: Some(String::new()),
+                        secret: true,
+                    },
+                    KeyValue {
+                        key: "B".to_string(),
+                        value: Some(SECRET_PLACEHOLDER.to_string()),
+                        secret: true,
+                    },
+                    KeyValue {
+                        key: "C".to_string(),
+                        value: Some("Beare****w0aO".to_string()),
+                        secret: true,
+                    },
+                    KeyValue {
+                        key: "D".to_string(),
+                        value: Some("real-token".to_string()),
+                        secret: true,
+                    },
+                ],
+                timeout_secs: None,
+                allow_insecure_tls: false,
+                oauth: None,
+            }),
+            protocol_version_pin: None,
+            enabled: true,
+            tags: Vec::new(),
+            origin: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_connected_at: None,
+        };
+
+        normalize_pending_secrets(&mut config);
+        let headers = &config.http.as_ref().unwrap().headers;
+        assert!(headers[0].value.is_none());
+        assert!(headers[1].value.is_none());
+        assert!(headers[2].value.is_none());
+        assert_eq!(headers[3].value.as_deref(), Some("real-token"));
+    }
+
+    #[tokio::test]
+    async fn portable_duplicate_copies_plaintext_and_clears_runtime() {
+        let (_dir, state) = portable_state();
+        let created = add_server_inner(&state, http_draft("Bearer token"))
+            .await
+            .expect("新增失败");
+
+        let copy = duplicate_server_inner(&state, &created.id, Some("copy".to_string()))
+            .await
+            .expect("复制失败");
+        assert_ne!(copy.id, created.id);
+        assert_eq!(copy.name, "copy");
+        assert!(copy.origin.is_none());
+        assert!(copy.last_connected_at.is_none());
+
+        let stored = state
+            .db
+            .with_read_blocking(|conn| server_repo::get(conn, &copy.id))
+            .expect("查询失败")
+            .expect("副本应存在");
+        let auth = &stored.http.as_ref().unwrap().headers[0];
+        assert_eq!(auth.value.as_deref(), Some("Bearer token"));
+        assert!(auth.secret);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn installed_duplicate_copies_secrets_to_new_keyring() {
+        keyring_core::unset_default_store();
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new().expect("mock store 创建失败"),
+        );
+        let (_dir, state) = installed_state();
+        let created = add_server_inner(&state, http_draft("Bearer secret"))
+            .await
+            .expect("新增失败");
+
+        let copy = duplicate_server_inner(&state, &created.id, None)
+            .await
+            .expect("复制失败");
+        let stored = state
+            .db
+            .with_read_blocking(|conn| server_repo::get(conn, &copy.id))
+            .expect("查询失败")
+            .expect("副本应存在");
+        let auth = &stored.http.as_ref().unwrap().headers[0];
+        assert!(auth.secret);
+        assert!(auth.value.as_deref().unwrap_or("").contains("****"));
+
+        let refs = state
+            .db
+            .with_read_blocking(|conn| server_repo::list_credentials(conn, &copy.id))
+            .expect("读取凭据索引失败");
+        assert_eq!(refs.len(), 1);
+        let value = credentials::get_secret(&refs[0].reference).expect("读取新凭据失败");
+        assert_eq!(value, "Bearer secret");
+        keyring_core::unset_default_store();
     }
 }

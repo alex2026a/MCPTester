@@ -11,7 +11,7 @@ const invokeMock = vi.mocked(invoke);
 const preview: GenerationPreview = {
   server_id: "srv-1",
   capability_hash: "a".repeat(32),
-  capability_snapshot: { server_id: "srv-1", tools: [] },
+  capability_snapshot: '{"server_id":"srv-1","tools":[]}',
   warnings: ["示例提示"],
   stats: {
     total: 1,
@@ -88,6 +88,7 @@ describe("GenerationDialog", () => {
       expect.objectContaining({
         suiteId: "suite-1",
         capabilityHash: preview.capability_hash,
+        capabilitySnapshot: preview.capability_snapshot,
       }),
     );
   });

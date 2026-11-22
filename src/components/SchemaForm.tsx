@@ -15,7 +15,9 @@ import {
   validateAgainstSchema,
   type SchemaObject,
 } from "../lib/schema";
+import { toolHeaderParams } from "../lib/headerParams";
 import { isSensitiveKey } from "../lib/sensitive";
+import { usePreferenceStore } from "../stores/preferences";
 
 export type SchemaValidation = {
   /** 当前表单/JSON 文本对应的参数 */
@@ -78,6 +80,7 @@ export function SchemaForm({
   onDirty,
   initial,
   maskSensitive = false,
+  showHeaderParams = false,
   ref,
 }: {
   schema: unknown;
@@ -88,10 +91,34 @@ export function SchemaForm({
   initial?: Record<string, unknown> | null;
   /** 表单模式把敏感字段渲染为 password（JSON 模式不掩码） */
   maskSensitive?: boolean;
+  /** 显示 MCP 2026-07-28 x-mcp-header 参数徽标；由调用方按传输/协议 gate */
+  showHeaderParams?: boolean;
   ref?: Ref<SchemaFormHandle>;
 }) {
   const root = useMemo(() => (schema ?? {}) as SchemaObject, [schema]);
+  const headerParams = useMemo(() => {
+    if (!showHeaderParams) return new Map<string, string>();
+    return new Map(
+      toolHeaderParams(schema).map((item) => [item.argument, item.header]),
+    );
+  }, [schema, showHeaderParams]);
   const fields = useMemo(() => Object.entries(root.properties ?? {}), [root]);
+  const requiredFirst = usePreferenceStore((state) => state.requiredFirst);
+  const setRequiredFirst = usePreferenceStore(
+    (state) => state.setRequiredFirst,
+  );
+  // 必填优先只做稳定分组，组内仍保持服务端原始声明顺序。
+  const orderedFields = useMemo(() => {
+    if (!requiredFirst) return fields;
+    const required = fields.filter(([key, field]) =>
+      isFieldRequired(root, key, field),
+    );
+    const optional = fields.filter(
+      ([key, field]) => !isFieldRequired(root, key, field),
+    );
+    if (required.length === 0 || optional.length === 0) return fields;
+    return [...required, ...optional];
+  }, [fields, requiredFirst, root]);
   const [values, setValues] = useState<Record<string, unknown>>(initial ?? {});
   const [jsonMode, setJsonMode] = useState(false);
   const [jsonText, setJsonText] = useState(
@@ -255,6 +282,21 @@ export function SchemaForm({
           ) : null}
         </span>
         <div className="flex items-center gap-2">
+          {!jsonMode && requiredNames.length > 0 ? (
+            <button
+              type="button"
+              aria-pressed={requiredFirst}
+              className={
+                requiredFirst
+                  ? "rounded border border-sky-300 bg-sky-50 px-2 py-0.5 text-xs text-sky-700"
+                  : "rounded border border-slate-200 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-50"
+              }
+              title="仅调整表单显示顺序：必填字段排在前面"
+              onClick={() => setRequiredFirst(!requiredFirst)}
+            >
+              必填优先
+            </button>
+          ) : null}
           <button
             type="button"
             className="rounded border border-slate-200 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-50"
@@ -304,7 +346,7 @@ export function SchemaForm({
       ) : fields.length === 0 ? (
         <div className="text-xs text-slate-400">该接口无参数</div>
       ) : (
-        fields.map(([key, field]) => {
+        orderedFields.map(([key, field]) => {
           const required = isFieldRequired(root, key, field);
           const control = simpleControlType(field);
           const current = values[key];
@@ -334,6 +376,16 @@ export function SchemaForm({
                   </span>
                 ) : null}
                 <span className="text-slate-400">{field.type ?? ""}</span>
+                {headerParams.has(key) ? (
+                  <span
+                    className="rounded bg-sky-50 px-1 py-0.5 text-[10px] font-medium text-sky-700"
+                    title={`参数有值时会作为 ${headerParams.get(
+                      key,
+                    )} 发送（必要时 Base64）`}
+                  >
+                    HTTP 头
+                  </span>
+                ) : null}
               </label>
               {field.description ? (
                 <div className="text-xs text-slate-400">
@@ -405,8 +457,12 @@ export function SchemaForm({
                 />
               ) : control === "string" ? (
                 <input
-                  type={maskSensitive && isSensitiveKey(key) ? "password" : "text"}
-                  autoComplete={maskSensitive && isSensitiveKey(key) ? "off" : undefined}
+                  type={
+                    maskSensitive && isSensitiveKey(key) ? "password" : "text"
+                  }
+                  autoComplete={
+                    maskSensitive && isSensitiveKey(key) ? "off" : undefined
+                  }
                   aria-label={key}
                   aria-required={required || undefined}
                   aria-invalid={showMissing || undefined}

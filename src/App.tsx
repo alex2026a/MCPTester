@@ -9,6 +9,7 @@ import { Explorer } from "./pages/Explorer";
 import { History } from "./pages/History";
 import { SettingsPage } from "./pages/Settings";
 import { Tests } from "./pages/Tests";
+import { LoadTest } from "./pages/LoadTest";
 import { Reports } from "./pages/Reports";
 import { ToastContainer } from "./components/Toast";
 import { InputRequestHost } from "./components/InputRequestHost";
@@ -68,6 +69,7 @@ function Layout() {
           <NavItem to="/" label={zh.nav.servers} />
           <NavItem to="/explorer" label={zh.nav.explorer} />
           <NavItem to="/tests" label={zh.nav.tests} />
+          <NavItem to="/loadtest" label={zh.nav.loadtest} />
           <NavItem to="/reports" label={zh.nav.reports} />
           <NavItem to="/history" label={zh.nav.history} />
           <NavItem to="/settings" label={zh.nav.settings} />
@@ -81,6 +83,7 @@ function Layout() {
           <Route path="/" element={<Servers />} />
           <Route path="/explorer" element={<Explorer />} />
           <Route path="/tests" element={<Tests />} />
+          <Route path="/loadtest" element={<LoadTest />} />
           <Route path="/reports" element={<Reports />} />
           <Route path="/history" element={<History />} />
           <Route path="/settings" element={<SettingsPage />} />

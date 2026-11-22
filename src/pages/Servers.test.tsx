@@ -4,7 +4,12 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { Servers } from "./Servers";
-import type { ConnectionState, ServerSummary } from "../types/models";
+import { useToastStore } from "../stores/toast";
+import type {
+  ConnectionState,
+  ServerConfig,
+  ServerSummary,
+} from "../types/models";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -50,6 +55,7 @@ function renderServers() {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  useToastStore.setState({ toasts: [] });
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "list_servers":
@@ -107,9 +113,7 @@ describe("Servers OAuth", () => {
     renderServers();
     expect(await screen.findByText("OAuth 需要登录")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "登录" }));
-    expect(
-      await screen.findByText(/OAuth 登录 · OAuth/),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/OAuth 登录 · OAuth/)).toBeInTheDocument();
     expect(
       screen.getByDisplayValue("https://auth.example/authorize"),
     ).toBeInTheDocument();
@@ -213,6 +217,69 @@ describe("Servers OAuth", () => {
       }),
     );
     confirmSpy.mockRestore();
+  });
+});
+
+describe("Servers 复制", () => {
+  it("复制服务器调用命令并提示待配置/OAuth", async () => {
+    const oauthServer: ServerSummary = {
+      ...alpha,
+      transport: "streamable_http",
+      oauth: {
+        configured: true,
+        authorized: false,
+        refreshable: false,
+        scopes: [],
+        expires_at: null,
+      },
+    };
+    const duplicated: ServerConfig = {
+      id: "copy",
+      name: "Alpha 副本",
+      transport: "streamable_http",
+      stdio: null,
+      http: {
+        url: "https://example.com/mcp",
+        headers: [{ key: "X-Api-Key", value: null, secret: true }],
+        timeout_secs: null,
+        allow_insecure_tls: false,
+        oauth: { scopes: [] },
+      },
+      protocol_version_pin: null,
+      enabled: true,
+      tags: [],
+      created_at: "2026-11-12T00:00:00Z",
+      updated_at: "2026-11-12T00:00:00Z",
+      last_connected_at: null,
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "list_servers":
+          return Promise.resolve([oauthServer]);
+        case "get_app_info":
+          return Promise.resolve(null);
+        case "duplicate_server":
+          return Promise.resolve(duplicated);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as typeof invoke);
+
+    renderServers();
+    await userEvent.click(await screen.findByRole("button", { name: "复制" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("duplicate_server", {
+        id: "alpha",
+        name: null,
+      }),
+    );
+    await waitFor(() => {
+      const item = useToastStore.getState().toasts[0];
+      expect(item?.title).toContain("已复制为");
+      expect(item?.message).toContain("部分敏感请求头待配置");
+      expect(item?.message).toContain("OAuth 登录状态");
+    });
   });
 });
 

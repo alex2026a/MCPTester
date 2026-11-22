@@ -16,24 +16,32 @@ export function ExportPreviewDialog({
   onSave,
   onClose,
   extra,
+  filters,
+  previewLimit = 1_000_000,
 }: {
   title: string;
   defaultFilename: string;
-  /** 生成预览内容（调用方需 useCallback 保持引用稳定以支持格式切换重载） */
+  /** 生成预览内容；在挂载时捕获，切换内容请通过 key 重挂载 */
   load: () => Promise<string>;
   /** 写入用户选择路径（返回最终路径） */
   onSave: (path: string) => Promise<string>;
   onClose: () => void;
   /** 标题行附加内容（如格式选择） */
   extra?: React.ReactNode;
+  /** 保存对话框过滤器；默认 JSON */
+  filters?: { name: string; extensions: string[] }[];
+  /** 预览字符上限；超出时截断展示，保存仍为完整内容 */
+  previewLimit?: number;
 }) {
   const [content, setContent] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // 通过 key 重挂载时重新捕获；不在 effect 内 setState，避免级联渲染。
+  const [loadOnce] = useState(() => load);
 
   useEffect(() => {
     let cancelled = false;
-    load()
+    loadOnce()
       .then((text) => {
         if (!cancelled) setContent(text);
       })
@@ -43,13 +51,13 @@ export function ExportPreviewDialog({
     return () => {
       cancelled = true;
     };
-  }, [load]);
+  }, [loadOnce]);
 
   async function handleSave() {
     const path = await save({
       title,
       defaultPath: defaultFilename,
-      filters: [{ name: "JSON", extensions: ["json"] }],
+      filters: filters ?? [{ name: "JSON", extensions: ["json"] }],
     });
     if (!path) return; // 用户取消
     setSaving(true);
@@ -71,6 +79,12 @@ export function ExportPreviewDialog({
       setSaving(false);
     }
   }
+
+  const previewText =
+    content !== null && content.length > previewLimit
+      ? content.slice(0, previewLimit)
+      : content;
+  const previewTruncated = content !== null && content.length > previewLimit;
 
   return (
     <div
@@ -111,11 +125,19 @@ export function ExportPreviewDialog({
           ) : content === null ? (
             <div className="text-xs text-slate-400">生成预览中…</div>
           ) : (
-            <JsonViewer
-              text={content}
-              defaultMode="text"
-              contentClassName="max-h-[60vh] overflow-auto"
-            />
+            <div className="space-y-1">
+              {previewTruncated ? (
+                <div className="text-[11px] text-amber-600">
+                  预览已截断（超过 {previewLimit.toLocaleString()}{" "}
+                  字符），保存仍导出完整内容。
+                </div>
+              ) : null}
+              <JsonViewer
+                text={previewText ?? ""}
+                defaultMode="text"
+                contentClassName="max-h-[60vh] overflow-auto"
+              />
+            </div>
           )}
         </div>
       </div>

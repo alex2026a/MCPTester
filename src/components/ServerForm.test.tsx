@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ServerForm } from "./ServerForm";
 import type { ServerConfig, ServerDraft } from "../types/models";
@@ -31,7 +31,9 @@ const MASKED_PLACEHOLDER = "已配置（留空=不修改；输入即替换）";
 describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
   it("掩码值不填入输入框（占位符提示已配置），提交时按 keep", async () => {
     const onSubmit = vi.fn();
-    render(<ServerForm initial={initial} onSubmit={onSubmit} onCancel={() => {}} />);
+    render(
+      <ServerForm initial={initial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
 
     // v0.1.2：掩码改为占位符显示，输入框为空
     const secretInput = screen.getByPlaceholderText(MASKED_PLACEHOLDER);
@@ -51,7 +53,9 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
 
   it("输入新明文 token 时按 replace 提交（掩码不被写回）", async () => {
     const onSubmit = vi.fn();
-    render(<ServerForm initial={initial} onSubmit={onSubmit} onCancel={() => {}} />);
+    render(
+      <ServerForm initial={initial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
 
     const secretInput = screen.getByPlaceholderText(MASKED_PLACEHOLDER);
     await userEvent.type(secretInput, "Bearer new-token");
@@ -86,7 +90,11 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
       },
     };
     render(
-      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+      <ServerForm
+        initial={oauthInitial}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
     );
 
     expect(screen.getByLabelText("认证方式")).toHaveValue("oauth");
@@ -123,7 +131,11 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
       },
     };
     render(
-      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+      <ServerForm
+        initial={oauthInitial}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
     );
     expect(screen.getByText(/已允许明文 HTTP/)).toBeInTheDocument();
 
@@ -144,7 +156,11 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
       },
     };
     render(
-      <ServerForm initial={oauthInitial} onSubmit={() => {}} onCancel={() => {}} />,
+      <ServerForm
+        initial={oauthInitial}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
     );
     expect(screen.getByText(/OAuth 模式默认要求 https/)).toBeInTheDocument();
   });
@@ -160,7 +176,11 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
       },
     };
     render(
-      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+      <ServerForm
+        initial={oauthInitial}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
     );
     const textarea = screen.getByLabelText(/授权请求额外参数/);
     await userEvent.type(textarea, "bad-line");
@@ -183,7 +203,11 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
       },
     };
     render(
-      <ServerForm initial={oauthInitial} onSubmit={onSubmit} onCancel={() => {}} />,
+      <ServerForm
+        initial={oauthInitial}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
     );
 
     await userEvent.selectOptions(screen.getByLabelText("认证方式"), "none");
@@ -200,12 +224,141 @@ describe("ServerForm 敏感值掩码防护（v0.1.1/v0.1.2）", () => {
     expect(secret?.action).toBe("clear");
   });
 
+  it("切换认证方式保留 Authorization 表单值（v0.6.1）", async () => {
+    const onSubmit = vi.fn();
+    const headerInitial: ServerConfig = {
+      ...initial,
+      http: {
+        ...initial.http!,
+        headers: [
+          { key: "Authorization", value: "Bearer abc", secret: false },
+          { key: "X-Trace", value: "1", secret: false },
+        ],
+      },
+    };
+    render(
+      <ServerForm
+        initial={headerInitial}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    );
+
+    await userEvent.selectOptions(screen.getByLabelText("认证方式"), "oauth");
+    expect(screen.getByDisplayValue("Bearer abc")).toBeDisabled();
+    await userEvent.selectOptions(screen.getByLabelText("认证方式"), "header");
+    expect(screen.getByDisplayValue("Bearer abc")).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+    const draft = onSubmit.mock.calls[0][0] as ServerDraft;
+    expect(
+      draft.http?.headers.some(
+        (header) => header.key.toLowerCase() === "authorization",
+      ),
+    ).toBe(true);
+  });
+
+  it("none 模式保存不提交 Authorization secret（v0.6.1）", async () => {
+    const onSubmit = vi.fn();
+    render(
+      <ServerForm initial={initial} onSubmit={onSubmit} onCancel={() => {}} />,
+    );
+
+    await userEvent.selectOptions(screen.getByLabelText("认证方式"), "none");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    const draft = onSubmit.mock.calls[0][0] as ServerDraft;
+    expect(
+      draft.secrets.some(
+        (secret) =>
+          secret.kind === "header" &&
+          secret.key.toLowerCase() === "authorization",
+      ),
+    ).toBe(false);
+    expect(
+      draft.http?.headers.some(
+        (header) => header.key.toLowerCase() === "authorization",
+      ),
+    ).toBe(false);
+  });
+
+  it("OAuth 模式编辑其他请求头不丢 Authorization（v0.6.1）", async () => {
+    const oauthInitial: ServerConfig = {
+      ...initial,
+      http: {
+        ...initial.http!,
+        oauth: { scopes: [] },
+        headers: [
+          { key: "Authorization", value: "Bearer abc", secret: false },
+          { key: "X-Trace", value: "1", secret: false },
+        ],
+      },
+    };
+    render(
+      <ServerForm
+        initial={oauthInitial}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+
+    const traceValue = screen.getByDisplayValue("1");
+    await userEvent.clear(traceValue);
+    await userEvent.type(traceValue, "2");
+    await userEvent.selectOptions(screen.getByLabelText("认证方式"), "header");
+    expect(screen.getByDisplayValue("Bearer abc")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("2")).toBeInTheDocument();
+  });
+
+  it("批量粘贴请求头并自动标记敏感（v0.6.1）", async () => {
+    const onSubmit = vi.fn();
+    const emptyHeaders: ServerConfig = {
+      ...initial,
+      http: { ...initial.http!, headers: [] },
+    };
+    render(
+      <ServerForm
+        initial={emptyHeaders}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "批量粘贴" }));
+    await userEvent.type(
+      screen.getByLabelText("批量粘贴请求头"),
+      "X-Api-Key: abc",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "解析并添加" }));
+
+    const keyInput = screen.getByDisplayValue("X-Api-Key");
+    expect(keyInput).toBeInTheDocument();
+    expect(screen.getByDisplayValue("abc")).toBeInTheDocument();
+    const row = keyInput.closest("div");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByRole("checkbox")).toBeChecked();
+  });
+
+  it("常用请求头补全存在（v0.6.1）", () => {
+    render(
+      <ServerForm initial={initial} onSubmit={() => {}} onCancel={() => {}} />,
+    );
+    expect(document.querySelector("datalist")).not.toBeNull();
+    expect(screen.getByDisplayValue("X-Trace")).toHaveAttribute("list");
+  });
+
   it("本地地址缺端口时显示提示（v0.1.2）", () => {
     const withoutPort: ServerConfig = {
       ...initial,
       http: { ...initial.http!, url: "http://127.0.0.1/mcp", headers: [] },
     };
-    render(<ServerForm initial={withoutPort} onSubmit={() => {}} onCancel={() => {}} />);
+    render(
+      <ServerForm
+        initial={withoutPort}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    );
     expect(screen.getByText(/未指定端口/)).toBeInTheDocument();
   });
 });

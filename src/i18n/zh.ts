@@ -6,6 +6,7 @@ export const zh = {
     servers: "服务器",
     explorer: "接口",
     tests: "测试",
+    loadtest: "压测",
     reports: "报告",
     history: "历史",
     settings: "设置",

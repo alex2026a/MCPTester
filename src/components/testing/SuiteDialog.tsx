@@ -123,27 +123,25 @@ export function Modal({
   title,
   onClose,
   children,
+  footer,
   wide,
   xwide,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
+  footer?: ReactNode;
   wide?: boolean;
   xwide?: boolean;
 }) {
   return (
     <div className="fixed inset-0 z-40 flex items-start justify-center bg-slate-900/30 p-6">
       <div
-        className={`max-h-[90vh] w-full overflow-y-auto rounded-lg bg-white p-4 shadow-xl ${
-          xwide
-            ? "max-w-[min(92vw,1400px)]"
-            : wide
-              ? "max-w-5xl"
-              : "max-w-xl"
+        className={`flex max-h-[calc(100vh-3rem)] w-full flex-col overflow-hidden rounded-lg bg-white shadow-xl ${
+          xwide ? "max-w-[min(92vw,1400px)]" : wide ? "max-w-5xl" : "max-w-xl"
         }`}
       >
-        <div className="mb-3 flex items-center justify-between">
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-100 px-4 py-3">
           <h3 className="text-base font-semibold text-slate-800">{title}</h3>
           <button
             type="button"
@@ -153,7 +151,14 @@ export function Modal({
             ×
           </button>
         </div>
-        {children}
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4">
+          {children}
+        </div>
+        {footer ? (
+          <div className="shrink-0 border-t border-slate-100 bg-white px-4 py-3">
+            {footer}
+          </div>
+        ) : null}
       </div>
     </div>
   );

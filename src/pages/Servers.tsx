@@ -22,6 +22,7 @@ import {
   connectServer,
   deleteServer,
   disconnectServer,
+  duplicateServer,
   exportServers,
   getServer,
   listServers,
@@ -86,19 +87,6 @@ export function Servers() {
     void queryClient.invalidateQueries({ queryKey: ["servers"] });
   };
 
-  const save = useMutation({
-    mutationFn: async (draft: ServerDraft) => {
-      if (editing) return updateServer(editing.id, draft);
-      return addServer(draft);
-    },
-    onSuccess: () => {
-      setShowForm(false);
-      setEditing(null);
-      invalidate();
-    },
-    onError: (error) => toast.fromError(error, "保存失败"),
-  });
-
   const connect = useMutation({
     mutationFn: (id: string) => connectServer(id),
     onSuccess: invalidate,
@@ -118,6 +106,32 @@ export function Servers() {
       toast.fromError(error);
       invalidate();
     },
+  });
+  const save = useMutation({
+    mutationFn: async (draft: ServerDraft) => {
+      if (editing) return updateServer(editing.id, draft);
+      return addServer(draft);
+    },
+    onSuccess: (saved) => {
+      const wasConnected = editing
+        ? servers.data?.find((server) => server.id === editing.id)?.state
+            .state === "ready"
+        : false;
+      const savedId = saved.id;
+      setShowForm(false);
+      setEditing(null);
+      invalidate();
+      if (wasConnected) {
+        toast.success("配置已保存", {
+          message: "重连后生效",
+          action: {
+            label: "重连",
+            run: () => reconnect.mutate(savedId),
+          },
+        });
+      }
+    },
+    onError: (error) => toast.fromError(error, "保存失败"),
   });
   const probe = useMutation({
     mutationFn: (id: string) => probeServer(id),
@@ -141,9 +155,7 @@ export function Servers() {
     mutationFn: (id: string) => logoutOAuth(id),
     onSuccess: (result) => {
       toast.success(
-        result.revoked
-          ? "已退出并撤销授权"
-          : "已退出登录（本地凭据已清除）",
+        result.revoked ? "已退出并撤销授权" : "已退出登录（本地凭据已清除）",
         result.detail ? { message: result.detail } : undefined,
       );
       invalidate();
@@ -161,6 +173,28 @@ export function Servers() {
       invalidate();
     },
     onError: (error) => toast.fromError(error, "清除客户端注册失败"),
+  });
+  const duplicate = useMutation({
+    mutationFn: (id: string) => duplicateServer(id),
+    onSuccess: (config, id) => {
+      const source = servers.data?.find((server) => server.id === id);
+      const pending =
+        (config.http?.headers ?? []).some(
+          (item) => item.secret && !item.value,
+        ) ||
+        (config.stdio?.env ?? []).some((item) => item.secret && !item.value);
+      const messages = [
+        pending ? "部分敏感请求头待配置，请编辑副本补全" : null,
+        source?.oauth?.configured
+          ? "OAuth 登录状态、客户端密钥与注册身份未复制，请重新登录/注册"
+          : null,
+      ].filter((item): item is string => Boolean(item));
+      toast.success(`已复制为「${config.name}」`, {
+        message: messages.length > 0 ? messages.join("；") : undefined,
+      });
+      invalidate();
+    },
+    onError: (error) => toast.fromError(error, "复制服务器失败"),
   });
   const reorder = useMutation<
     void,
@@ -583,6 +617,14 @@ export function Servers() {
                     }
                   >
                     JSON
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded border border-slate-200 px-2 py-1 hover:bg-slate-50 disabled:opacity-50"
+                    disabled={duplicate.isPending}
+                    onClick={() => duplicate.mutate(server.id)}
+                  >
+                    复制
                   </button>
                   <button
                     type="button"

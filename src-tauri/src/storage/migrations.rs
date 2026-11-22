@@ -17,6 +17,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, MIGRATION_0006),
     (7, MIGRATION_0007),
     (8, MIGRATION_0008),
+    (9, MIGRATION_0009),
 ];
 
 /// 执行所有未应用的迁移
@@ -269,6 +270,35 @@ const MIGRATION_0008: &str = r#"
 ALTER TABLE call_records ADD COLUMN rounds_json TEXT;
 "#;
 
+/// 迁移 0009：v0.7.0 MCP 压测运行记录
+///
+/// 单表聚合：profile/operations/manifest/summary/series/errors 均为 JSON；
+/// 不写 call_records，不建逐调用明细表。
+const MIGRATION_0009: &str = r#"
+CREATE TABLE IF NOT EXISTS load_runs (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    server_name TEXT NOT NULL,
+    suite_id TEXT NOT NULL,
+    suite_name TEXT NOT NULL,
+    profile_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running','completed','failed','canceled','interrupted','aborted')
+    ),
+    stop_reason TEXT,
+    profile_json TEXT NOT NULL,
+    operations_json TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    series_json TEXT NOT NULL DEFAULT '[]',
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_load_runs_started ON load_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_load_runs_server ON load_runs(server_id, started_at DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +313,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         // transport 约束生效（非法值应失败）
         let insert_err = conn.execute(
@@ -331,7 +361,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -369,7 +399,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -398,7 +428,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let ref_value: String = conn
             .query_row(
                 "SELECT ref FROM credentials WHERE server_id = 's1' AND kind = 'header'",
@@ -501,7 +531,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let rounds: Option<String> = conn
             .query_row(
@@ -541,7 +571,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let row: (String, Option<String>, Option<String>, Option<String>, i64) = conn
             .query_row(
@@ -575,7 +605,56 @@ mod tests {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
     }
+
+    #[test]
+    fn upgrade_v8_to_v9_creates_load_runs_and_keeps_old_record() {
+        let mut conn = Connection::open_in_memory().expect("内存库打开失败");
+        for sql in [
+            MIGRATION_0001,
+            MIGRATION_0002,
+            MIGRATION_0003,
+            MIGRATION_0004,
+            MIGRATION_0005,
+            MIGRATION_0006,
+            MIGRATION_0007,
+            MIGRATION_0008,
+        ] {
+            conn.execute_batch(sql).expect("迁移失败");
+        }
+        conn.pragma_update(None, "user_version", 8)
+            .expect("版本设置失败");
+        conn.execute(
+            "INSERT INTO call_records
+                (id, server_id, server_name, method, target, params_json, status, duration_ms,
+                 protocol_version, transport, size_bytes, origin, created_at)
+             VALUES ('v8-1', 's1', 'demo', 'tools_call', 'echo', '{}', 'ok', 1,
+                     '2026-07-28', 'stdio', 0, 'manual', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("旧记录插入失败");
+
+        run(&mut conn).expect("升级失败");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='load_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1);
+        let old: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_records WHERE id = 'v8-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(old, 1);
+    }
 }
+

@@ -786,7 +786,8 @@ pub struct GenerationStats {
 pub struct GenerationPreview {
     pub server_id: String,
     pub capability_hash: String,
-    pub capability_snapshot: Value,
+    /// 序列化后的 JSON 字符串；不交给前端解析，避免 JS 改写数字表示。
+    pub capability_snapshot: String,
     pub cases: Vec<TestCaseDraft>,
     pub warnings: Vec<String>,
     pub stats: GenerationStats,

@@ -22,6 +22,10 @@ pub struct Settings {
     pub test_run_retention_days: u32,
     #[serde(default = "default_test_run_max_rows")]
     pub test_run_max_rows: u32,
+    #[serde(default = "default_load_run_retention_days")]
+    pub load_run_retention_days: u32,
+    #[serde(default = "default_load_run_max_rows")]
+    pub load_run_max_rows: u32,
 }
 
 fn default_test_call_retention_days() -> u32 {
@@ -40,6 +44,14 @@ fn default_test_run_max_rows() -> u32 {
     100
 }
 
+fn default_load_run_retention_days() -> u32 {
+    30
+}
+
+fn default_load_run_max_rows() -> u32 {
+    50
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -55,6 +67,8 @@ impl Default for Settings {
             test_call_max_rows: default_test_call_max_rows(),
             test_run_retention_days: default_test_run_retention_days(),
             test_run_max_rows: default_test_run_max_rows(),
+            load_run_retention_days: default_load_run_retention_days(),
+            load_run_max_rows: default_load_run_max_rows(),
         }
     }
 }
@@ -123,5 +137,7 @@ mod tests {
         assert!(!loaded.auto_reconnect);
         assert_eq!(loaded.test_call_retention_days, 30);
         assert_eq!(loaded.test_run_max_rows, 100);
+        assert_eq!(loaded.load_run_retention_days, 30);
+        assert_eq!(loaded.load_run_max_rows, 50);
     }
 }

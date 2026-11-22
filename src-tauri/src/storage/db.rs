@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn migrate_sets_user_version() {
-        // 迁移后 user_version = 最新版本（当前为 8），且关键表存在
+        // 迁移后 user_version = 最新版本（当前为 9），且关键表存在
         let (_dir, db) = temp_db();
         db.migrate().expect("迁移失败");
 
@@ -126,7 +126,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         for table in [
             "servers",
@@ -140,6 +140,7 @@ mod tests {
             "test_runs",
             "test_run_cases",
             "oauth_credentials",
+            "load_runs",
         ] {
             let count: i64 = conn
                 .query_row(

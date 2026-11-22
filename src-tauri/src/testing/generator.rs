@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::mcp::models::{CapabilitySnapshot, PromptInfo, ResourceInfo, ToolInfo};
 
-use super::contract::{build_snapshot, canonical_json, capability_hash};
+use super::contract::{canonical_json, capability_hash, encode_snapshot};
 use super::history::HistorySample;
 use super::models::{
     AssertionKind, AssertionSeverity, GenerationOptions, GenerationPreview, GenerationProfile,
@@ -177,7 +177,7 @@ pub fn generate(
     GenerationPreview {
         server_id: snapshot.server_id.clone(),
         capability_hash: capability_hash(snapshot),
-        capability_snapshot: build_snapshot(snapshot).snapshot,
+        capability_snapshot: encode_snapshot(snapshot),
         cases,
         warnings,
         stats,
@@ -1055,6 +1055,7 @@ fn compact(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::mcp::models::{CapabilitySnapshot, ToolInfo};
+    use crate::testing::contract::parse_snapshot;
     use chrono::Utc;
     use serde_json::json;
 
@@ -1114,6 +1115,23 @@ mod tests {
         assert!(first.stats.boundary >= 1);
         assert!(first.stats.negative >= 1);
         assert!(first.cases.iter().any(|case| case.expect.outcome == TestOutcome::Rejected));
+    }
+
+    #[test]
+    fn preview_snapshot_string_is_hash_stable() {
+        let preview = generate(
+            &snapshot(tool(json!({
+                "type": "object",
+                "properties": {
+                    "ratio": {"type": "number", "default": 1.0}
+                }
+            }))),
+            &[],
+            &GenerationOptions::default(),
+        );
+        let (_, parsed) = parse_snapshot(&preview.capability_snapshot).expect("预览快照应可解析");
+        assert_eq!(capability_hash(&parsed), preview.capability_hash);
+        assert!(preview.capability_snapshot.contains("\"default\":1.0"));
     }
 
     #[test]

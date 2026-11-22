@@ -7,6 +7,7 @@ mod commands;
 pub mod core;
 mod credentials;
 mod logging;
+pub mod loadtest;
 pub mod mcp;
 pub mod storage;
 pub mod testing;
@@ -82,6 +83,8 @@ pub fn run() {
                 portable: paths.portable,
                 data_dir_source: paths.source.as_str().to_string(),
                 test_run: Arc::new(tokio::sync::Mutex::new(None)),
+                load_run: Arc::new(tokio::sync::Mutex::new(None)),
+                run_slot: Arc::new(std::sync::Mutex::new(None)),
             };
 
             // 启动配置 seed：只补充缺失项，不覆盖用户修改
@@ -113,6 +116,12 @@ pub fn run() {
             {
                 tracing::warn!(error = %e, "测试运行回收失败");
             }
+            if let Err(e) = state
+                .db
+                .with_write_blocking(|conn| storage::load_repo::recover_interrupted_runs(conn))
+            {
+                tracing::warn!(error = %e, "压测运行回收失败");
+            }
 
             // 启动保留清理（历史天数 / 条数 / 落盘目录上限）
             run_retention_cleanup(&state);
@@ -135,6 +144,7 @@ pub fn run() {
             commands::bootstrap::reload_bootstrap_config,
             commands::server::list_servers,
             commands::server::get_server,
+            commands::server::duplicate_server,
             commands::server::add_server,
             commands::server::update_server,
             commands::server::update_server_meta,
@@ -146,6 +156,8 @@ pub fn run() {
             commands::server::get_connection_states,
             commands::capability::get_capabilities,
             commands::capability::refresh_capabilities,
+            commands::capability_export::preview_capability_export,
+            commands::capability_export::export_capability_export,
             commands::events::get_wire_log,
             commands::events::clear_wire_log,
             commands::events::export_wire_log,
@@ -216,6 +228,13 @@ pub fn run() {
             commands::testing::import_test_cases,
             commands::testing::import_llm_test_cases,
             commands::testing::export_llm_prompt,
+            commands::loadtest::preview_load_test,
+            commands::loadtest::start_load_test,
+            commands::loadtest::cancel_load_test,
+            commands::loadtest::get_active_load_test,
+            commands::loadtest::list_load_runs,
+            commands::loadtest::get_load_run,
+            commands::loadtest::export_load_run,
         ]);
 
     builder
@@ -252,12 +271,19 @@ fn run_retention_cleanup(state: &AppState) {
             settings.test_run_retention_days,
             settings.test_run_max_rows,
         )?;
-        Ok((manual + test, files_a + files_b, runs))
+        let load_runs = storage::load_repo::cleanup_runs(
+            conn,
+            settings.load_run_retention_days,
+            settings.load_run_max_rows,
+        )?;
+        Ok((manual + test, files_a + files_b, runs, load_runs))
     }) {
-        Ok((records, files, runs)) if records > 0 || files > 0 || runs > 0 => {
-            tracing::info!(records, files, runs, "历史/测试保留清理完成");
+        Ok((records, files, runs, load_runs))
+            if records > 0 || files > 0 || runs > 0 || load_runs > 0 =>
+        {
+            tracing::info!(records, files, runs, load_runs, "历史/测试/压测保留清理完成");
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "历史/测试保留清理失败"),
+        Err(e) => tracing::warn!(error = %e, "历史/测试/压测保留清理失败"),
     }
 }

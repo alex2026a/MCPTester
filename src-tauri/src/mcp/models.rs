@@ -496,6 +496,10 @@ pub struct RuntimeSettings {
     pub notification_buffer_lines: usize,
     /// 报文日志缓冲条数（v0.1.1）
     pub wire_buffer_lines: usize,
+    /// 是否采集线上报文（压测临时会话关闭；默认开启）
+    pub wire_enabled: bool,
+    /// 是否采集原始帧/多轮 frames（压测关闭；默认开启）
+    pub capture_enabled: bool,
 }
 
 impl Default for RuntimeSettings {
@@ -506,6 +510,8 @@ impl Default for RuntimeSettings {
             stderr_buffer_lines: 2000,
             notification_buffer_lines: 1000,
             wire_buffer_lines: 300,
+            wire_enabled: true,
+            capture_enabled: true,
         }
     }
 }

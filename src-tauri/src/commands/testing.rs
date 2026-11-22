@@ -4,13 +4,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
-use crate::commands::AppState;
-use crate::mcp::models::{CallMethod, CallOrigin, CallRecord, CallStatus, CapabilitySnapshot};
+use crate::commands::{AppState, RunKind, RunSlotGuard};
+use crate::mcp::models::{CallMethod, CallOrigin, CallRecord, CallStatus};
 use crate::storage::{call_repo, settings_repo, test_repo};
 use crate::testing::report;
 use crate::testing::contract::{
     build_snapshot, capability_hash as compute_capability_hash,
-    diff_contract as contract_diff,
+    diff_contract as contract_diff, parse_snapshot,
 };
 use crate::testing::generator;
 use crate::testing::history;
@@ -209,13 +209,16 @@ pub async fn generate_test_cases(
 }
 
 /// 保存生成预览：原子写入用例 + 能力快照/指纹。
+///
+/// `capability_snapshot` 是预览返回的不透明 JSON 字符串，前端不得解析或重新序列化；
+/// 直接传 `Value` 会经过 JS 数字归一化，导致指纹误判。
 #[tauri::command]
 pub async fn save_generated_cases(
     state: State<'_, AppState>,
     suite_id: String,
     cases: Vec<TestCaseDraft>,
     capability_hash: String,
-    capability_snapshot: Value,
+    capability_snapshot: String,
 ) -> Result<Vec<TestCase>, String> {
     if cases.is_empty() {
         return Err("没有要保存的用例".to_string());
@@ -228,19 +231,29 @@ pub async fn save_generated_cases(
         .with_read_blocking(|conn| test_repo::get_suite(conn, &suite_id))
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "套件不存在".to_string())?;
-    let snapshot: CapabilitySnapshot = serde_json::from_value(capability_snapshot.clone())
+    let (snapshot_value, snapshot) = parse_snapshot(&capability_snapshot)
         .map_err(|e| format!("能力快照不合法：{e}"))?;
     if snapshot.server_id != suite.server_id {
         return Err("能力快照与套件不属于同一服务器".to_string());
     }
-    if compute_capability_hash(&snapshot) != capability_hash {
-        return Err("能力指纹不匹配，预览可能已过期，请重新生成".to_string());
+    let actual_hash = compute_capability_hash(&snapshot);
+    if actual_hash != capability_hash {
+        tracing::warn!(
+            suite_id = %suite_id,
+            server_id = %snapshot.server_id,
+            preview_hash = %capability_hash,
+            computed_hash = %actual_hash,
+            "保存生成用例时能力指纹不一致"
+        );
+        return Err(
+            "能力指纹不一致，预览数据可能已被修改，请重新生成".to_string(),
+        );
     }
     state
         .db
         .with_write_blocking(|conn| {
             let tx = conn.transaction()?;
-            test_repo::set_suite_capability(&tx, &suite_id, &capability_hash, &capability_snapshot)?;
+            test_repo::set_suite_capability(&tx, &suite_id, &capability_hash, &snapshot_value)?;
             let inserted = test_repo::insert_cases(&tx, &suite_id, &cases)?;
             tx.commit()?;
             Ok(inserted)
@@ -256,7 +269,7 @@ pub async fn run_test_suite(
     suite_id: String,
     options: RunOptions,
 ) -> Result<String, String> {
-    ensure_no_active_run(&state).await?;
+    let mut slot = RunSlotGuard::reserve(state.run_slot.clone(), RunKind::Test)?;
     let suite = state
         .db
         .with_read_blocking(|conn| test_repo::get_suite(conn, &suite_id))
@@ -287,14 +300,16 @@ pub async fn run_test_suite(
         options,
     )
     .await?;
-    start_background(
+    let run_id = start_background(
         app,
         &state,
         prepared,
         cases,
         settings.request_timeout_secs,
     )
-    .await
+    .await?;
+    slot.commit(run_id.clone());
+    Ok(run_id)
 }
 
 /// 运行指定用例（必须属于同一服务器）。
@@ -306,7 +321,7 @@ pub async fn run_test_cases(
     case_ids: Vec<String>,
     options: RunOptions,
 ) -> Result<String, String> {
-    ensure_no_active_run(&state).await?;
+    let mut slot = RunSlotGuard::reserve(state.run_slot.clone(), RunKind::Test)?;
     if case_ids.is_empty() {
         return Err("没有选中的用例".to_string());
     }
@@ -360,14 +375,16 @@ pub async fn run_test_cases(
         options,
     )
     .await?;
-    start_background(
+    let run_id = start_background(
         app,
         &state,
         prepared,
         cases,
         settings.request_timeout_secs,
     )
-    .await
+    .await?;
+    slot.commit(run_id.clone());
+    Ok(run_id)
 }
 
 async fn start_background(
@@ -407,13 +424,6 @@ async fn start_background(
         default_timeout_secs,
     );
     Ok(run_id)
-}
-
-async fn ensure_no_active_run(state: &AppState) -> Result<(), String> {
-    if state.test_run.lock().await.is_some() {
-        return Err("已有测试正在运行，请先取消".to_string());
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -585,7 +595,7 @@ pub async fn rerun_failed_test_cases(
     run_id: String,
     options: RunOptions,
 ) -> Result<String, String> {
-    ensure_no_active_run(&state).await?;
+    let mut slot = RunSlotGuard::reserve(state.run_slot.clone(), RunKind::Test)?;
     let run = state
         .db
         .with_read_blocking(|conn| test_repo::get_run(conn, &run_id))
@@ -624,14 +634,16 @@ pub async fn rerun_failed_test_cases(
         options,
     )
     .await?;
-    start_background(
+    let run_id = start_background(
         app,
         &state,
         prepared,
         rerun,
         settings.request_timeout_secs,
     )
-    .await
+    .await?;
+    slot.commit(run_id.clone());
+    Ok(run_id)
 }
 
 #[tauri::command]

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-use crate::commands::AppState;
+use crate::commands::{AppState, RunKind, clear_run_slot};
 use crate::mcp::connection::{CallOptions, ConnectionHandle};
 use crate::mcp::error::CallError;
 use crate::mcp::input::RejectInputHandler;
@@ -467,7 +467,7 @@ fn collect_evidence(
     evidence
 }
 
-fn effective_risk(case: &TestCase, capabilities: &CapabilitySnapshot) -> TestRisk {
+pub(crate) fn effective_risk(case: &TestCase, capabilities: &CapabilitySnapshot) -> TestRisk {
     let current = if case.method == TestMethod::ToolsCall {
         capabilities
             .tools
@@ -497,7 +497,7 @@ fn risk_skip_reason(risk: &TestRisk, options: &RunOptions, prod: bool) -> Option
     }
 }
 
-fn target_exists(case: &TestCase, capabilities: &CapabilitySnapshot) -> bool {
+pub(crate) fn target_exists(case: &TestCase, capabilities: &CapabilitySnapshot) -> bool {
     match case.method {
         TestMethod::ToolsCall => capabilities.tools.iter().any(|tool| tool.name == case.target),
         TestMethod::PromptsGet => capabilities
@@ -631,6 +631,8 @@ async fn clear_control(app: &AppHandle, run_id: &str) {
     {
         *guard = None;
     }
+    drop(guard);
+    clear_run_slot(&state.run_slot, RunKind::Test, run_id);
 }
 
 /// 运行用例行构造器：统一累计 summary。

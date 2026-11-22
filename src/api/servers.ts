@@ -20,6 +20,17 @@ export function getServer(id: string): Promise<ServerConfig> {
   return invoke<ServerConfig>("get_server", { id });
 }
 
+/** 复制服务器（敏感值由后端复制；OAuth 登录状态/密钥/注册身份不复制） */
+export function duplicateServer(
+  id: string,
+  name?: string,
+): Promise<ServerConfig> {
+  return invoke<ServerConfig>("duplicate_server", {
+    id,
+    name: name ?? null,
+  });
+}
+
 /** 新增服务器 */
 export function addServer(draft: ServerDraft): Promise<ServerConfig> {
   return invoke<ServerConfig>("add_server", { draft });
@@ -80,6 +91,37 @@ export function getCapabilities(id: string): Promise<CapabilitySnapshot> {
 /** 强制刷新能力快照 */
 export function refreshCapabilities(id: string): Promise<CapabilitySnapshot> {
   return invoke<CapabilitySnapshot>("refresh_capabilities", { id });
+}
+
+/** 能力快照导出格式（P1 csv/json；P2 增加 csv_params） */
+export type CapabilityExportFormat = "csv" | "csv_params" | "json";
+
+/** 预览能力快照导出内容（CSV/JSON 文本） */
+export function previewCapabilityExport(
+  serverId: string,
+  format: CapabilityExportFormat,
+  includeSchema = false,
+): Promise<string> {
+  return invoke<string>("preview_capability_export", {
+    id: serverId,
+    format,
+    includeSchema,
+  });
+}
+
+/** 导出能力快照到文件（返回路径） */
+export function exportCapabilityExport(
+  serverId: string,
+  format: CapabilityExportFormat,
+  path?: string,
+  includeSchema = false,
+): Promise<string> {
+  return invoke<string>("export_capability_export", {
+    id: serverId,
+    format,
+    path: path ?? null,
+    includeSchema,
+  });
 }
 
 export interface ImportIssue {

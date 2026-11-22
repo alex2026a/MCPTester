@@ -92,6 +92,7 @@ export function GenerationDialog({
         selected.has(index),
       );
       if (cases.length === 0) throw new Error("请至少选择一条用例");
+      // 能力快照是后端生成的不透明 JSON 字符串，必须原样回传，不能在 JS 里解析。
       return saveGeneratedCases(
         suiteId,
         cases,
